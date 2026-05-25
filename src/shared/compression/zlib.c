@@ -44,6 +44,14 @@ typedef struct {
     unsigned char *lengths;
 } ZlibHuffman;
 
+typedef struct {
+    unsigned char *data;
+    size_t capacity;
+    size_t byte_offset;
+    unsigned int bit_buffer;
+    unsigned int bit_count;
+} ZlibBitWriter;
+
 static void zlib_bit_reader_init(ZlibBitReader *reader, const unsigned char *data, size_t size) {
     reader->data = data;
     reader->size = size;
@@ -96,6 +104,97 @@ static unsigned int zlib_reverse_bits(unsigned int value, unsigned int count) {
         value >>= 1U;
     }
     return reversed;
+}
+
+static void zlib_bit_writer_init(ZlibBitWriter *writer, unsigned char *data, size_t capacity) {
+    writer->data = data;
+    writer->capacity = capacity;
+    writer->byte_offset = 0U;
+    writer->bit_buffer = 0U;
+    writer->bit_count = 0U;
+}
+
+static int zlib_write_bits(ZlibBitWriter *writer, unsigned int value, unsigned int count) {
+    if (count > 16U) return -1;
+    writer->bit_buffer |= value << writer->bit_count;
+    writer->bit_count += count;
+    while (writer->bit_count >= 8U) {
+        if (writer->byte_offset >= writer->capacity) return -1;
+        writer->data[writer->byte_offset++] = (unsigned char)(writer->bit_buffer & 0xffU);
+        writer->bit_buffer >>= 8U;
+        writer->bit_count -= 8U;
+    }
+    return 0;
+}
+
+static int zlib_flush_bits(ZlibBitWriter *writer) {
+    if (writer->bit_count != 0U) {
+        if (writer->byte_offset >= writer->capacity) return -1;
+        writer->data[writer->byte_offset++] = (unsigned char)(writer->bit_buffer & 0xffU);
+        writer->bit_buffer = 0U;
+        writer->bit_count = 0U;
+    }
+    return 0;
+}
+
+static int zlib_write_fixed_symbol(ZlibBitWriter *writer, unsigned int symbol) {
+    unsigned int code;
+    unsigned int length;
+
+    if (symbol <= 143U) {
+        code = 0x30U + symbol;
+        length = 8U;
+    } else if (symbol <= 255U) {
+        code = 0x190U + (symbol - 144U);
+        length = 9U;
+    } else if (symbol <= 279U) {
+        code = symbol - 256U;
+        length = 7U;
+    } else if (symbol <= 287U) {
+        code = 0xc0U + (symbol - 280U);
+        length = 8U;
+    } else {
+        return -1;
+    }
+    return zlib_write_bits(writer, zlib_reverse_bits(code, length), length);
+}
+
+static int zlib_write_fixed_match(ZlibBitWriter *writer, unsigned int length, unsigned int distance) {
+    static const unsigned short length_base[29] = {
+        3U, 4U, 5U, 6U, 7U, 8U, 9U, 10U, 11U, 13U, 15U, 17U, 19U, 23U, 27U, 31U,
+        35U, 43U, 51U, 59U, 67U, 83U, 99U, 115U, 131U, 163U, 195U, 227U, 258U
+    };
+    static const unsigned char length_extra[29] = {
+        0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 1U, 1U, 1U, 1U, 2U, 2U, 2U, 2U,
+        3U, 3U, 3U, 3U, 4U, 4U, 4U, 4U, 5U, 5U, 5U, 5U, 0U
+    };
+    static const unsigned short dist_base[30] = {
+        1U, 2U, 3U, 4U, 5U, 7U, 9U, 13U, 17U, 25U, 33U, 49U, 65U, 97U, 129U, 193U,
+        257U, 385U, 513U, 769U, 1025U, 1537U, 2049U, 3073U, 4097U, 6145U, 8193U, 12289U, 16385U, 24577U
+    };
+    static const unsigned char dist_extra[30] = {
+        0U, 0U, 0U, 0U, 1U, 1U, 2U, 2U, 3U, 3U, 4U, 4U, 5U, 5U, 6U, 6U,
+        7U, 7U, 8U, 8U, 9U, 9U, 10U, 10U, 11U, 11U, 12U, 12U, 13U, 13U
+    };
+    unsigned int length_index;
+    unsigned int dist_index;
+
+    if (length < 3U || length > 258U || distance == 0U || distance > 32768U) return -1;
+    for (length_index = 0U; length_index < 29U; ++length_index) {
+        unsigned int max_length = length_base[length_index] + ((1U << length_extra[length_index]) - 1U);
+        if (length <= max_length) break;
+    }
+    if (length_index >= 29U) return -1;
+    for (dist_index = 0U; dist_index < 30U; ++dist_index) {
+        unsigned int max_distance = dist_base[dist_index] + ((1U << dist_extra[dist_index]) - 1U);
+        if (distance <= max_distance) break;
+    }
+    if (dist_index >= 30U) return -1;
+    if (zlib_write_fixed_symbol(writer, 257U + length_index) != 0) return -1;
+    if (length_extra[length_index] != 0U && zlib_write_bits(writer, length - length_base[length_index], length_extra[length_index]) != 0) return -1;
+    if (zlib_write_bits(writer, zlib_reverse_bits(dist_index, 5U), 5U) != 0) return -1;
+    if (dist_extra[dist_index] != 0U && zlib_write_bits(writer, distance - dist_base[dist_index], dist_extra[dist_index]) != 0) return -1;
+    return 0;
 }
 
 static void zlib_huffman_free(ZlibHuffman *huffman) {
@@ -490,5 +589,66 @@ int compression_zlib_store(const unsigned char *input, size_t input_size, unsign
     output[output_offset++] = (unsigned char)((adler >> 8U) & 0xffU);
     output[output_offset++] = (unsigned char)(adler & 0xffU);
     *output_size_out = output_offset;
+    return 0;
+}
+
+size_t compression_zlib_fixed_rle_bound(size_t input_size) {
+    size_t bit_bytes;
+
+    if (input_size > (((size_t)-1) / 9U) - 32U) return 0U;
+    bit_bytes = (input_size * 9U + 7U) / 8U;
+    if (bit_bytes > ((size_t)-1) - 16U) return 0U;
+    return bit_bytes + 16U;
+}
+
+int compression_zlib_fixed_rle(const unsigned char *input, size_t input_size, unsigned char *output, size_t output_capacity, size_t *output_size_out) {
+    ZlibBitWriter writer;
+    size_t input_offset = 0U;
+    unsigned int adler;
+
+    if (input == 0 || output == 0 || output_size_out == 0 || compression_zlib_fixed_rle_bound(input_size) == 0U || output_capacity < compression_zlib_fixed_rle_bound(input_size)) return -1;
+    if (output_capacity < 6U) return -1;
+    output[0] = 0x78U;
+    output[1] = 0x01U;
+    zlib_bit_writer_init(&writer, output + 2U, output_capacity - 6U);
+    if (zlib_write_bits(&writer, 1U, 1U) != 0 || zlib_write_bits(&writer, 1U, 2U) != 0) return -1;
+    while (input_offset < input_size) {
+        size_t run = 1U;
+
+        while (input_offset + run < input_size && run < 259U && input[input_offset + run] == input[input_offset]) run += 1U;
+        if (run >= 4U) {
+            size_t remaining;
+
+            if (zlib_write_fixed_symbol(&writer, input[input_offset]) != 0) return -1;
+            input_offset += 1U;
+            remaining = run - 1U;
+            while (remaining != 0U) {
+                unsigned int length = remaining > 258U ? 258U : (unsigned int)remaining;
+                if (length < 3U) {
+                    unsigned int index;
+                    for (index = 0U; index < length; ++index) {
+                        if (zlib_write_fixed_symbol(&writer, input[input_offset + index]) != 0) return -1;
+                    }
+                    input_offset += (size_t)length;
+                    remaining = 0U;
+                } else {
+                    if (zlib_write_fixed_match(&writer, length, 1U) != 0) return -1;
+                    input_offset += (size_t)length;
+                    remaining -= (size_t)length;
+                }
+            }
+        } else {
+            if (zlib_write_fixed_symbol(&writer, input[input_offset]) != 0) return -1;
+            input_offset += 1U;
+        }
+    }
+    if (zlib_write_fixed_symbol(&writer, 256U) != 0 || zlib_flush_bits(&writer) != 0) return -1;
+    *output_size_out = 2U + writer.byte_offset;
+    if (*output_size_out + 4U > output_capacity) return -1;
+    adler = compression_adler32(input, input_size);
+    output[(*output_size_out)++] = (unsigned char)((adler >> 24U) & 0xffU);
+    output[(*output_size_out)++] = (unsigned char)((adler >> 16U) & 0xffU);
+    output[(*output_size_out)++] = (unsigned char)((adler >> 8U) & 0xffU);
+    output[(*output_size_out)++] = (unsigned char)(adler & 0xffU);
     return 0;
 }
