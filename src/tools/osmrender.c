@@ -103,6 +103,7 @@ typedef struct {
     int node_points;
     int tree_points;
     int green_only;
+    int major_roads;
     int no_fills;
     int relation_filter_enabled;
     int boundary_relation_enabled;
@@ -167,7 +168,7 @@ struct OsmRenderStyleSheet {
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " FILE.osm.pbf OUT.bmp --bbox MINLON,MINLAT,MAXLON,MAXLAT [--width N] [--height N] [--style FILE] [--node-index FILE] [--way-index FILE] [--green-only] [--no-fills] [--max-way-refs N] [--relation-id ID] [--boundary-relation-id ID] [--node-points] [--tree-points] [--stop-after-nodes N] [--stop-after-trees N] [--stop-after-ways N] [--stop-after-drawn N]\n");
+    rt_write_cstr(2, " FILE.osm.pbf OUT.bmp|OUT.png --bbox MINLON,MINLAT,MAXLON,MAXLAT [--width N] [--height N] [--style FILE] [--node-index FILE] [--way-index FILE] [--green-only] [--major-roads] [--no-fills] [--max-way-refs N] [--relation-id ID] [--boundary-relation-id ID] [--node-points] [--tree-points] [--stop-after-nodes N] [--stop-after-trees N] [--stop-after-ways N] [--stop-after-drawn N]\n");
 }
 
 static int parse_uint_arg(const char *text, unsigned int *value_out) {
@@ -323,12 +324,12 @@ static void style_sheet_init(OsmRenderStyleSheet *style_sheet) {
     set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_PARK], 142U, 181U, 119U, 1U);
     set_fill_style(&style_sheet->styles[OSM_RENDER_STYLE_BUILDING], 217U, 203U, 184U, 175U);
     set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_BUILDING], 157U, 138U, 117U, 1U);
-    set_casing_style(&style_sheet->styles[OSM_RENDER_STYLE_MOTORWAY], 196U, 126U, 92U, 7U);
-    set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_MOTORWAY], 238U, 171U, 105U, 5U);
-    set_casing_style(&style_sheet->styles[OSM_RENDER_STYLE_PRIMARY], 202U, 145U, 98U, 6U);
-    set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_PRIMARY], 246U, 194U, 118U, 4U);
-    set_casing_style(&style_sheet->styles[OSM_RENDER_STYLE_SECONDARY], 198U, 176U, 121U, 5U);
-    set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_SECONDARY], 246U, 226U, 148U, 3U);
+    set_casing_style(&style_sheet->styles[OSM_RENDER_STYLE_MOTORWAY], 238U, 236U, 228U, 5U);
+    set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_MOTORWAY], 82U, 82U, 78U, 3U);
+    set_casing_style(&style_sheet->styles[OSM_RENDER_STYLE_PRIMARY], 238U, 236U, 228U, 4U);
+    set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_PRIMARY], 92U, 92U, 88U, 2U);
+    set_casing_style(&style_sheet->styles[OSM_RENDER_STYLE_SECONDARY], 238U, 236U, 228U, 3U);
+    set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_SECONDARY], 112U, 112U, 106U, 1U);
     set_casing_style(&style_sheet->styles[OSM_RENDER_STYLE_MINOR_ROAD], 190U, 182U, 169U, 4U);
     set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_MINOR_ROAD], 250U, 248U, 240U, 2U);
     set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_PATH], 147U, 139U, 122U, 1U);
@@ -387,7 +388,7 @@ static int classify_tags_id(const PbfTag *tags, unsigned int tag_count, OsmRende
             *style_id_out = OSM_RENDER_STYLE_MOTORWAY;
         } else if (tag_value_equals(highway, "primary")) {
             *style_id_out = OSM_RENDER_STYLE_PRIMARY;
-        } else if (tag_value_equals(highway, "secondary") || tag_value_equals(highway, "tertiary")) {
+        } else if (tag_value_equals(highway, "secondary")) {
             *style_id_out = OSM_RENDER_STYLE_SECONDARY;
         } else if (tag_value_equals(highway, "footway") || tag_value_equals(highway, "path") || tag_value_equals(highway, "cycleway") || tag_value_equals(highway, "track")) {
             *style_id_out = OSM_RENDER_STYLE_PATH;
@@ -420,6 +421,15 @@ static int style_id_is_green_context(OsmRenderStyleId style_id) {
     return style_id == OSM_RENDER_STYLE_WATER || style_id == OSM_RENDER_STYLE_WATERWAY ||
            style_id == OSM_RENDER_STYLE_FOREST || style_id == OSM_RENDER_STYLE_PARK ||
            style_id == OSM_RENDER_STYLE_BOUNDARY;
+}
+
+static int style_id_is_major_road_context(OsmRenderStyleId style_id) {
+    return style_id == OSM_RENDER_STYLE_MOTORWAY || style_id == OSM_RENDER_STYLE_PRIMARY || style_id == OSM_RENDER_STYLE_SECONDARY;
+}
+
+static int style_id_is_render_context(const OsmRenderContext *context, OsmRenderStyleId style_id) {
+    if (style_id_is_green_context(style_id)) return 1;
+    return context->major_roads && style_id_is_major_road_context(style_id);
 }
 
 static int node_in_bbox(const OsmRenderContext *context, long long lat_nano, long long lon_nano) {
@@ -1139,7 +1149,7 @@ static int on_way(void *user, const PbfWay *way) {
         copy_style(context->style_sheet, style_id, &style);
         is_relation_member = 1;
     }
-    if (context->green_only && !style_id_is_green_context(style_id)) return 0;
+    if (context->green_only && !style_id_is_render_context(context, style_id)) return 0;
     if (context->max_way_refs != 0U && way->ref_count > context->max_way_refs) {
         context->way_refs_skipped += 1ULL;
         return 0;
@@ -1229,7 +1239,7 @@ static int on_way_tags(void *user, long long id, const PbfTag *tags, unsigned in
     if (context->relation_filter_enabled) return relation_way_find(context, id, &style_id);
     if (relation_way_find(context, id, &style_id)) return 1;
     if (!classify_way(context->style_sheet, &way, &style, &style_id)) return 0;
-    if (context->green_only && !style_id_is_green_context(style_id)) return 0;
+    if (context->green_only && !style_id_is_render_context(context, style_id)) return 0;
     return (style.flags & (OSM_RENDER_STYLE_FILL | OSM_RENDER_STYLE_LINE | OSM_RENDER_STYLE_CASING)) != 0U;
 }
 
@@ -1240,7 +1250,7 @@ static int on_relation_tags(void *user, long long id, const PbfTag *tags, unsign
     if (context->boundary_relation_enabled && id == context->boundary_relation_id) return 1;
     if (context->relation_filter_enabled && id != context->relation_filter_id) return 0;
     if (!classify_tags_id(tags, tag_count, &style_id)) return 0;
-    if (context->green_only && !style_id_is_green_context(style_id)) return 0;
+    if (context->green_only && !style_id_is_render_context(context, style_id)) return 0;
     return style_id_is_green_context(style_id);
 }
 
@@ -1942,6 +1952,9 @@ int main(int argc, char **argv) {
         } else if (rt_strcmp(argv[argi], "--green-only") == 0) {
             context.green_only = 1;
             argi += 1;
+        } else if (rt_strcmp(argv[argi], "--major-roads") == 0) {
+            context.major_roads = 1;
+            argi += 1;
         } else if (rt_strcmp(argv[argi], "--no-fills") == 0) {
             context.no_fills = 1;
             argi += 1;
@@ -2168,6 +2181,9 @@ int main(int argc, char **argv) {
     rt_write_char(1, '\n');
     rt_write_cstr(1, "green_only: ");
     rt_write_cstr(1, context.green_only ? "yes" : "no");
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "major_roads: ");
+    rt_write_cstr(1, context.major_roads ? "yes" : "no");
     rt_write_char(1, '\n');
     rt_write_cstr(1, "no_fills: ");
     rt_write_cstr(1, context.no_fills ? "yes" : "no");

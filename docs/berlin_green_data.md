@@ -76,7 +76,14 @@ Full Berlin green-shape map with Berlin boundary:
 timeout 300 ./build/freestanding-linux-x86_64/osmrender data/berlin-260524.osm.pbf build/berlin-green-shapes-2048x1664.png --bbox 13.05,52.33,13.80,52.68 --width 2048 --height 1664 --style styles/osmrender-default.conf --node-index build/berlin.osmnidx --way-index build/berlin.osmwidx --green-only --boundary-relation-id 62422
 ```
 
+Variant with large roads overlaid:
+
+```sh
+timeout 300 ./build/freestanding-linux-x86_64/osmrender data/berlin-260524.osm.pbf build/berlin-green-shapes-roads-2048x1664.png --bbox 13.05,52.33,13.80,52.68 --width 2048 --height 1664 --style styles/osmrender-default.conf --node-index build/berlin.osmnidx --way-index build/berlin.osmwidx --green-only --major-roads --boundary-relation-id 62422
+```
+
 The aspect ratio uses a latitude-aware height for the lon/lat bbox around Berlin. The east edge is padded to `13.80` so Berlin's eastern boundary does not clip against the image edge. `osmrender` writes PNG directly when the output path ends in `.png`; use the same command with a `.bmp` output path to write BMP instead. PNG output is dependency-free and uses an indexed-color palette when possible to keep map-style images smaller than BMP.
+`--major-roads` keeps motorway/trunk, primary, and secondary roads in `--green-only` renders and leaves tertiary/minor roads out.
 
 Observed current counters:
 
@@ -97,6 +104,31 @@ green_only: yes
 ```
 
 Observed output: `build/berlin-green-shapes-2048x1664.png` is a 2048x1664 indexed-color PNG and is about 3.3 MB.
+
+Observed road-overlay counters:
+
+```text
+ways_decoded: 70400
+ways_drawn: 70400
+segments_drawn: 792005
+visible_pixels: 987325
+major_roads: yes
+```
+
+## Toward Generic City Rendering
+
+A generic Germany-wide command should resolve the city boundary before rendering. The intended workflow is:
+
+1. Build Germany-wide node and way indexes once.
+2. Find the administrative boundary relation by `name=<city>`, `boundary=administrative`, and a city-level `admin_level`.
+3. Use the boundary relation's member ways and the indexes to compute a padded bbox automatically.
+4. Render the bbox with `--green-only`, `--boundary-relation-id <id>`, and optional `--major-roads`.
+
+A future CLI can hide those steps behind a city name, for example:
+
+```sh
+./build/freestanding-linux-x86_64/osmrender data/germany-260524.osm.pbf city.png --city Berlin --node-index build/germany.osmnidx --way-index build/germany.osmwidx --green-only --major-roads
+```
 
 Tree-point checkpoint:
 
