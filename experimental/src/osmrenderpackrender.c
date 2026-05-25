@@ -28,6 +28,10 @@
 #define STYLE_FLAG_FILL (1U << 1)
 #define STYLE_FLAG_CASING (1U << 2)
 
+#define OSMRPACK_V2_HEADER_SIZE 256U
+#define OSMRPACK_V2_PLACE_RECORD_SIZE 112U
+#define OSMRPACK_V2_TILE_RECORD_SIZE 96U
+
 typedef struct {
     unsigned char red;
     unsigned char green;
@@ -101,6 +105,16 @@ typedef struct {
     int boundary_fade_applied;
     int png_palette;
     unsigned long long features_seen;
+    unsigned long long features_skipped;
+    unsigned long long features_collected;
+    unsigned long long points_skipped;
+    unsigned long long points_collected;
+    unsigned long long collect_skip_count;
+    unsigned long long collect_header_bytes;
+    unsigned long long collect_skipped_bytes;
+    unsigned long long collect_point_bytes;
+    unsigned long long collect_refills;
+    unsigned long long collect_bytes_read;
     unsigned long long features_drawn;
     unsigned long long segments_drawn;
     unsigned long long polygons_drawn;
@@ -115,6 +129,66 @@ typedef struct {
     long long max_lon_nano;
     long long max_lat_nano;
 } PackFeatureHeader;
+
+typedef struct {
+    int fd;
+    unsigned char *buffer;
+    size_t capacity;
+    size_t position;
+    size_t used;
+    unsigned long long refill_count;
+    unsigned long long bytes_read;
+} PackReader;
+
+typedef struct {
+    unsigned int version;
+    unsigned int header_size;
+    unsigned int flags;
+    unsigned int tile_zoom;
+    unsigned int tile_halo;
+    unsigned int layer_count;
+    unsigned int place_record_size;
+    unsigned int tile_record_size;
+    unsigned int feature_record_size;
+    unsigned long long place_count;
+    unsigned long long tile_count;
+    unsigned long long place_directory_offset;
+    unsigned long long place_directory_size;
+    unsigned long long tile_directory_offset;
+    unsigned long long tile_directory_size;
+    unsigned long long tile_range_index_offset;
+    unsigned long long tile_range_index_size;
+    unsigned long long tile_payload_offset;
+    unsigned long long tile_payload_size;
+    unsigned long long string_table_offset;
+    unsigned long long string_table_size;
+    unsigned long long source_nodes;
+    unsigned long long source_ways;
+    unsigned long long source_relations;
+} OsmrPackV2Header;
+
+typedef struct {
+    unsigned long long tile_id;
+    unsigned int z;
+    unsigned int x;
+    unsigned int y;
+    unsigned int feature_count;
+    unsigned int layer_mask;
+    unsigned long long payload_offset;
+    unsigned long long payload_size;
+    long long min_lon_nano;
+    long long min_lat_nano;
+    long long max_lon_nano;
+    long long max_lat_nano;
+} OsmrPackV2TileRecord;
+
+typedef struct {
+    unsigned long long *entries;
+    unsigned int count;
+    unsigned int capacity;
+} FeatureHashSet;
+
+static const unsigned char osmrpack_v2_magic[8] = { 'O', 'S', 'M', 'R', 'P', 'K', '0', '2' };
 
 static const RenderLayer render_layers[] = {
     { RENDER_STEP_AREA, PACK_STYLE_WATER },
@@ -144,7 +218,13 @@ static const RenderLayer render_layers[] = {
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " PACK.osmrpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city Potsdam|Berlin) [--width N] [--height N] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb]\n");
+    rt_write_cstr(2, " PACK.osmrpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]\n");
+}
+
+static void write_profile_ms(const char *label, unsigned long long elapsed_ms) {
+    rt_write_cstr(1, label);
+    rt_write_uint(1, elapsed_ms);
+    rt_write_char(1, '\n');
 }
 
 static int path_exists(const char *path) {
@@ -250,6 +330,10 @@ static int set_city_bbox(const char *city, RenderContext *context) {
     return -1;
 }
 
+static int render_bbox_is_valid(const RenderContext *context) {
+    return context->min_lon_nano < context->max_lon_nano && context->min_lat_nano < context->max_lat_nano;
+}
+
 static void set_line_style(RenderStyle *style, unsigned char red, unsigned char green, unsigned char blue, unsigned int width) {
     style->red = red;
     style->green = green;
@@ -318,6 +402,39 @@ static long long read_i64_le(const unsigned char *data) {
     return (long long)read_u64_le(data);
 }
 
+static int read_v2_header_bytes(const unsigned char data[OSMRPACK_V2_HEADER_SIZE], OsmrPackV2Header *header) {
+    if (memcmp(data, osmrpack_v2_magic, sizeof(osmrpack_v2_magic)) != 0) return 0;
+    rt_memset(header, 0, sizeof(*header));
+    header->version = read_u32_le(data + 8U);
+    header->header_size = read_u32_le(data + 12U);
+    header->flags = read_u32_le(data + 16U);
+    header->tile_zoom = read_u32_le(data + 20U);
+    header->tile_halo = read_u32_le(data + 24U);
+    header->layer_count = read_u32_le(data + 28U);
+    header->place_record_size = read_u32_le(data + 32U);
+    header->tile_record_size = read_u32_le(data + 36U);
+    header->feature_record_size = read_u32_le(data + 40U);
+    header->place_count = read_u64_le(data + 48U);
+    header->tile_count = read_u64_le(data + 56U);
+    header->place_directory_offset = read_u64_le(data + 64U);
+    header->place_directory_size = read_u64_le(data + 72U);
+    header->tile_directory_offset = read_u64_le(data + 80U);
+    header->tile_directory_size = read_u64_le(data + 88U);
+    header->tile_range_index_offset = read_u64_le(data + 96U);
+    header->tile_range_index_size = read_u64_le(data + 104U);
+    header->tile_payload_offset = read_u64_le(data + 112U);
+    header->tile_payload_size = read_u64_le(data + 120U);
+    header->string_table_offset = read_u64_le(data + 128U);
+    header->string_table_size = read_u64_le(data + 136U);
+    header->source_nodes = read_u64_le(data + 144U);
+    header->source_ways = read_u64_le(data + 152U);
+    header->source_relations = read_u64_le(data + 160U);
+    if (header->version != 2U || header->header_size != OSMRPACK_V2_HEADER_SIZE) return -1;
+    if (header->place_record_size != OSMRPACK_V2_PLACE_RECORD_SIZE || header->tile_record_size != OSMRPACK_V2_TILE_RECORD_SIZE) return -1;
+    if (header->feature_record_size != OSMRPACK_FEATURE_HEADER_SIZE || header->tile_zoom > 29U) return -1;
+    return 1;
+}
+
 static void write_u32_be(unsigned char *out, unsigned int value) {
     out[0] = (unsigned char)((value >> 24U) & 0xffU);
     out[1] = (unsigned char)((value >> 16U) & 0xffU);
@@ -337,10 +454,222 @@ static int read_exact(int fd, void *buffer, size_t size) {
     return 0;
 }
 
+static int read_v2_header_fd(int fd, OsmrPackV2Header *header) {
+    unsigned char data[OSMRPACK_V2_HEADER_SIZE];
+    int result;
+
+    if (platform_seek(fd, 0, PLATFORM_SEEK_SET) < 0) return -1;
+    if (read_exact(fd, data, sizeof(data)) != 0) return -1;
+    result = read_v2_header_bytes(data, header);
+    return result < 0 ? -1 : result;
+}
+
+static int read_v2_header_path(const char *path, OsmrPackV2Header *header) {
+    int fd = platform_open_read(path);
+    int result;
+
+    if (fd < 0) return -1;
+    result = read_v2_header_fd(fd, header);
+    if (platform_close(fd) != 0 && result >= 0) result = -1;
+    return result;
+}
+
+static void read_v2_tile_record_bytes(const unsigned char data[OSMRPACK_V2_TILE_RECORD_SIZE], OsmrPackV2TileRecord *record) {
+    rt_memset(record, 0, sizeof(*record));
+    record->tile_id = read_u64_le(data + 0U);
+    record->z = read_u32_le(data + 8U);
+    record->x = read_u32_le(data + 12U);
+    record->y = read_u32_le(data + 16U);
+    record->feature_count = read_u32_le(data + 20U);
+    record->layer_mask = read_u32_le(data + 24U);
+    record->payload_offset = read_u64_le(data + 32U);
+    record->payload_size = read_u64_le(data + 40U);
+    record->min_lon_nano = read_i64_le(data + 48U);
+    record->min_lat_nano = read_i64_le(data + 56U);
+    record->max_lon_nano = read_i64_le(data + 64U);
+    record->max_lat_nano = read_i64_le(data + 72U);
+}
+
+static int read_v2_tile_record_fd(int fd, OsmrPackV2TileRecord *record) {
+    unsigned char data[OSMRPACK_V2_TILE_RECORD_SIZE];
+    if (read_exact(fd, data, sizeof(data)) != 0) return -1;
+    read_v2_tile_record_bytes(data, record);
+    return 0;
+}
+
+static unsigned int v2_tile_axis(unsigned int zoom) {
+    return 1U << zoom;
+}
+
+static unsigned int v2_lon_to_tile_x(long long lon_nano, unsigned int zoom) {
+    long long shifted = lon_nano + 180000000000LL;
+    unsigned long long axis = (unsigned long long)v2_tile_axis(zoom);
+    unsigned long long value;
+    if (shifted < 0) shifted = 0;
+    if (shifted > 360000000000LL) shifted = 360000000000LL;
+    value = ((unsigned long long)shifted * axis) / 360000000000ULL;
+    if (value >= axis) value = axis - 1ULL;
+    return (unsigned int)value;
+}
+
+static unsigned int v2_lat_to_tile_y(long long lat_nano, unsigned int zoom) {
+    long long shifted = 90000000000LL - lat_nano;
+    unsigned long long axis = (unsigned long long)v2_tile_axis(zoom);
+    unsigned long long value;
+    if (shifted < 0) shifted = 0;
+    if (shifted > 180000000000LL) shifted = 180000000000LL;
+    value = ((unsigned long long)shifted * axis) / 180000000000ULL;
+    if (value >= axis) value = axis - 1ULL;
+    return (unsigned int)value;
+}
+
+static unsigned long long feature_hash_mix(unsigned long long hash, unsigned long long value) {
+    hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6U) + (hash >> 2U);
+    return hash == 0ULL ? 1ULL : hash;
+}
+
+static unsigned long long feature_hash_init(const PackFeatureHeader *feature) {
+    unsigned long long hash = 1469598103934665603ULL;
+    hash = feature_hash_mix(hash, feature->style_id);
+    hash = feature_hash_mix(hash, feature->flags);
+    hash = feature_hash_mix(hash, feature->point_count);
+    hash = feature_hash_mix(hash, (unsigned long long)feature->min_lon_nano);
+    hash = feature_hash_mix(hash, (unsigned long long)feature->min_lat_nano);
+    hash = feature_hash_mix(hash, (unsigned long long)feature->max_lon_nano);
+    hash = feature_hash_mix(hash, (unsigned long long)feature->max_lat_nano);
+    return hash;
+}
+
+static void feature_hash_set_destroy(FeatureHashSet *set) {
+    rt_free(set->entries);
+    set->entries = 0;
+    set->count = 0U;
+    set->capacity = 0U;
+}
+
+static int feature_hash_set_rehash(FeatureHashSet *set, unsigned int new_capacity) {
+    unsigned long long *old_entries = set->entries;
+    unsigned int old_capacity = set->capacity;
+    unsigned int index;
+
+    set->entries = (unsigned long long *)rt_malloc(sizeof(*set->entries) * (size_t)new_capacity);
+    if (set->entries == 0) {
+        set->entries = old_entries;
+        return -1;
+    }
+    rt_memset(set->entries, 0, sizeof(*set->entries) * (size_t)new_capacity);
+    set->capacity = new_capacity;
+    set->count = 0U;
+    for (index = 0U; index < old_capacity; ++index) {
+        unsigned long long hash = old_entries[index];
+        if (hash != 0ULL) {
+            unsigned int slot = (unsigned int)hash & (set->capacity - 1U);
+            while (set->entries[slot] != 0ULL) slot = (slot + 1U) & (set->capacity - 1U);
+            set->entries[slot] = hash;
+            set->count += 1U;
+        }
+    }
+    rt_free(old_entries);
+    return 0;
+}
+
+static int feature_hash_set_insert(FeatureHashSet *set, unsigned long long hash) {
+    unsigned int slot;
+
+    if (hash == 0ULL) hash = 1ULL;
+    if (set->capacity == 0U) {
+        if (feature_hash_set_rehash(set, 65536U) != 0) return -1;
+    } else if ((set->count + 1U) * 2U >= set->capacity) {
+        if (set->capacity > 0x40000000U || feature_hash_set_rehash(set, set->capacity * 2U) != 0) return -1;
+    }
+    slot = (unsigned int)hash & (set->capacity - 1U);
+    while (set->entries[slot] != 0ULL) {
+        if (set->entries[slot] == hash) return 0;
+        slot = (slot + 1U) & (set->capacity - 1U);
+    }
+    set->entries[slot] = hash;
+    set->count += 1U;
+    return 1;
+}
+
 static int read_feature_header(int fd, PackFeatureHeader *header) {
     unsigned char data[OSMRPACK_FEATURE_HEADER_SIZE];
 
     if (read_exact(fd, data, sizeof(data)) != 0) return -1;
+    header->style_id = read_u32_le(data + 0U);
+    header->flags = read_u32_le(data + 4U);
+    header->point_count = read_u32_le(data + 8U);
+    header->min_lon_nano = read_i64_le(data + 16U);
+    header->min_lat_nano = read_i64_le(data + 24U);
+    header->max_lon_nano = read_i64_le(data + 32U);
+    header->max_lat_nano = read_i64_le(data + 40U);
+    return 0;
+}
+
+static int pack_reader_init(PackReader *reader, int fd, size_t capacity) {
+    rt_memset(reader, 0, sizeof(*reader));
+    reader->fd = fd;
+    reader->capacity = capacity;
+    reader->buffer = (unsigned char *)rt_malloc(capacity);
+    return reader->buffer == 0 ? -1 : 0;
+}
+
+static void pack_reader_destroy(PackReader *reader) {
+    rt_free(reader->buffer);
+    reader->buffer = 0;
+    reader->capacity = 0U;
+    reader->position = 0U;
+    reader->used = 0U;
+}
+
+static int pack_reader_refill(PackReader *reader) {
+    long amount;
+
+    amount = platform_read(reader->fd, reader->buffer, reader->capacity);
+    if (amount <= 0) return -1;
+    reader->position = 0U;
+    reader->used = (size_t)amount;
+    reader->refill_count += 1ULL;
+    reader->bytes_read += (unsigned long long)amount;
+    return 0;
+}
+
+static int pack_reader_read_exact(PackReader *reader, void *buffer, size_t size) {
+    unsigned char *out = (unsigned char *)buffer;
+    size_t copied = 0U;
+
+    while (copied < size) {
+        size_t available;
+        size_t chunk;
+
+        if (reader->position >= reader->used && pack_reader_refill(reader) != 0) return -1;
+        available = reader->used - reader->position;
+        chunk = size - copied < available ? size - copied : available;
+        memcpy(out + copied, reader->buffer + reader->position, chunk);
+        reader->position += chunk;
+        copied += chunk;
+    }
+    return 0;
+}
+
+static int pack_reader_skip(PackReader *reader, unsigned long long size) {
+    while (size != 0ULL) {
+        size_t available;
+        size_t chunk;
+
+        if (reader->position >= reader->used && pack_reader_refill(reader) != 0) return -1;
+        available = reader->used - reader->position;
+        chunk = size < (unsigned long long)available ? (size_t)size : available;
+        reader->position += chunk;
+        size -= (unsigned long long)chunk;
+    }
+    return 0;
+}
+
+static int pack_reader_read_feature_header(PackReader *reader, PackFeatureHeader *header) {
+    unsigned char data[OSMRPACK_FEATURE_HEADER_SIZE];
+
+    if (pack_reader_read_exact(reader, data, sizeof(data)) != 0) return -1;
     header->style_id = read_u32_le(data + 0U);
     header->flags = read_u32_le(data + 4U);
     header->point_count = read_u32_le(data + 8U);
@@ -465,34 +794,310 @@ static int read_projected_feature_points(int fd, const PackFeatureHeader *featur
     return 0;
 }
 
+static int pack_reader_read_projected_feature_points(PackReader *reader, const PackFeatureHeader *feature, RenderContext *context, int *projected_points) {
+    unsigned char data[16];
+    unsigned int point_index;
+
+    for (point_index = 0U; point_index < feature->point_count; ++point_index) {
+        long long pixel_x;
+        long long pixel_y;
+        long long lon_nano;
+        long long lat_nano;
+
+        if (pack_reader_read_exact(reader, data, sizeof(data)) != 0) return -1;
+        lon_nano = read_i64_le(data + 0U);
+        lat_nano = read_i64_le(data + 8U);
+        if (project_point(context, lon_nano, lat_nano, &pixel_x, &pixel_y) != 0) return -1;
+        projected_points[point_index * 2U + 0U] = clamp_to_int(pixel_x);
+        projected_points[point_index * 2U + 1U] = clamp_to_int(pixel_y);
+    }
+    return 0;
+}
+
+static int pack_reader_read_projected_feature_points_with_hash(PackReader *reader, const PackFeatureHeader *feature, RenderContext *context, int *projected_points, unsigned long long *hash_out) {
+    unsigned char data[16];
+    unsigned int point_index;
+    unsigned long long hash = feature_hash_init(feature);
+
+    for (point_index = 0U; point_index < feature->point_count; ++point_index) {
+        long long pixel_x;
+        long long pixel_y;
+        long long lon_nano;
+        long long lat_nano;
+
+        if (pack_reader_read_exact(reader, data, sizeof(data)) != 0) return -1;
+        lon_nano = read_i64_le(data + 0U);
+        lat_nano = read_i64_le(data + 8U);
+        hash = feature_hash_mix(hash, (unsigned long long)lon_nano);
+        hash = feature_hash_mix(hash, (unsigned long long)lat_nano);
+        if (project_point(context, lon_nano, lat_nano, &pixel_x, &pixel_y) != 0) return -1;
+        projected_points[point_index * 2U + 0U] = clamp_to_int(pixel_x);
+        projected_points[point_index * 2U + 1U] = clamp_to_int(pixel_y);
+    }
+    *hash_out = hash;
+    return 0;
+}
+
 static int collect_visible_features(int fd, const OsmrPackHeader *pack_header, RenderContext *context) {
     unsigned char count_data[8];
     unsigned long long feature_count;
     unsigned long long feature_index;
+    PackReader reader;
+    int result = -1;
 
     if (platform_seek(fd, (long long)pack_header->feature_data_offset, PLATFORM_SEEK_SET) < 0) return -1;
-    if (read_exact(fd, count_data, sizeof(count_data)) != 0) return -1;
+    if (pack_reader_init(&reader, fd, 1024U * 1024U) != 0) return -1;
+    if (pack_reader_read_exact(&reader, count_data, sizeof(count_data)) != 0) goto cleanup;
     feature_count = read_u64_le(count_data);
     for (feature_index = 0ULL; feature_index < feature_count; ++feature_index) {
         PackFeatureHeader feature;
         int *projected_points;
+        unsigned long long point_bytes;
 
-        if (read_feature_header(fd, &feature) != 0) return -1;
+        if (pack_reader_read_feature_header(&reader, &feature) != 0) goto cleanup;
+        context->collect_header_bytes += OSMRPACK_FEATURE_HEADER_SIZE;
         context->features_seen += 1ULL;
-        if (feature.point_count < 2U || feature.point_count > 10000000U || feature.style_id >= PACK_STYLE_COUNT) return -1;
+        if (feature.point_count < 2U || feature.point_count > 10000000U || feature.style_id >= PACK_STYLE_COUNT) goto cleanup;
+        point_bytes = (unsigned long long)feature.point_count * 16ULL;
         if (!feature_intersects_render_bbox(context, &feature)) {
-            if (skip_points(fd, feature.point_count) != 0) return -1;
+            context->features_skipped += 1ULL;
+            context->points_skipped += feature.point_count;
+            context->collect_skip_count += 1ULL;
+            context->collect_skipped_bytes += point_bytes;
+            if (pack_reader_skip(&reader, point_bytes) != 0) goto cleanup;
             continue;
         }
         projected_points = (int *)rt_malloc(sizeof(int) * (size_t)feature.point_count * 2U);
-        if (projected_points == 0) return -1;
-        if (read_projected_feature_points(fd, &feature, context, projected_points) != 0 || append_visible_feature(context, &feature, projected_points) != 0) {
+        if (projected_points == 0) goto cleanup;
+        if (pack_reader_read_projected_feature_points(&reader, &feature, context, projected_points) != 0 || append_visible_feature(context, &feature, projected_points) != 0) {
             rt_free(projected_points);
-            return -1;
+            goto cleanup;
         }
+        context->features_collected += 1ULL;
+        context->points_collected += feature.point_count;
+        context->collect_point_bytes += point_bytes;
         rt_free(projected_points);
     }
+    context->collect_refills = reader.refill_count;
+    context->collect_bytes_read = reader.bytes_read;
+    result = 0;
+
+cleanup:
+    if (result != 0) {
+        context->collect_refills = reader.refill_count;
+        context->collect_bytes_read = reader.bytes_read;
+    }
+    pack_reader_destroy(&reader);
+    return result;
+}
+
+static int grow_v2_tile_records(OsmrPackV2TileRecord **records_io, unsigned int *capacity_io, unsigned int needed) {
+    unsigned int capacity = *capacity_io == 0U ? 128U : *capacity_io;
+    OsmrPackV2TileRecord *records;
+    while (capacity < needed) {
+        if (capacity > 0x40000000U) return -1;
+        capacity *= 2U;
+    }
+    if (capacity == *capacity_io) return 0;
+    records = (OsmrPackV2TileRecord *)rt_realloc(*records_io, sizeof(*records) * (size_t)capacity);
+    if (records == 0) return -1;
+    *records_io = records;
+    *capacity_io = capacity;
     return 0;
+}
+
+static int v2_place_name_matches(int fd, unsigned long long name_offset, unsigned int name_size, const char *city_name) {
+    char buffer[256];
+    size_t city_size = rt_strlen(city_name);
+
+    if (name_size != city_size || name_size >= sizeof(buffer)) return 0;
+    if (platform_seek(fd, (long long)name_offset, PLATFORM_SEEK_SET) < 0) return -1;
+    if (read_exact(fd, buffer, name_size) != 0) return -1;
+    buffer[name_size] = '\0';
+    return rt_strcmp(buffer, city_name) == 0 ? 1 : 0;
+}
+
+static int apply_v2_place_bbox(int fd, const OsmrPackV2Header *header, RenderContext *context) {
+    unsigned long long place_index;
+    unsigned int best_rank = 0U;
+    long long best_min_lon = 0;
+    long long best_min_lat = 0;
+    long long best_max_lon = 0;
+    long long best_max_lat = 0;
+    int found = 0;
+
+    if (!context->city_enabled || context->city_name == 0 || header->place_count == 0ULL) return 0;
+    if (platform_seek(fd, (long long)header->place_directory_offset, PLATFORM_SEEK_SET) < 0) return -1;
+    for (place_index = 0ULL; place_index < header->place_count; ++place_index) {
+        unsigned char data[OSMRPACK_V2_PLACE_RECORD_SIZE];
+        long long min_lon;
+        long long min_lat;
+        long long max_lon;
+        long long max_lat;
+        unsigned long long name_offset;
+        unsigned int name_size;
+        unsigned int rank_score;
+        long long next_record_offset = (long long)(header->place_directory_offset + (place_index + 1ULL) * OSMRPACK_V2_PLACE_RECORD_SIZE);
+        int match;
+
+        if (read_exact(fd, data, sizeof(data)) != 0) return -1;
+        rank_score = read_u32_le(data + 20U);
+        min_lon = read_i64_le(data + 24U);
+        min_lat = read_i64_le(data + 32U);
+        max_lon = read_i64_le(data + 40U);
+        max_lat = read_i64_le(data + 48U);
+        name_offset = read_u64_le(data + 56U);
+        name_size = read_u32_le(data + 64U);
+        match = v2_place_name_matches(fd, name_offset, name_size, context->city_name);
+        if (match < 0) return -1;
+        if (match && min_lon < max_lon && min_lat < max_lat && (!found || rank_score > best_rank)) {
+            best_rank = rank_score;
+            best_min_lon = min_lon;
+            best_min_lat = min_lat;
+            best_max_lon = max_lon;
+            best_max_lat = max_lat;
+            found = 1;
+        }
+        if (platform_seek(fd, next_record_offset, PLATFORM_SEEK_SET) < 0) return -1;
+    }
+    if (found) {
+        long long lon_padding = (best_max_lon - best_min_lon) / 10LL;
+        long long lat_padding = (best_max_lat - best_min_lat) / 10LL;
+        if (lon_padding < 5000000LL) lon_padding = 5000000LL;
+        if (lat_padding < 5000000LL) lat_padding = 5000000LL;
+        context->min_lon_nano = best_min_lon - lon_padding;
+        context->max_lon_nano = best_max_lon + lon_padding;
+        context->min_lat_nano = best_min_lat - lat_padding;
+        context->max_lat_nano = best_max_lat + lat_padding;
+        return 1;
+    }
+    return 0;
+}
+
+static int v2_tile_in_requested_range(const OsmrPackV2TileRecord *record, unsigned int min_x, unsigned int min_y, unsigned int max_x, unsigned int max_y, unsigned int zoom) {
+    if (record->z != zoom) return 0;
+    if (record->x < min_x || record->x > max_x) return 0;
+    if (record->y < min_y || record->y > max_y) return 0;
+    return 1;
+}
+
+static int collect_visible_features_v2(int fd, const OsmrPackV2Header *header, RenderContext *context, unsigned long long *selected_tile_count_out, unsigned long long *selected_tile_features_out) {
+    OsmrPackV2TileRecord *selected_records = 0;
+    unsigned int selected_count = 0U;
+    unsigned int selected_capacity = 0U;
+    unsigned int axis = v2_tile_axis(header->tile_zoom);
+    unsigned int min_x = v2_lon_to_tile_x(context->min_lon_nano, header->tile_zoom);
+    unsigned int max_x = v2_lon_to_tile_x(context->max_lon_nano, header->tile_zoom);
+    unsigned int min_y = v2_lat_to_tile_y(context->max_lat_nano, header->tile_zoom);
+    unsigned int max_y = v2_lat_to_tile_y(context->min_lat_nano, header->tile_zoom);
+    unsigned int halo = header->tile_halo;
+    unsigned long long tile_index;
+    FeatureHashSet seen_hashes;
+    int result = -1;
+
+    rt_memset(&seen_hashes, 0, sizeof(seen_hashes));
+    if (halo > 16U) halo = 16U;
+    min_x = min_x > halo ? min_x - halo : 0U;
+    min_y = min_y > halo ? min_y - halo : 0U;
+    max_x = max_x + halo < axis ? max_x + halo : axis - 1U;
+    max_y = max_y + halo < axis ? max_y + halo : axis - 1U;
+    *selected_tile_count_out = 0ULL;
+    *selected_tile_features_out = 0ULL;
+    if (header->tile_count > 10000000ULL) return -1;
+    if (platform_seek(fd, (long long)header->tile_directory_offset, PLATFORM_SEEK_SET) < 0) return -1;
+    for (tile_index = 0ULL; tile_index < header->tile_count; ++tile_index) {
+        OsmrPackV2TileRecord record;
+        if (read_v2_tile_record_fd(fd, &record) != 0) goto cleanup;
+        if (v2_tile_in_requested_range(&record, min_x, min_y, max_x, max_y, header->tile_zoom)) {
+            if (grow_v2_tile_records(&selected_records, &selected_capacity, selected_count + 1U) != 0) goto cleanup;
+            selected_records[selected_count++] = record;
+            *selected_tile_features_out += record.feature_count;
+        }
+    }
+    *selected_tile_count_out = selected_count;
+    for (tile_index = 0ULL; tile_index < (unsigned long long)selected_count; ++tile_index) {
+        OsmrPackV2TileRecord *record = &selected_records[(unsigned int)tile_index];
+        unsigned char count_data[8];
+        unsigned long long feature_count;
+        unsigned long long feature_index;
+        PackReader reader;
+
+        if (platform_seek(fd, (long long)record->payload_offset, PLATFORM_SEEK_SET) < 0) goto cleanup;
+        if (pack_reader_init(&reader, fd, 1024U * 1024U) != 0) goto cleanup;
+        if (pack_reader_read_exact(&reader, count_data, sizeof(count_data)) != 0) {
+            pack_reader_destroy(&reader);
+            goto cleanup;
+        }
+        feature_count = read_u64_le(count_data);
+        if (feature_count != (unsigned long long)record->feature_count) {
+            pack_reader_destroy(&reader);
+            goto cleanup;
+        }
+        for (feature_index = 0ULL; feature_index < feature_count; ++feature_index) {
+            PackFeatureHeader feature;
+            int *projected_points;
+            unsigned long long point_bytes;
+            unsigned long long feature_hash;
+            int inserted;
+
+            if (pack_reader_read_feature_header(&reader, &feature) != 0) {
+                pack_reader_destroy(&reader);
+                goto cleanup;
+            }
+            context->collect_header_bytes += OSMRPACK_FEATURE_HEADER_SIZE;
+            context->features_seen += 1ULL;
+            if (feature.point_count < 2U || feature.point_count > 10000000U || feature.style_id >= PACK_STYLE_COUNT) {
+                pack_reader_destroy(&reader);
+                goto cleanup;
+            }
+            point_bytes = (unsigned long long)feature.point_count * 16ULL;
+            if (!feature_intersects_render_bbox(context, &feature)) {
+                context->features_skipped += 1ULL;
+                context->points_skipped += feature.point_count;
+                context->collect_skip_count += 1ULL;
+                context->collect_skipped_bytes += point_bytes;
+                if (pack_reader_skip(&reader, point_bytes) != 0) {
+                    pack_reader_destroy(&reader);
+                    goto cleanup;
+                }
+                continue;
+            }
+            projected_points = (int *)rt_malloc(sizeof(int) * (size_t)feature.point_count * 2U);
+            if (projected_points == 0) {
+                pack_reader_destroy(&reader);
+                goto cleanup;
+            }
+            if (pack_reader_read_projected_feature_points_with_hash(&reader, &feature, context, projected_points, &feature_hash) != 0) {
+                rt_free(projected_points);
+                pack_reader_destroy(&reader);
+                goto cleanup;
+            }
+            inserted = feature_hash_set_insert(&seen_hashes, feature_hash);
+            if (inserted < 0 || (inserted > 0 && append_visible_feature(context, &feature, projected_points) != 0)) {
+                rt_free(projected_points);
+                pack_reader_destroy(&reader);
+                goto cleanup;
+            }
+            if (inserted > 0) {
+                context->features_collected += 1ULL;
+                context->points_collected += feature.point_count;
+                context->collect_point_bytes += point_bytes;
+            } else {
+                context->features_skipped += 1ULL;
+                context->points_skipped += feature.point_count;
+            }
+            rt_free(projected_points);
+        }
+        context->collect_refills += reader.refill_count;
+        context->collect_bytes_read += reader.bytes_read;
+        pack_reader_destroy(&reader);
+    }
+    result = 0;
+
+cleanup:
+    feature_hash_set_destroy(&seen_hashes);
+    rt_free(selected_records);
+    return result;
 }
 
 static int compute_city_boundary_bbox(RenderContext *context) {
@@ -520,7 +1125,10 @@ static int compute_city_boundary_bbox(RenderContext *context) {
     if (osm_node_index_open(&node_index, context->node_index_path, error, sizeof(error)) != 0) goto cleanup;
     if (osm_way_index_open(&way_index, context->way_index_path, error, sizeof(error)) != 0) goto cleanup;
     if (osm_relation_index_open(&relation_index, context->relation_index_path, error, sizeof(error)) != 0) goto cleanup;
-    if (!osm_relation_index_find_city(&relation_index, context->city_name, &relation_record)) goto cleanup;
+    if (!osm_relation_index_find_city(&relation_index, context->city_name, &relation_record)) {
+        result = 0;
+        goto cleanup;
+    }
     for (member_index = 0U; member_index < relation_record.member_count; ++member_index) {
         unsigned long long relation_member_index = relation_record.member_offset + (unsigned long long)member_index;
         OsmWayIndexRecord way_record;
@@ -635,7 +1243,10 @@ static int collect_city_boundary(RenderContext *context) {
     if (osm_node_index_open(&node_index, context->node_index_path, error, sizeof(error)) != 0) goto cleanup;
     if (osm_way_index_open(&way_index, context->way_index_path, error, sizeof(error)) != 0) goto cleanup;
     if (osm_relation_index_open(&relation_index, context->relation_index_path, error, sizeof(error)) != 0) goto cleanup;
-    if (!osm_relation_index_find_city(&relation_index, context->city_name, &relation_record)) goto cleanup;
+    if (!osm_relation_index_find_city(&relation_index, context->city_name, &relation_record)) {
+        result = 0;
+        goto cleanup;
+    }
     for (member_index = 0U; member_index < relation_record.member_count; ++member_index) {
         unsigned long long relation_member_index = relation_record.member_offset + (unsigned long long)member_index;
         if (relation_member_index >= relation_index.member_count) goto cleanup;
@@ -1493,6 +2104,88 @@ static int write_png(const char *path, const RenderContext *context) {
     return result;
 }
 
+static void write_render_summary(const char *out_path, const RenderContext *context, unsigned long long tile_count, unsigned long long selected_tile_count, unsigned long long tile_features,
+                                 unsigned long long elapsed_ms, int profile_enabled, unsigned long long total_elapsed_ms, unsigned long long bbox_elapsed_ms,
+                                 unsigned long long header_elapsed_ms, unsigned long long open_tile_elapsed_ms, unsigned long long fill_elapsed_ms,
+                                 unsigned long long collect_elapsed_ms, unsigned long long boundary_elapsed_ms, unsigned long long draw_elapsed_ms,
+                                 unsigned long long png_elapsed_ms) {
+    rt_write_cstr(1, "pack_valid: yes\n");
+    rt_write_cstr(1, "tile_count: ");
+    rt_write_uint(1, tile_count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "selected_tiles: ");
+    rt_write_uint(1, selected_tile_count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "tile_features: ");
+    rt_write_uint(1, tile_features);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "features_seen: ");
+    rt_write_uint(1, context->features_seen);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "features_skipped: ");
+    rt_write_uint(1, context->features_skipped);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "features_collected: ");
+    rt_write_uint(1, context->features_collected);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "points_skipped: ");
+    rt_write_uint(1, context->points_skipped);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "points_collected: ");
+    rt_write_uint(1, context->points_collected);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "collect_skip_count: ");
+    rt_write_uint(1, context->collect_skip_count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "collect_header_bytes: ");
+    rt_write_uint(1, context->collect_header_bytes);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "collect_skipped_bytes: ");
+    rt_write_uint(1, context->collect_skipped_bytes);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "collect_point_bytes: ");
+    rt_write_uint(1, context->collect_point_bytes);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "collect_refills: ");
+    rt_write_uint(1, context->collect_refills);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "collect_bytes_read: ");
+    rt_write_uint(1, context->collect_bytes_read);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "features_drawn: ");
+    rt_write_uint(1, context->features_drawn);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "segments_drawn: ");
+    rt_write_uint(1, context->segments_drawn);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "polygons_drawn: ");
+    rt_write_uint(1, context->polygons_drawn);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "boundary_features: ");
+    rt_write_uint(1, context->boundary_feature_count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "boundary_fade: ");
+    rt_write_cstr(1, context->boundary_fade_applied ? "yes" : "no");
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "render_elapsed_ms: ");
+    rt_write_uint(1, elapsed_ms);
+    rt_write_char(1, '\n');
+    if (profile_enabled) {
+        write_profile_ms("profile_total_ms: ", total_elapsed_ms);
+        write_profile_ms("profile_city_bbox_ms: ", bbox_elapsed_ms);
+        write_profile_ms("profile_header_ms: ", header_elapsed_ms);
+        write_profile_ms("profile_open_tile_ms: ", open_tile_elapsed_ms);
+        write_profile_ms("profile_fill_background_ms: ", fill_elapsed_ms);
+        write_profile_ms("profile_collect_features_ms: ", collect_elapsed_ms);
+        write_profile_ms("profile_collect_boundary_ms: ", boundary_elapsed_ms);
+        write_profile_ms("profile_draw_layers_ms: ", draw_elapsed_ms);
+        write_profile_ms("profile_write_png_ms: ", png_elapsed_ms);
+    }
+    rt_write_cstr(1, "output: ");
+    rt_write_cstr(1, out_path);
+    rt_write_char(1, '\n');
+}
+
 int main(int argc, char **argv) {
     const char *program = argc > 0 ? argv[0] : "osmrenderpackrender";
     const char *pack_path;
@@ -1502,18 +2195,32 @@ int main(int argc, char **argv) {
     char default_relation_index_path[256];
     OsmrPackHeader pack_header;
     OsmrPackTileRecord tile_record;
+    OsmrPackV2Header v2_header;
     RenderContext context;
     char error[OSMRPACK_ERROR_CAPACITY];
     int bbox_set = 0;
+    int profile_enabled = 0;
     int fd;
     int argi = 3;
-    unsigned long long start_ns;
+    int v2_header_result;
+    unsigned long long phase_start_ns;
+    unsigned long long total_start_ns;
+    unsigned long long bbox_elapsed_ms = 0ULL;
+    unsigned long long header_elapsed_ms = 0ULL;
+    unsigned long long open_tile_elapsed_ms = 0ULL;
+    unsigned long long fill_elapsed_ms = 0ULL;
+    unsigned long long collect_elapsed_ms = 0ULL;
+    unsigned long long boundary_elapsed_ms = 0ULL;
+    unsigned long long draw_elapsed_ms = 0ULL;
+    unsigned long long png_elapsed_ms = 0ULL;
     unsigned long long elapsed_ms;
+    unsigned long long total_elapsed_ms;
 
     if (argc < 5) {
         write_usage(program);
         return 1;
     }
+    total_start_ns = platform_get_monotonic_time_ns();
     pack_path = argv[1];
     out_path = argv[2];
     rt_memset(&context, 0, sizeof(context));
@@ -1536,13 +2243,13 @@ int main(int argc, char **argv) {
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--city") == 0) {
             argi += 1;
-            if (argi >= argc || set_city_bbox(argv[argi], &context) != 0) {
+            if (argi >= argc) {
                 write_usage(program);
                 return 1;
             }
+            if (set_city_bbox(argv[argi], &context) == 0) bbox_set = 1;
             context.city_name = argv[argi];
             context.city_enabled = 1;
-            bbox_set = 1;
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--width") == 0) {
             argi += 1;
@@ -1588,6 +2295,9 @@ int main(int argc, char **argv) {
         } else if (rt_strcmp(argv[argi], "--png-rgb") == 0) {
             context.png_palette = 0;
             argi += 1;
+        } else if (rt_strcmp(argv[argi], "--profile") == 0) {
+            profile_enabled = 1;
+            argi += 1;
         } else if (rt_strcmp(argv[argi], "-h") == 0 || rt_strcmp(argv[argi], "--help") == 0) {
             write_usage(program);
             return 0;
@@ -1596,10 +2306,11 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    if (!bbox_set) {
-        rt_write_cstr(2, "osmrenderpackrender: missing --bbox or supported --city\n");
+    if (!bbox_set && !context.city_enabled) {
+        rt_write_cstr(2, "osmrenderpackrender: missing --bbox or --city\n");
         return 1;
     }
+    phase_start_ns = platform_get_monotonic_time_ns();
     if (context.city_enabled) {
         if (context.node_index_path == 0 && infer_index_path_from_pack(pack_path, ".osmnidx", default_node_index_path, sizeof(default_node_index_path)) == 0 && path_exists(default_node_index_path)) context.node_index_path = default_node_index_path;
         if (context.way_index_path == 0 && infer_index_path_from_pack(pack_path, ".osmwidx", default_way_index_path, sizeof(default_way_index_path)) == 0 && path_exists(default_way_index_path)) context.way_index_path = default_way_index_path;
@@ -1608,8 +2319,89 @@ int main(int argc, char **argv) {
             rt_write_cstr(2, "osmrenderpackrender: failed while computing city boundary bbox\n");
             return 1;
         }
+        if (render_bbox_is_valid(&context)) bbox_set = 1;
     }
+    bbox_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
     error[0] = '\0';
+    phase_start_ns = platform_get_monotonic_time_ns();
+    v2_header_result = read_v2_header_path(pack_path, &v2_header);
+    if (v2_header_result < 0) {
+        rt_write_cstr(2, "osmrenderpackrender: could not read pack header\n");
+        return 1;
+    }
+    if (v2_header_result > 0) {
+        unsigned long long selected_tile_count = 0ULL;
+        unsigned long long selected_tile_features = 0ULL;
+
+        header_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+        phase_start_ns = platform_get_monotonic_time_ns();
+        fd = platform_open_read(pack_path);
+        if (fd < 0) {
+            rt_write_cstr(2, "osmrenderpackrender: could not open pack\n");
+            return 1;
+        }
+        if (!bbox_set && context.city_enabled) {
+            int place_bbox_result = apply_v2_place_bbox(fd, &v2_header, &context);
+            if (place_bbox_result < 0) {
+                (void)platform_close(fd);
+                rt_write_cstr(2, "osmrenderpackrender: failed while resolving v2 place bbox\n");
+                return 1;
+            }
+            if (place_bbox_result > 0 && render_bbox_is_valid(&context)) bbox_set = 1;
+        }
+        if (!bbox_set) {
+            (void)platform_close(fd);
+            rt_write_cstr(2, "osmrenderpackrender: could not resolve city bbox\n");
+            return 1;
+        }
+        open_tile_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+        phase_start_ns = platform_get_monotonic_time_ns();
+        if (fill_background(&context) != 0) {
+            (void)platform_close(fd);
+            rt_write_cstr(2, "osmrenderpackrender: could not allocate framebuffer\n");
+            return 1;
+        }
+        fill_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+        phase_start_ns = platform_get_monotonic_time_ns();
+        if (collect_visible_features_v2(fd, &v2_header, &context, &selected_tile_count, &selected_tile_features) != 0) {
+            rt_free(context.pixels);
+            (void)platform_close(fd);
+            rt_write_cstr(2, "osmrenderpackrender: failed while collecting visible v2 pack features\n");
+            return 1;
+        }
+        collect_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+        phase_start_ns = platform_get_monotonic_time_ns();
+        if (collect_city_boundary(&context) != 0) {
+            rt_free(context.features);
+            rt_free(context.points);
+            rt_free(context.pixels);
+            (void)platform_close(fd);
+            rt_write_cstr(2, "osmrenderpackrender: failed while collecting city boundary\n");
+            return 1;
+        }
+        boundary_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+        phase_start_ns = platform_get_monotonic_time_ns();
+        draw_collected_layers(&context);
+        draw_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+        elapsed_ms = collect_elapsed_ms + boundary_elapsed_ms + draw_elapsed_ms;
+        (void)platform_close(fd);
+        phase_start_ns = platform_get_monotonic_time_ns();
+        if (write_png(out_path, &context) != 0) {
+            rt_free(context.features);
+            rt_free(context.points);
+            rt_free(context.pixels);
+            rt_write_cstr(2, "osmrenderpackrender: could not write PNG\n");
+            return 1;
+        }
+        png_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+        total_elapsed_ms = (platform_get_monotonic_time_ns() - total_start_ns) / 1000000ULL;
+        rt_free(context.features);
+        rt_free(context.points);
+        rt_free(context.pixels);
+        write_render_summary(out_path, &context, v2_header.tile_count, selected_tile_count, selected_tile_features, elapsed_ms, profile_enabled, total_elapsed_ms, bbox_elapsed_ms,
+                             header_elapsed_ms, open_tile_elapsed_ms, fill_elapsed_ms, collect_elapsed_ms, boundary_elapsed_ms, draw_elapsed_ms, png_elapsed_ms);
+        return 0;
+    }
     if (osmrpack_read_header(pack_path, &pack_header, error, sizeof(error)) != 0) {
         rt_write_cstr(2, "osmrenderpackrender: ");
         rt_write_cstr(2, error[0] == '\0' ? "could not read pack" : error);
@@ -1620,6 +2412,12 @@ int main(int argc, char **argv) {
         rt_write_cstr(2, "osmrenderpackrender: pack contains no render tiles yet\n");
         return 2;
     }
+    if (!bbox_set) {
+        rt_write_cstr(2, "osmrenderpackrender: could not resolve city bbox\n");
+        return 1;
+    }
+    header_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+    phase_start_ns = platform_get_monotonic_time_ns();
     fd = platform_open_read(pack_path);
     if (fd < 0) {
         rt_write_cstr(2, "osmrenderpackrender: could not open pack\n");
@@ -1630,18 +2428,23 @@ int main(int argc, char **argv) {
         rt_write_cstr(2, "osmrenderpackrender: could not read tile directory\n");
         return 1;
     }
+    open_tile_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+    phase_start_ns = platform_get_monotonic_time_ns();
     if (fill_background(&context) != 0) {
         (void)platform_close(fd);
         rt_write_cstr(2, "osmrenderpackrender: could not allocate framebuffer\n");
         return 1;
     }
-    start_ns = platform_get_monotonic_time_ns();
+    fill_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+    phase_start_ns = platform_get_monotonic_time_ns();
     if (collect_visible_features(fd, &pack_header, &context) != 0) {
         rt_free(context.pixels);
         (void)platform_close(fd);
         rt_write_cstr(2, "osmrenderpackrender: failed while collecting visible pack features\n");
         return 1;
     }
+    collect_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+    phase_start_ns = platform_get_monotonic_time_ns();
     if (collect_city_boundary(&context) != 0) {
         rt_free(context.features);
         rt_free(context.points);
@@ -1650,47 +2453,24 @@ int main(int argc, char **argv) {
         rt_write_cstr(2, "osmrenderpackrender: failed while collecting city boundary\n");
         return 1;
     }
+    boundary_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+    phase_start_ns = platform_get_monotonic_time_ns();
     draw_collected_layers(&context);
-    elapsed_ms = (platform_get_monotonic_time_ns() - start_ns) / 1000000ULL;
+    draw_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+    elapsed_ms = collect_elapsed_ms + boundary_elapsed_ms + draw_elapsed_ms;
     (void)platform_close(fd);
+    phase_start_ns = platform_get_monotonic_time_ns();
     if (write_png(out_path, &context) != 0) {
         rt_free(context.pixels);
         rt_write_cstr(2, "osmrenderpackrender: could not write PNG\n");
         return 1;
     }
+    png_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+    total_elapsed_ms = (platform_get_monotonic_time_ns() - total_start_ns) / 1000000ULL;
     rt_free(context.features);
     rt_free(context.points);
     rt_free(context.pixels);
-    rt_write_cstr(1, "pack_valid: yes\n");
-    rt_write_cstr(1, "tile_count: ");
-    rt_write_uint(1, pack_header.tile_count);
-    rt_write_char(1, '\n');
-    rt_write_cstr(1, "tile_features: ");
-    rt_write_uint(1, tile_record.feature_count);
-    rt_write_char(1, '\n');
-    rt_write_cstr(1, "features_seen: ");
-    rt_write_uint(1, context.features_seen);
-    rt_write_char(1, '\n');
-    rt_write_cstr(1, "features_drawn: ");
-    rt_write_uint(1, context.features_drawn);
-    rt_write_char(1, '\n');
-    rt_write_cstr(1, "segments_drawn: ");
-    rt_write_uint(1, context.segments_drawn);
-    rt_write_char(1, '\n');
-    rt_write_cstr(1, "polygons_drawn: ");
-    rt_write_uint(1, context.polygons_drawn);
-    rt_write_char(1, '\n');
-    rt_write_cstr(1, "boundary_features: ");
-    rt_write_uint(1, context.boundary_feature_count);
-    rt_write_char(1, '\n');
-    rt_write_cstr(1, "boundary_fade: ");
-    rt_write_cstr(1, context.boundary_fade_applied ? "yes" : "no");
-    rt_write_char(1, '\n');
-    rt_write_cstr(1, "render_elapsed_ms: ");
-    rt_write_uint(1, elapsed_ms);
-    rt_write_char(1, '\n');
-    rt_write_cstr(1, "output: ");
-    rt_write_cstr(1, out_path);
-    rt_write_char(1, '\n');
+    write_render_summary(out_path, &context, pack_header.tile_count, 1ULL, tile_record.feature_count, elapsed_ms, profile_enabled, total_elapsed_ms, bbox_elapsed_ms,
+                         header_elapsed_ms, open_tile_elapsed_ms, fill_elapsed_ms, collect_elapsed_ms, boundary_elapsed_ms, draw_elapsed_ms, png_elapsed_ms);
     return 0;
 }

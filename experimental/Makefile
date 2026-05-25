@@ -29,6 +29,10 @@ OSMRENDERPACK_SRCS := \
     $(PACK_COMMON_SRCS) \
     src/osmrenderpack.c
 
+OSMRENDERPACKV2_SRCS := \
+    $(PACK_COMMON_SRCS) \
+    src/osmrenderpackv2.c
+
 OSMRPACKINFO_SRCS := \
     $(PACK_COMMON_SRCS) \
     src/osmrpackinfo.c
@@ -40,13 +44,16 @@ OSMRENDERPACKRENDER_SRCS := \
 
 .PHONY: all clean
 
-all: $(BUILD_DIR)/osmrenderpack $(BUILD_DIR)/osmrpackinfo $(BUILD_DIR)/osmrenderpackrender
+all: $(BUILD_DIR)/osmrenderpack $(BUILD_DIR)/osmrenderpackv2 $(BUILD_DIR)/osmrpackinfo $(BUILD_DIR)/osmrenderpackrender
 
 $(BUILD_DIR):
 	mkdir -p $@
 
 $(BUILD_DIR)/osmrenderpack: $(OSMRENDERPACK_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMRENDERPACK_SRCS) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/osmrenderpackv2: $(OSMRENDERPACKV2_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(OSMRENDERPACKV2_SRCS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/osmrpackinfo: $(OSMRPACKINFO_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMRPACKINFO_SRCS) $(LDFLAGS) -o $@
