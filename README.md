@@ -10,6 +10,7 @@ The repository currently provides:
 
 - `pbfinfo`, which reads OSM PBF fileblocks and reports summary counts and metadata.
 - `osmlookup`, which streams nodes, ways, and relations and filters them by type, tags, IDs, names, and bounding boxes.
+- `osmaddresses`, which extracts address tags into TSV rows containing street names, house numbers, and postcodes.
 - `osmnodeindex`, which builds a compact node coordinate index for way geometry lookup.
 - `osmrender`, an experimental BMP renderer used to validate rendering paths and benchmark indexing needs.
 - `threadtest`, a small validation tool for the Linux nolibc threading layer.

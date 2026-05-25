@@ -88,6 +88,54 @@ Examples:
 
 Output is line-oriented text. Nodes include coordinates; ways include decoded ref counts; relations include member counts.
 
+## osmaddresses
+
+`osmaddresses` extracts address tags from nodes, ways, and relations and writes tab-separated output. By default it emits only complete records that contain all three tags:
+
+```text
+addr:street
+addr:housenumber
+addr:postcode
+```
+
+Build and run:
+
+```sh
+make all
+./build/freestanding-linux-x86_64/osmaddresses data/germany-060524.osm.pbf build/germany-addresses.tsv
+```
+
+Output columns:
+
+```text
+type    id    lat    lon    street    housenumber    postcode
+```
+
+Node rows include coordinates. Way and relation rows leave the coordinate columns empty because this extractor only reads address tags; geometry can be resolved separately with the node index when needed.
+
+Options:
+
+- `--include-incomplete`, emit records that have at least one of street, housenumber, or postcode.
+- `--no-header`, omit the TSV header row.
+- `--limit N`, stop after writing `N` rows when the limit is reached from node or relation callbacks.
+
+The tool uses the `way_tags` prefilter to write address ways without decoding their packed node refs. This keeps way address extraction cheaper than a full geometry lookup.
+
+Smoke validation on `data/hamburg-260524.osm.pbf`:
+
+```sh
+./build/freestanding-linux-x86_64/osmaddresses data/hamburg-260524.osm.pbf build/hamburg-addresses-sample.tsv --limit 5
+```
+
+Result:
+
+```text
+addresses_written: 5
+node_addresses: 5
+way_addresses: 0
+relation_addresses: 0
+```
+
 ## osmnodeindex
 
 `osmnodeindex` builds a compact binary node coordinate index:

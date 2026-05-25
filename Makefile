@@ -35,6 +35,12 @@ OSMNODEINDEX_SRCS := \
     src/shared/pbf.c \
     src/tools/osmnodeindex.c
 
+OSMADDRESSES_SRCS := \
+    $(RUNTIME_SRCS) \
+    src/shared/compression/zlib.c \
+    src/shared/pbf.c \
+    src/tools/osmaddresses.c
+
 OSMRENDER_SRCS := \
     $(RUNTIME_SRCS) \
     src/shared/compression/zlib.c \
@@ -49,7 +55,7 @@ THREADTEST_SRCS := \
 
 .PHONY: all clean threadtest
 
-all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmrender $(BUILD_DIR)/threadtest
+all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmaddresses $(BUILD_DIR)/osmrender $(BUILD_DIR)/threadtest
 
 threadtest: $(BUILD_DIR)/threadtest
 
@@ -64,6 +70,9 @@ $(BUILD_DIR)/osmlookup: $(OSMLOOKUP_SRCS) | $(BUILD_DIR)
 
 $(BUILD_DIR)/osmnodeindex: $(OSMNODEINDEX_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMNODEINDEX_SRCS) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/osmaddresses: $(OSMADDRESSES_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(OSMADDRESSES_SRCS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/osmrender: $(OSMRENDER_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMRENDER_SRCS) $(LDFLAGS) -o $@
