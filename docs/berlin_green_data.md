@@ -63,9 +63,40 @@ relation 62422 members=177 boundary=administrative admin_level=4 ISO3166-2=DE-BE
 - `landuse=meadow`, `leisure=garden`, `natural=scrub`, `natural=grassland`, `natural=heath`, `natural=tree_row`, `landuse=orchard`, and `landuse=village_green` should be considered green renderable features. The renderer now maps these to park or forest styles.
 - Large landmarks such as Grunewald and Spandauer Forst are relation multipolygons. `osmrender --relation-id ID` can target one relation, collect its member way IDs, and render closed member ways or member outlines with the relation's green style.
 - `osmwayindex` builds a way-reference index so targeted relation renders can look up member ways directly instead of scanning all PBF ways. On `berlin-260524.osm.pbf`, `build/berlin.osmwidx` contains 1322684 ways and 10329914 refs and is about 110 MB.
+- Berlin's administrative boundary can be overlaid with `--boundary-relation-id 62422`.
 - Complete forest shapes remain incomplete because open relation members are not stitched into rings yet. The next structural improvement should be relation ring stitching, not color tuning.
 
 ## Current Checkpoints
+
+Full Berlin green-shape map with Berlin boundary:
+
+```sh
+./build/freestanding-linux-x86_64/osmnodeindex data/berlin-260524.osm.pbf build/berlin.osmnidx
+./build/freestanding-linux-x86_64/osmwayindex data/berlin-260524.osm.pbf build/berlin.osmwidx
+timeout 300 ./build/freestanding-linux-x86_64/osmrender data/berlin-260524.osm.pbf build/berlin-green-shapes-2048x1664.png --bbox 13.05,52.33,13.80,52.68 --width 2048 --height 1664 --style styles/osmrender-default.conf --node-index build/berlin.osmnidx --way-index build/berlin.osmwidx --green-only --boundary-relation-id 62422
+```
+
+The aspect ratio uses a latitude-aware height for the lon/lat bbox around Berlin. The east edge is padded to `13.80` so Berlin's eastern boundary does not clip against the image edge. `osmrender` writes PNG directly when the output path ends in `.png`; use the same command with a `.bmp` output path to write BMP instead. PNG output is dependency-free and uses an indexed-color palette when possible to keep map-style images smaller than BMP.
+
+Observed current counters:
+
+```text
+nodes_in_bbox: 7832535
+ways_seen: 48224
+ways_decoded: 48224
+ways_drawn: 48224
+segments_drawn: 722706
+relations_seen: 896
+relation_members_collected: 4509
+relation_ways_matched: 3558
+polygons_collected: 43219
+visible_pixels: 871668
+node_index: yes
+way_index: yes
+green_only: yes
+```
+
+Observed output: `build/berlin-green-shapes-2048x1664.png` is a 2048x1664 indexed-color PNG and is about 3.3 MB.
 
 Tree-point checkpoint:
 

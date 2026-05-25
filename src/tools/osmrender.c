@@ -1,5 +1,7 @@
 #include "pbf.h"
 #include "osm_index.h"
+#include "compression/crc32.h"
+#include "compression/zlib.h"
 #include "platform.h"
 #include "runtime.h"
 #include "simple_config.h"
@@ -42,6 +44,12 @@ typedef struct {
     OsmWayIndexRecord record;
     unsigned int style_id;
 } OsmRenderIndexedWayCandidate;
+
+typedef struct {
+    unsigned int color;
+    unsigned int count;
+    int used;
+} OsmRenderPngColorCount;
 
 typedef struct {
     long long min_lon_nano;
@@ -87,6 +95,7 @@ typedef struct {
     unsigned int stop_after_drawn;
     unsigned int max_way_refs;
     long long relation_filter_id;
+    long long boundary_relation_id;
     const char *node_index_path;
     const char *way_index_path;
     const OsmRenderStyleSheet *style_sheet;
@@ -96,6 +105,7 @@ typedef struct {
     int green_only;
     int no_fills;
     int relation_filter_enabled;
+    int boundary_relation_enabled;
     int node_index_open;
     int way_index_open;
     int stopped_after_nodes;
@@ -143,6 +153,7 @@ typedef enum {
     OSM_RENDER_STYLE_MINOR_ROAD,
     OSM_RENDER_STYLE_PATH,
     OSM_RENDER_STYLE_RAIL,
+    OSM_RENDER_STYLE_BOUNDARY,
     OSM_RENDER_STYLE_COUNT
 } OsmRenderStyleId;
 
@@ -156,7 +167,7 @@ struct OsmRenderStyleSheet {
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " FILE.osm.pbf OUT.bmp --bbox MINLON,MINLAT,MAXLON,MAXLAT [--width N] [--height N] [--style FILE] [--node-index FILE] [--way-index FILE] [--green-only] [--no-fills] [--max-way-refs N] [--relation-id ID] [--node-points] [--tree-points] [--stop-after-nodes N] [--stop-after-trees N] [--stop-after-ways N] [--stop-after-drawn N]\n");
+    rt_write_cstr(2, " FILE.osm.pbf OUT.bmp --bbox MINLON,MINLAT,MAXLON,MAXLAT [--width N] [--height N] [--style FILE] [--node-index FILE] [--way-index FILE] [--green-only] [--no-fills] [--max-way-refs N] [--relation-id ID] [--boundary-relation-id ID] [--node-points] [--tree-points] [--stop-after-nodes N] [--stop-after-trees N] [--stop-after-ways N] [--stop-after-drawn N]\n");
 }
 
 static int parse_uint_arg(const char *text, unsigned int *value_out) {
@@ -323,6 +334,8 @@ static void style_sheet_init(OsmRenderStyleSheet *style_sheet) {
     set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_PATH], 147U, 139U, 122U, 1U);
     set_casing_style(&style_sheet->styles[OSM_RENDER_STYLE_RAIL], 222U, 218U, 210U, 3U);
     set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_RAIL], 92U, 91U, 101U, 1U);
+    set_casing_style(&style_sheet->styles[OSM_RENDER_STYLE_BOUNDARY], 244U, 239U, 225U, 5U);
+    set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_BOUNDARY], 119U, 88U, 121U, 3U);
 }
 
 static void copy_style(const OsmRenderStyleSheet *style_sheet, OsmRenderStyleId style_id, OsmRenderStyle *style_out) {
@@ -405,7 +418,8 @@ static int classify_way(const OsmRenderStyleSheet *style_sheet, const PbfWay *wa
 
 static int style_id_is_green_context(OsmRenderStyleId style_id) {
     return style_id == OSM_RENDER_STYLE_WATER || style_id == OSM_RENDER_STYLE_WATERWAY ||
-           style_id == OSM_RENDER_STYLE_FOREST || style_id == OSM_RENDER_STYLE_PARK;
+           style_id == OSM_RENDER_STYLE_FOREST || style_id == OSM_RENDER_STYLE_PARK ||
+           style_id == OSM_RENDER_STYLE_BOUNDARY;
 }
 
 static int node_in_bbox(const OsmRenderContext *context, long long lat_nano, long long lon_nano) {
@@ -1005,6 +1019,7 @@ static int style_id_from_name(const char *name, size_t name_size, OsmRenderStyle
     else if (style_name_equals(name, name_size, "minor_road")) *style_id_out = OSM_RENDER_STYLE_MINOR_ROAD;
     else if (style_name_equals(name, name_size, "path")) *style_id_out = OSM_RENDER_STYLE_PATH;
     else if (style_name_equals(name, name_size, "rail")) *style_id_out = OSM_RENDER_STYLE_RAIL;
+    else if (style_name_equals(name, name_size, "boundary")) *style_id_out = OSM_RENDER_STYLE_BOUNDARY;
     else return -1;
     return 0;
 }
@@ -1100,6 +1115,7 @@ static int on_way(void *user, const PbfWay *way) {
     OsmRenderContext *context = (OsmRenderContext *)user;
     OsmRenderStyle style;
     OsmRenderStyleId style_id;
+    unsigned int relation_style_id;
     long long previous_x = 0;
     long long previous_y = 0;
     int has_previous = 0;
@@ -1109,24 +1125,19 @@ static int on_way(void *user, const PbfWay *way) {
     int is_relation_member = 0;
 
     if (context->relation_filter_enabled) {
-        unsigned int relation_style_id;
         if (!relation_way_find(context, way->id, &relation_style_id)) return 0;
+        style_id = (OsmRenderStyleId)relation_style_id;
+        copy_style(context->style_sheet, style_id, &style);
+        is_relation_member = 1;
+    } else if (relation_way_find(context, way->id, &relation_style_id) && style_id_is_green_context((OsmRenderStyleId)relation_style_id)) {
         style_id = (OsmRenderStyleId)relation_style_id;
         copy_style(context->style_sheet, style_id, &style);
         is_relation_member = 1;
     } else if (!classify_way(context->style_sheet, way, &style, &style_id)) {
-        unsigned int relation_style_id;
         if (!relation_way_find(context, way->id, &relation_style_id)) return 0;
         style_id = (OsmRenderStyleId)relation_style_id;
         copy_style(context->style_sheet, style_id, &style);
         is_relation_member = 1;
-    } else {
-        unsigned int relation_style_id;
-        if (relation_way_find(context, way->id, &relation_style_id) && style_id_is_green_context((OsmRenderStyleId)relation_style_id)) {
-            style_id = (OsmRenderStyleId)relation_style_id;
-            copy_style(context->style_sheet, style_id, &style);
-            is_relation_member = 1;
-        }
     }
     if (context->green_only && !style_id_is_green_context(style_id)) return 0;
     if (context->max_way_refs != 0U && way->ref_count > context->max_way_refs) {
@@ -1226,6 +1237,7 @@ static int on_relation_tags(void *user, long long id, const PbfTag *tags, unsign
     OsmRenderContext *context = (OsmRenderContext *)user;
     OsmRenderStyleId style_id;
 
+    if (context->boundary_relation_enabled && id == context->boundary_relation_id) return 1;
     if (context->relation_filter_enabled && id != context->relation_filter_id) return 0;
     if (!classify_tags_id(tags, tag_count, &style_id)) return 0;
     if (context->green_only && !style_id_is_green_context(style_id)) return 0;
@@ -1237,6 +1249,19 @@ static int on_relation(void *user, const PbfRelation *relation) {
     OsmRenderStyleId style_id;
     unsigned int index;
 
+    if (context->boundary_relation_enabled && relation->id == context->boundary_relation_id) {
+        context->relations_seen += 1ULL;
+        for (index = 0U; index < relation->member_count; ++index) {
+            const PbfRelationMember *member = &relation->members[index];
+            if (member->type == PBF_RELATION_MEMBER_WAY) {
+                if (relation_way_insert(context, member->id, (unsigned int)OSM_RENDER_STYLE_BOUNDARY) != 0) {
+                    context->failed = 1;
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    }
     if (context->relation_filter_enabled && relation->id != context->relation_filter_id) return 0;
     if (!classify_tags_id(relation->tags, relation->tag_count, &style_id)) return 0;
     if (!style_id_is_green_context(style_id)) return 0;
@@ -1343,6 +1368,13 @@ static void write_u32_le(unsigned char *out, unsigned int value) {
     out[3] = (unsigned char)((value >> 24U) & 0xffU);
 }
 
+static void write_u32_be(unsigned char *out, unsigned int value) {
+    out[0] = (unsigned char)((value >> 24U) & 0xffU);
+    out[1] = (unsigned char)((value >> 16U) & 0xffU);
+    out[2] = (unsigned char)((value >> 8U) & 0xffU);
+    out[3] = (unsigned char)(value & 0xffU);
+}
+
 static int write_bmp(const char *path, const OsmRenderContext *context) {
     int fd;
     unsigned int row_stride = ((context->width * 3U + 3U) / 4U) * 4U;
@@ -1393,6 +1425,302 @@ static int write_bmp(const char *path, const OsmRenderContext *context) {
     }
     rt_free(row);
     return platform_close(fd);
+}
+
+static int write_png_chunk(int fd, const char type[4], const unsigned char *data, size_t data_size) {
+    unsigned char header[8];
+    unsigned char crc_bytes[4];
+    unsigned int crc;
+
+    if (data_size > 0xffffffffU) return -1;
+    write_u32_be(header, (unsigned int)data_size);
+    header[4] = (unsigned char)type[0];
+    header[5] = (unsigned char)type[1];
+    header[6] = (unsigned char)type[2];
+    header[7] = (unsigned char)type[3];
+    if (rt_write_all(fd, header, sizeof(header)) != 0) return -1;
+    if (data_size != 0U && rt_write_all(fd, data, data_size) != 0) return -1;
+    crc = compression_crc32_update(0xffffffffU, (const unsigned char *)type, 4U);
+    if (data_size != 0U) crc = compression_crc32_update(crc, data, data_size);
+    write_u32_be(crc_bytes, compression_crc32_finish(crc));
+    return rt_write_all(fd, crc_bytes, sizeof(crc_bytes));
+}
+
+static int collect_png_palette(const OsmRenderContext *context, unsigned char *palette, unsigned int *palette_count_out) {
+    size_t pixel_count = (size_t)context->width * (size_t)context->height;
+    unsigned int palette_count = 0U;
+    size_t index;
+
+    for (index = 0U; index < pixel_count; ++index) {
+        const unsigned char *pixel = context->pixels + index * 3U;
+        unsigned int palette_index;
+        int found = 0;
+
+        for (palette_index = 0U; palette_index < palette_count; ++palette_index) {
+            const unsigned char *entry = palette + palette_index * 3U;
+            if (entry[0] == pixel[0] && entry[1] == pixel[1] && entry[2] == pixel[2]) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            if (palette_count == 256U) return 0;
+            palette[palette_count * 3U + 0U] = pixel[0];
+            palette[palette_count * 3U + 1U] = pixel[1];
+            palette[palette_count * 3U + 2U] = pixel[2];
+            palette_count += 1U;
+        }
+    }
+    *palette_count_out = palette_count;
+    return 1;
+}
+
+static unsigned char png_palette_index(const unsigned char *palette, unsigned int palette_count, const unsigned char *pixel) {
+    unsigned int index;
+
+    for (index = 0U; index < palette_count; ++index) {
+        const unsigned char *entry = palette + index * 3U;
+        if (entry[0] == pixel[0] && entry[1] == pixel[1] && entry[2] == pixel[2]) return (unsigned char)index;
+    }
+    return 0U;
+}
+
+static unsigned int png_rgb_color(const unsigned char *pixel) {
+    return ((unsigned int)pixel[0] << 16U) | ((unsigned int)pixel[1] << 8U) | (unsigned int)pixel[2];
+}
+
+static unsigned int png_color_hash(unsigned int color) {
+    color ^= color >> 16U;
+    color *= 0x7feb352dU;
+    color ^= color >> 15U;
+    color *= 0x846ca68bU;
+    color ^= color >> 16U;
+    return color;
+}
+
+static int collect_png_color_counts(const OsmRenderContext *context, OsmRenderPngColorCount *counts, unsigned int capacity, unsigned int *unique_count_out) {
+    size_t pixel_count = (size_t)context->width * (size_t)context->height;
+    unsigned int unique_count = 0U;
+    size_t index;
+
+    for (index = 0U; index < pixel_count; ++index) {
+        const unsigned char *pixel = context->pixels + index * 3U;
+        unsigned int color = png_rgb_color(pixel);
+        unsigned int slot = png_color_hash(color) & (capacity - 1U);
+
+        for (;;) {
+            if (!counts[slot].used) {
+                if (unique_count >= capacity / 2U) return 0;
+                counts[slot].used = 1;
+                counts[slot].color = color;
+                counts[slot].count = 1U;
+                unique_count += 1U;
+                break;
+            }
+            if (counts[slot].color == color) {
+                if (counts[slot].count != 0xffffffffU) counts[slot].count += 1U;
+                break;
+            }
+            slot = (slot + 1U) & (capacity - 1U);
+        }
+    }
+    *unique_count_out = unique_count;
+    return 1;
+}
+
+static void set_png_palette_color(unsigned char *palette, unsigned int index, unsigned int color) {
+    palette[index * 3U + 0U] = (unsigned char)((color >> 16U) & 0xffU);
+    palette[index * 3U + 1U] = (unsigned char)((color >> 8U) & 0xffU);
+    palette[index * 3U + 2U] = (unsigned char)(color & 0xffU);
+}
+
+static void build_png_cube_palette(unsigned char *palette, unsigned int *palette_count_out) {
+    unsigned int palette_count = 0U;
+    unsigned int red_index;
+
+    for (red_index = 0U; red_index < 6U; ++red_index) {
+        unsigned int green_index;
+        for (green_index = 0U; green_index < 6U; ++green_index) {
+            unsigned int blue_index;
+            for (blue_index = 0U; blue_index < 6U; ++blue_index) {
+                palette[palette_count * 3U + 0U] = (unsigned char)(red_index * 51U);
+                palette[palette_count * 3U + 1U] = (unsigned char)(green_index * 51U);
+                palette[palette_count * 3U + 2U] = (unsigned char)(blue_index * 51U);
+                palette_count += 1U;
+            }
+        }
+    }
+    *palette_count_out = palette_count;
+}
+
+static int build_png_counted_palette(const OsmRenderContext *context, unsigned char *palette, unsigned int *palette_count_out) {
+    unsigned int capacity = 16384U;
+    OsmRenderPngColorCount *counts;
+    unsigned int unique_count = 0U;
+    unsigned int palette_count = 0U;
+
+    counts = (OsmRenderPngColorCount *)rt_malloc(sizeof(*counts) * (size_t)capacity);
+    if (counts == 0) return 0;
+    rt_memset(counts, 0, sizeof(*counts) * (size_t)capacity);
+    if (!collect_png_color_counts(context, counts, capacity, &unique_count)) {
+        rt_free(counts);
+        build_png_cube_palette(palette, palette_count_out);
+        return 1;
+    }
+    while (palette_count < 256U && palette_count < unique_count) {
+        unsigned int best_slot = capacity;
+        unsigned int slot;
+
+        for (slot = 0U; slot < capacity; ++slot) {
+            if (counts[slot].used && (best_slot == capacity || counts[slot].count > counts[best_slot].count)) {
+                best_slot = slot;
+            }
+        }
+        if (best_slot == capacity) break;
+        set_png_palette_color(palette, palette_count, counts[best_slot].color);
+        counts[best_slot].used = 0;
+        palette_count += 1U;
+    }
+    rt_free(counts);
+    *palette_count_out = palette_count;
+    return palette_count != 0U;
+}
+
+static unsigned char png_nearest_palette_index(const unsigned char *palette, unsigned int palette_count, const unsigned char *pixel) {
+    unsigned int best_index = 0U;
+    unsigned int best_distance = 0xffffffffU;
+    unsigned int index;
+
+    for (index = 0U; index < palette_count; ++index) {
+        const unsigned char *entry = palette + index * 3U;
+        int red_delta = (int)pixel[0] - (int)entry[0];
+        int green_delta = (int)pixel[1] - (int)entry[1];
+        int blue_delta = (int)pixel[2] - (int)entry[2];
+        unsigned int distance = (unsigned int)(red_delta * red_delta + green_delta * green_delta + blue_delta * blue_delta);
+
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_index = index;
+            if (distance == 0U) break;
+        }
+    }
+    return (unsigned char)best_index;
+}
+
+static int png_raw_size(unsigned int width, unsigned int height, unsigned int bytes_per_pixel, size_t *raw_size_out) {
+    size_t row_size;
+
+    if (width == 0U || height == 0U || bytes_per_pixel == 0U) return -1;
+    if ((size_t)width > (((size_t)-1) - 1U) / (size_t)bytes_per_pixel) return -1;
+    row_size = (size_t)width * (size_t)bytes_per_pixel + 1U;
+    if ((size_t)height > ((size_t)-1) / row_size) return -1;
+    *raw_size_out = row_size * (size_t)height;
+    return 0;
+}
+
+static int build_png_raw_image(const OsmRenderContext *context, const unsigned char *palette, unsigned int palette_count, int exact_palette, unsigned char **raw_out, size_t *raw_size_out, unsigned int *color_type_out) {
+    unsigned int bytes_per_pixel = palette_count != 0U ? 1U : 3U;
+    size_t raw_size;
+    size_t row_size;
+    unsigned char *raw;
+    unsigned int y;
+
+    if (png_raw_size(context->width, context->height, bytes_per_pixel, &raw_size) != 0) return -1;
+    row_size = (size_t)context->width * (size_t)bytes_per_pixel + 1U;
+    raw = (unsigned char *)rt_malloc(raw_size);
+    if (raw == 0) return -1;
+    for (y = 0U; y < context->height; ++y) {
+        unsigned char *row = raw + (size_t)y * row_size;
+        unsigned int x;
+
+        row[0] = 0U;
+        for (x = 0U; x < context->width; ++x) {
+            const unsigned char *pixel = context->pixels + ((size_t)y * (size_t)context->width + (size_t)x) * 3U;
+            if (palette_count != 0U) {
+                row[1U + x] = exact_palette ? png_palette_index(palette, palette_count, pixel) : png_nearest_palette_index(palette, palette_count, pixel);
+            } else {
+                row[1U + (size_t)x * 3U + 0U] = pixel[0];
+                row[1U + (size_t)x * 3U + 1U] = pixel[1];
+                row[1U + (size_t)x * 3U + 2U] = pixel[2];
+            }
+        }
+    }
+    *raw_out = raw;
+    *raw_size_out = raw_size;
+    *color_type_out = palette_count != 0U ? 3U : 2U;
+    return 0;
+}
+
+static int write_png(const char *path, const OsmRenderContext *context) {
+    static const unsigned char signature[8] = {0x89U, 'P', 'N', 'G', '\r', '\n', 0x1aU, '\n'};
+    unsigned char palette[256U * 3U];
+    unsigned int palette_count = 0U;
+    int exact_palette = 1;
+    unsigned char ihdr[13];
+    unsigned char *raw = 0;
+    unsigned char *compressed = 0;
+    size_t raw_size = 0U;
+    size_t compressed_capacity;
+    size_t compressed_size = 0U;
+    unsigned int color_type;
+    int fd;
+    int result = -1;
+
+    if (!collect_png_palette(context, palette, &palette_count)) {
+        exact_palette = 0;
+        if (!build_png_counted_palette(context, palette, &palette_count)) palette_count = 0U;
+    }
+    if (build_png_raw_image(context, palette, palette_count, exact_palette, &raw, &raw_size, &color_type) != 0) return -1;
+    compressed_capacity = compression_zlib_store_bound(raw_size);
+    if (compressed_capacity == 0U) {
+        rt_free(raw);
+        return -1;
+    }
+    compressed = (unsigned char *)rt_malloc(compressed_capacity);
+    if (compressed == 0) {
+        rt_free(raw);
+        return -1;
+    }
+    if (compression_zlib_store(raw, raw_size, compressed, compressed_capacity, &compressed_size) != 0) {
+        rt_free(compressed);
+        rt_free(raw);
+        return -1;
+    }
+    fd = platform_open_write(path, 0644U);
+    if (fd < 0) {
+        rt_free(compressed);
+        rt_free(raw);
+        return -1;
+    }
+    write_u32_be(ihdr + 0U, context->width);
+    write_u32_be(ihdr + 4U, context->height);
+    ihdr[8] = 8U;
+    ihdr[9] = (unsigned char)color_type;
+    ihdr[10] = 0U;
+    ihdr[11] = 0U;
+    ihdr[12] = 0U;
+    if (rt_write_all(fd, signature, sizeof(signature)) == 0 &&
+        write_png_chunk(fd, "IHDR", ihdr, sizeof(ihdr)) == 0 &&
+        (palette_count == 0U || write_png_chunk(fd, "PLTE", palette, (size_t)palette_count * 3U) == 0) &&
+        write_png_chunk(fd, "IDAT", compressed, compressed_size) == 0 &&
+        write_png_chunk(fd, "IEND", 0, 0U) == 0) {
+        result = 0;
+    }
+    if (platform_close(fd) != 0) result = -1;
+    rt_free(compressed);
+    rt_free(raw);
+    return result;
+}
+
+static int path_has_png_extension(const char *path) {
+    size_t size = rt_strlen(path);
+
+    return size >= 4U && path[size - 4U] == '.' && path[size - 3U] == 'p' && path[size - 2U] == 'n' && path[size - 1U] == 'g';
+}
+
+static int write_render_output(const char *path, const OsmRenderContext *context) {
+    if (path_has_png_extension(path)) return write_png(path, context);
+    return write_bmp(path, context);
 }
 
 static void fill_background(OsmRenderContext *context) {
@@ -1479,7 +1807,9 @@ static const OsmRenderLayer render_layers[] = {
     { OSM_RENDER_STEP_LINE, OSM_RENDER_STYLE_PRIMARY },
     { OSM_RENDER_STEP_LINE, OSM_RENDER_STYLE_MOTORWAY },
     { OSM_RENDER_STEP_CASING, OSM_RENDER_STYLE_RAIL },
-    { OSM_RENDER_STEP_LINE, OSM_RENDER_STYLE_RAIL }
+    { OSM_RENDER_STEP_LINE, OSM_RENDER_STYLE_RAIL },
+    { OSM_RENDER_STEP_CASING, OSM_RENDER_STYLE_BOUNDARY },
+    { OSM_RENDER_STEP_LINE, OSM_RENDER_STYLE_BOUNDARY }
 };
 
 static void draw_render_layers(OsmRenderContext *context) {
@@ -1630,6 +1960,14 @@ int main(int argc, char **argv) {
             }
             context.relation_filter_enabled = 1;
             argi += 1;
+        } else if (rt_strcmp(argv[argi], "--boundary-relation-id") == 0) {
+            argi += 1;
+            if (argi >= argc || parse_id_arg(argv[argi], &context.boundary_relation_id) != 0) {
+                write_usage(program);
+                return 1;
+            }
+            context.boundary_relation_enabled = 1;
+            argi += 1;
         } else if (rt_strcmp(argv[argi], "--stop-after-nodes") == 0) {
             argi += 1;
             if (argi >= argc || parse_uint_arg(argv[argi], &context.stop_after_nodes) != 0) {
@@ -1769,8 +2107,8 @@ int main(int argc, char **argv) {
         draw_render_layers(&context);
     }
     context.visible_pixels = count_visible_pixels(&context);
-    if (write_bmp(out_path, &context) != 0) {
-        rt_write_cstr(2, "osmrender: could not write BMP\n");
+    if (write_render_output(out_path, &context) != 0) {
+        rt_write_cstr(2, "osmrender: could not write output image\n");
         cleanup_context(&context);
         return 1;
     }

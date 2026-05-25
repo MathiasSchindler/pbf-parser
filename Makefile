@@ -55,6 +55,7 @@ OSMADDRESSES_SRCS := \
 OSMRENDER_SRCS := \
     $(RUNTIME_SRCS) \
     src/platform/linux/fs.c \
+    src/shared/compression/crc32.c \
     src/shared/compression/zlib.c \
     src/shared/osm_index.c \
     src/shared/pbf.c \

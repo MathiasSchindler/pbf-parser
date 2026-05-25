@@ -13,7 +13,7 @@ The repository currently provides:
 - `osmaddresses`, which extracts address tags into TSV rows containing state, city, suburb, street, house number, and postcode fields.
 - `osmnodeindex`, which builds a compact node coordinate index for way geometry lookup.
 - `osmwayindex`, which builds a compact way-reference index for targeted relation rendering.
-- `osmrender`, an experimental BMP renderer used to validate rendering paths and benchmark indexing needs.
+- `osmrender`, an experimental BMP/PNG renderer used to validate rendering paths and benchmark indexing needs.
 - `threadtest`, a small validation tool for the Linux nolibc threading layer.
 
 The project is not intended to be a complete GIS engine. It is a compact parser and tool collection for exploring OSM PBF data with minimal runtime dependencies.
