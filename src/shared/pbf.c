@@ -49,10 +49,18 @@ typedef struct {
     PlatformMutex ready_mutex;
     PlatformMutex merge_mutex;
     PbfSummary summary;
+    const PbfStreamParallelOptions *stream_options;
+    unsigned char *stream_worker_users;
     volatile int failed;
+    volatile int stopped;
     char *error;
     size_t error_capacity;
 } PbfParallelContext;
+
+typedef struct {
+    PbfParallelContext *context;
+    unsigned int worker_index;
+} PbfParallelWorkerStart;
 
 typedef struct {
     PbfText *items;
@@ -1279,6 +1287,55 @@ static int pbf_parallel_worker_main(void *arg) {
     return 0;
 }
 
+static int pbf_parallel_stream_worker_main(void *arg) {
+    PbfParallelWorkerStart *start = (PbfParallelWorkerStart *)arg;
+    PbfParallelContext *context = start->context;
+    const PbfStreamParallelOptions *options = context->stream_options;
+    void *worker_user = context->stream_worker_users + (size_t)start->worker_index * options->worker_user_size;
+
+    for (;;) {
+        PbfParallelSlot *slot;
+        PbfDecodedBlob decoded;
+        unsigned int slot_index;
+        int failed;
+
+        platform_semaphore_wait(&context->ready_slots);
+        platform_mutex_lock(&context->ready_mutex);
+        slot_index = context->ready_indices[context->ready_read_index % context->slot_count];
+        context->ready_read_index += 1U;
+        platform_mutex_unlock(&context->ready_mutex);
+        slot = &context->slots[slot_index];
+
+        if (slot->stop) {
+            break;
+        }
+
+        failed = __atomic_load_n(&context->failed, __ATOMIC_ACQUIRE);
+        if (!failed && !__atomic_load_n(&context->stopped, __ATOMIC_ACQUIRE) && pbf_text_equals(slot->header.type, "OSMData")) {
+            if (pbf_decode_blob(slot->blob_data, slot->blob_size, &decoded) != 0) {
+                pbf_parallel_set_error(context, "could not decode OSMData Blob");
+            } else {
+                int result = pbf_stream_primitive_block(decoded.data, decoded.size, options->callbacks, worker_user);
+                if (result < 0) {
+                    pbf_parallel_set_error(context, "could not parse OSM protobuf payload");
+                } else if (result > 0) {
+                    __atomic_store_n(&context->stopped, 1, __ATOMIC_RELEASE);
+                }
+                if (decoded.should_free) {
+                    rt_free(decoded.data);
+                }
+            }
+        }
+        platform_mutex_lock(&context->free_mutex);
+        context->free_indices[context->free_write_index % context->slot_count] = slot_index;
+        context->free_write_index += 1U;
+        platform_mutex_unlock(&context->free_mutex);
+        platform_semaphore_post(&context->free_slots);
+    }
+
+    return 0;
+}
+
 static int pbf_parallel_take_free_slot(PbfParallelContext *context, unsigned int *slot_index_out) {
     platform_semaphore_wait(&context->free_slots);
     platform_mutex_lock(&context->free_mutex);
@@ -1371,7 +1428,7 @@ static int pbf_parallel_read_blocks(int fd, PbfParallelContext *context, unsigne
         slot->stop = 0;
         pbf_parallel_post_ready_slot(context, slot_index);
 
-        if (__atomic_load_n(&context->failed, __ATOMIC_ACQUIRE)) {
+        if (__atomic_load_n(&context->failed, __ATOMIC_ACQUIRE) || __atomic_load_n(&context->stopped, __ATOMIC_ACQUIRE)) {
             break;
         }
     }
@@ -1551,6 +1608,170 @@ int pbf_read_summary_parallel(const char *path, unsigned int worker_count, PbfSu
     rt_free(context.free_indices);
     rt_free(context.ready_indices);
     rt_free(threads);
+    return result;
+}
+
+static int pbf_stream_entities_parallel_serial(const char *path, const PbfStreamParallelOptions *options, char *error, size_t error_capacity) {
+    void *worker_user;
+    int result;
+
+    if (options == 0 || options->callbacks == 0 || options->worker_user_size == 0U || options->merge_worker == 0) {
+        pbf_set_error(error, error_capacity, "invalid parallel stream options");
+        return -1;
+    }
+    worker_user = rt_malloc(options->worker_user_size);
+    if (worker_user == 0) {
+        pbf_set_error(error, error_capacity, "out of memory");
+        return -1;
+    }
+    rt_memset(worker_user, 0, options->worker_user_size);
+    if (options->init_worker != 0 && options->init_worker(worker_user, 0U, options->shared_user) != 0) {
+        rt_free(worker_user);
+        pbf_set_error(error, error_capacity, "could not initialize stream worker");
+        return -1;
+    }
+    result = pbf_stream_entities(path, options->callbacks, worker_user, error, error_capacity);
+    if (result == 0 && options->merge_worker(options->shared_user, worker_user) != 0) {
+        pbf_set_error(error, error_capacity, "could not merge stream worker results");
+        result = -1;
+    }
+    if (options->destroy_worker != 0) {
+        options->destroy_worker(worker_user);
+    }
+    rt_free(worker_user);
+    return result;
+}
+
+int pbf_stream_entities_parallel(const char *path, unsigned int worker_count, const PbfStreamParallelOptions *options, char *error, size_t error_capacity) {
+    PbfParallelContext context;
+    PlatformThread *threads;
+    PbfParallelWorkerStart *starts;
+    int fd;
+    unsigned int slot_count;
+    unsigned int started = 0U;
+    unsigned int initialized = 0U;
+    unsigned int index;
+    int result = 0;
+
+    if (worker_count <= 1U) {
+        return pbf_stream_entities_parallel_serial(path, options, error, error_capacity);
+    }
+    if (options == 0 || options->callbacks == 0 || options->worker_user_size == 0U || options->merge_worker == 0) {
+        pbf_set_error(error, error_capacity, "invalid parallel stream options");
+        return -1;
+    }
+    if (worker_count > PBF_PARALLEL_MAX_WORKERS) {
+        worker_count = PBF_PARALLEL_MAX_WORKERS;
+    }
+
+    rt_memset(&context, 0, sizeof(context));
+    context.error = error;
+    context.error_capacity = error_capacity;
+    context.stream_options = options;
+    slot_count = worker_count * PBF_PARALLEL_QUEUE_MULTIPLIER;
+    context.slot_count = slot_count;
+    context.slots = (PbfParallelSlot *)rt_malloc(sizeof(PbfParallelSlot) * (size_t)slot_count);
+    context.free_indices = (unsigned int *)rt_malloc(sizeof(unsigned int) * (size_t)slot_count);
+    context.ready_indices = (unsigned int *)rt_malloc(sizeof(unsigned int) * (size_t)slot_count);
+    threads = (PlatformThread *)rt_malloc(sizeof(PlatformThread) * (size_t)worker_count);
+    starts = (PbfParallelWorkerStart *)rt_malloc(sizeof(PbfParallelWorkerStart) * (size_t)worker_count);
+    context.stream_worker_users = (unsigned char *)rt_malloc(options->worker_user_size * (size_t)worker_count);
+    if (context.slots == 0 || context.free_indices == 0 || context.ready_indices == 0 || threads == 0 || starts == 0 || context.stream_worker_users == 0) {
+        pbf_set_error(error, error_capacity, "out of memory");
+        if (context.slots != 0) rt_free(context.slots);
+        if (context.free_indices != 0) rt_free(context.free_indices);
+        if (context.ready_indices != 0) rt_free(context.ready_indices);
+        if (threads != 0) rt_free(threads);
+        if (starts != 0) rt_free(starts);
+        if (context.stream_worker_users != 0) rt_free(context.stream_worker_users);
+        return -1;
+    }
+    rt_memset(context.slots, 0, sizeof(PbfParallelSlot) * (size_t)slot_count);
+    rt_memset(context.stream_worker_users, 0, options->worker_user_size * (size_t)worker_count);
+    for (index = 0U; index < slot_count; ++index) {
+        context.free_indices[index] = index;
+    }
+    context.free_write_index = slot_count;
+    platform_mutex_init(&context.free_mutex);
+    platform_mutex_init(&context.ready_mutex);
+    platform_mutex_init(&context.merge_mutex);
+    platform_semaphore_init(&context.free_slots, (int)slot_count);
+    platform_semaphore_init(&context.ready_slots, 0);
+
+    for (index = 0U; index < worker_count; ++index) {
+        void *worker_user = context.stream_worker_users + (size_t)index * options->worker_user_size;
+        if (options->init_worker != 0 && options->init_worker(worker_user, index, options->shared_user) != 0) {
+            pbf_set_error(error, error_capacity, "could not initialize stream worker");
+            result = -1;
+            break;
+        }
+        initialized += 1U;
+    }
+
+    fd = result == 0 ? platform_open_read(path) : -1;
+    if (result == 0 && fd < 0) {
+        pbf_set_error(error, error_capacity, "could not open input file");
+        result = -1;
+    }
+
+    if (result == 0) {
+        for (index = 0U; index < worker_count; ++index) {
+            starts[index].context = &context;
+            starts[index].worker_index = index;
+            if (platform_thread_start(&threads[index], pbf_parallel_stream_worker_main, &starts[index], 0U) != 0) {
+                pbf_parallel_set_error(&context, "could not start worker thread");
+                break;
+            }
+            started += 1U;
+        }
+
+        if (started == worker_count) {
+            result = pbf_parallel_read_blocks(fd, &context, started);
+        } else {
+            for (index = 0U; index < started; ++index) {
+                (void)pbf_parallel_enqueue_stop(&context);
+            }
+            result = -1;
+        }
+        (void)platform_close(fd);
+    }
+
+    for (index = 0U; index < started; ++index) {
+        int thread_result = 0;
+        if (platform_thread_join(&threads[index], &thread_result) != 0 || thread_result != 0) {
+            result = -1;
+            pbf_set_error(error, error_capacity, "worker thread failed");
+        }
+    }
+    if (result == 0 && !context.failed) {
+        for (index = 0U; index < initialized; ++index) {
+            void *worker_user = context.stream_worker_users + (size_t)index * options->worker_user_size;
+            if (options->merge_worker(options->shared_user, worker_user) != 0) {
+                pbf_set_error(error, error_capacity, "could not merge stream worker results");
+                result = -1;
+                break;
+            }
+        }
+    } else {
+        result = -1;
+    }
+    if (options->destroy_worker != 0) {
+        for (index = 0U; index < initialized; ++index) {
+            void *worker_user = context.stream_worker_users + (size_t)index * options->worker_user_size;
+            options->destroy_worker(worker_user);
+        }
+    }
+    for (index = 0U; index < slot_count; ++index) {
+        if (context.slots[index].blob_data != 0) {
+            rt_free(context.slots[index].blob_data);
+        }
+    }
+    rt_free(context.slots);
+    rt_free(context.free_indices);
+    rt_free(context.ready_indices);
+    rt_free(threads);
+    rt_free(starts);
+    rt_free(context.stream_worker_users);
     return result;
 }
 

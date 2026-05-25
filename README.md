@@ -17,6 +17,9 @@ The repository currently provides:
 - `osmrelindex`, which builds a compact administrative relation index for fast city-boundary lookup.
 - `osmspindex`, which builds a way bounding-box index from node and way indexes for faster viewport filtering.
 - `osmrender`, an experimental BMP/PNG renderer with bbox, relation-boundary, city-name, green-area, major-road rendering modes, and a font-rendered status footer.
+- `osmrenderpackv2`, which builds `OSMRPK02` render-pack files from `.osm.pbf` extracts for faster repeated city/bbox rendering.
+- `osmrpackinfo`, which prints render-pack header and directory metadata.
+- `osmrender-rpack`, which renders PNGs from `.rpack` files using `--city` or `--bbox` without scanning the source PBF.
 - `threadtest`, a small validation tool for the Linux nolibc threading layer.
 - `fonttest`, a small smoke tool for the vendored TrueType renderer used by future map labels.
 
@@ -76,6 +79,15 @@ With `--city`, `osmrender` infers matching `build/<extract>.osmnidx`, `.osmwidx`
 
 By default, `osmrender` appends a small status footer below the map when the configured TrueType font is available. Footer font, colors, size, and text are configured with `footer.*` keys in `styles/osmrender-default.conf`; `--font FILE.ttf` overrides the configured font for one run, and `--no-status-footer` disables the footer for clean exports. Available footer variables are documented in `docs/osmrender_footer.md`.
 
+For repeated renders from a large extract, build a render pack once and render from it:
+
+```sh
+./build/freestanding-linux-x86_64/osmrenderpackv2 --tile-zoom 10 --threads 8 data/germany-260524.osm.pbf build/germany.rpack
+./build/freestanding-linux-x86_64/osmrender-rpack build/germany.rpack city.png --city Berlin --width 1600 --height 1200 --profile
+```
+
+`osmrender-rpack` can render directly from the pack-contained place directory, tile payloads, and embedded per-place boundary payloads. For `--city`, it draws the matching administrative boundary and fades pixels outside it without sidecar indexes; `.osmnidx`, `.osmwidx`, and `.osmridx` remain as a fallback for older packs. The pack format is documented in `docs/osmrpack_format.md`.
+
 ## Fonts
 
 The project vendors the freestanding TrueType backend from `~/fontrender` under `src/shared/fontrender`. The core remains dependency-free and is connected to this runtime by `fontrender_runtime_install()`. `osmrender` uses it for the diagnostic footer; full map labels are still future work.
@@ -96,6 +108,7 @@ Additional notes are in:
 - `docs/osm_streaming.md`
 - `docs/osm_rendering.md`
 - `docs/osmrender_footer.md`
+- `docs/osmrpack_format.md`
 - `docs/berlin_green_data.md`
 
 ## Generation And License

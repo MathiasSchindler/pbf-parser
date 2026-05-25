@@ -62,6 +62,16 @@ Useful experiments:
 - Stack-backed zlib Huffman tables reduced allocator traffic and improved Germany `--threads 8` from about 8.35s to about 7.78s.
 - One slot per worker reduced memory use, but did not beat two slots per worker on Germany.
 
+`osmrenderpackv2` also uses the threaded PBF fileblock stream for selected entity phases:
+
+```sh
+./build/freestanding-linux-x86_64/osmrenderpackv2 --tile-zoom 10 --threads 8 data/brandenburg-260524.osm.pbf build/brandenburg.rpack
+```
+
+`--threads` controls the node-coordinate collection pass. That pass scales well because workers decode dense nodes independently, probe a shared read-only node hash, and merge only source-node counters. On Brandenburg at tile zoom 10, `collect_nodes` dropped from 6419 ms with `--threads 1` to 943 ms with `--threads 8`, and full conversion dropped from 17.97s to 12.38s.
+
+The builder also has `--way-threads N` for the worker-local way collector. It is correct and preserves the same pack counts, but it is currently a negative performance experiment on the benchmark host: `--threads 8 --way-threads 8` raised full Brandenburg conversion to 21.86s because generic way/tag parsing and allocation overhead dominate. Keep `--way-threads 1` unless that path is optimized further.
+
 ## Current Scope
 
 This is currently implemented for Linux x86_64, matching the active freestanding build target. macOS, Windows, and aarch64 can keep the same public API with platform-specific implementations later.

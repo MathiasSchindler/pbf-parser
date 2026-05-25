@@ -11,6 +11,7 @@ RUNTIME_SRCS := \
     $(ROOT)/src/arch/x86_64/linux/crt0.S \
     $(ROOT)/src/arch/x86_64/linux/syscall_stubs.S \
     $(ROOT)/src/platform/linux/io.c \
+    $(ROOT)/src/platform/linux/thread.c \
     $(ROOT)/src/platform/linux/time.c \
     $(ROOT)/src/shared/runtime/io.c \
     $(ROOT)/src/shared/runtime/memory.c \
@@ -25,10 +26,6 @@ PACK_COMMON_SRCS := \
     $(ROOT)/src/shared/pbf.c \
     src/osmrpack.c
 
-OSMRENDERPACK_SRCS := \
-    $(PACK_COMMON_SRCS) \
-    src/osmrenderpack.c
-
 OSMRENDERPACKV2_SRCS := \
     $(PACK_COMMON_SRCS) \
     src/osmrenderpackv2.c
@@ -37,29 +34,18 @@ OSMRPACKINFO_SRCS := \
     $(PACK_COMMON_SRCS) \
     src/osmrpackinfo.c
 
-OSMRENDERPACKRENDER_SRCS := \
-    $(PACK_COMMON_SRCS) \
-    $(ROOT)/src/shared/osm_index.c \
-    src/osmrenderpackrender.c
-
 .PHONY: all clean
 
-all: $(BUILD_DIR)/osmrenderpack $(BUILD_DIR)/osmrenderpackv2 $(BUILD_DIR)/osmrpackinfo $(BUILD_DIR)/osmrenderpackrender
+all: $(BUILD_DIR)/osmrenderpackv2 $(BUILD_DIR)/osmrpackinfo
 
 $(BUILD_DIR):
 	mkdir -p $@
-
-$(BUILD_DIR)/osmrenderpack: $(OSMRENDERPACK_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMRENDERPACK_SRCS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/osmrenderpackv2: $(OSMRENDERPACKV2_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMRENDERPACKV2_SRCS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/osmrpackinfo: $(OSMRPACKINFO_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMRPACKINFO_SRCS) $(LDFLAGS) -o $@
-
-$(BUILD_DIR)/osmrenderpackrender: $(OSMRENDERPACKRENDER_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMRENDERPACKRENDER_SRCS) $(LDFLAGS) -o $@
 
 clean:
 	rm -rf build

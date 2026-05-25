@@ -96,6 +96,33 @@ OSMRENDER_SRCS := \
     src/shared/simple_config.c \
     src/tools/osmrender.c
 
+OSMRENDERPACKV2_SRCS := \
+    $(RUNTIME_SRCS) \
+    src/platform/linux/fs.c \
+    src/platform/linux/thread.c \
+    src/platform/linux/time.c \
+    src/shared/compression/zlib.c \
+    src/shared/pbf.c \
+    src/shared/osmrpack.c \
+    src/tools/osmrenderpackv2.c
+
+OSMRPACKINFO_SRCS := \
+    $(RUNTIME_SRCS) \
+    src/platform/linux/fs.c \
+    src/shared/osmrpack.c \
+    src/tools/osmrpackinfo.c
+
+OSMRENDER_RPACK_SRCS := \
+    $(RUNTIME_SRCS) \
+    src/platform/linux/fs.c \
+    src/platform/linux/time.c \
+    src/shared/compression/crc32.c \
+    src/shared/compression/zlib.c \
+    src/shared/osm_index.c \
+    src/shared/pbf.c \
+    src/shared/osmrpack.c \
+    src/tools/osmrender_rpack.c
+
 THREADTEST_SRCS := \
     $(RUNTIME_SRCS) \
     src/platform/linux/thread.c \
@@ -109,7 +136,7 @@ FONTTEST_SRCS := \
 
 .PHONY: all clean threadtest
 
-all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmwayindex $(BUILD_DIR)/osmindex $(BUILD_DIR)/osmrelindex $(BUILD_DIR)/osmspindex $(BUILD_DIR)/osmaddresses $(BUILD_DIR)/osmrender $(BUILD_DIR)/threadtest $(BUILD_DIR)/fonttest
+all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmwayindex $(BUILD_DIR)/osmindex $(BUILD_DIR)/osmrelindex $(BUILD_DIR)/osmspindex $(BUILD_DIR)/osmaddresses $(BUILD_DIR)/osmrender $(BUILD_DIR)/osmrenderpackv2 $(BUILD_DIR)/osmrpackinfo $(BUILD_DIR)/osmrender-rpack $(BUILD_DIR)/threadtest $(BUILD_DIR)/fonttest
 
 threadtest: $(BUILD_DIR)/threadtest
 
@@ -142,6 +169,15 @@ $(BUILD_DIR)/osmaddresses: $(OSMADDRESSES_SRCS) | $(BUILD_DIR)
 
 $(BUILD_DIR)/osmrender: $(OSMRENDER_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMRENDER_SRCS) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/osmrenderpackv2: $(OSMRENDERPACKV2_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(OSMRENDERPACKV2_SRCS) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/osmrpackinfo: $(OSMRPACKINFO_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(OSMRPACKINFO_SRCS) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/osmrender-rpack: $(OSMRENDER_RPACK_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(OSMRENDER_RPACK_SRCS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/threadtest: $(THREADTEST_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(THREADTEST_SRCS) $(LDFLAGS) -o $@

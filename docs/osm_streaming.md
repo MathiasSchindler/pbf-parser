@@ -23,6 +23,21 @@ int pbf_stream_entities(const char *path,
                         void *user,
                         char *error,
                         size_t error_capacity);
+
+typedef struct {
+    const PbfStreamCallbacks *callbacks;
+    size_t worker_user_size;
+    int (*init_worker)(void *worker_user, unsigned int worker_index, void *shared_user);
+    int (*merge_worker)(void *shared_user, void *worker_user);
+    void (*destroy_worker)(void *worker_user);
+    void *shared_user;
+} PbfStreamParallelOptions;
+
+int pbf_stream_entities_parallel(const char *path,
+                                 unsigned int worker_count,
+                                 const PbfStreamParallelOptions *options,
+                                 char *error,
+                                 size_t error_capacity);
 ```
 
 Each callback receives data that is valid only for the duration of the callback. Consumers that need to keep tags, refs, members, or text must copy them.
@@ -45,7 +60,9 @@ Coordinates are exposed as signed nanodegrees. Convert with:
 degrees = nano / 1000000000
 ```
 
-The stream parser currently runs serially. The threaded fileblock pipeline remains available for summary-style consumers such as `pbfinfo`; entity callbacks need an ordering and synchronization policy before they should be parallelized.
+`pbf_stream_entities` runs serially. `pbf_stream_entities_parallel` uses the threaded fileblock pipeline and gives each worker a separate callback user buffer. Worker callbacks must write only to their worker-local state or to explicitly shared read-only structures. After all worker threads exit, `merge_worker` runs serially for each worker so consumers can append results into their global output without callback-time locks.
+
+Parallel entity streaming does not preserve source entity order. It is intended for order-independent consumers such as render-pack construction phases that collect worker-local ways or fill a prebuilt node lookup. If `worker_count` is `1`, the parallel API still uses one worker-local buffer and then calls `merge_worker`; this keeps serial and threaded code paths consistent.
 
 ## osmlookup
 

@@ -89,6 +89,15 @@ typedef struct {
     int (*relation)(void *user, const PbfRelation *relation);
 } PbfStreamCallbacks;
 
+typedef struct {
+    const PbfStreamCallbacks *callbacks;
+    size_t worker_user_size;
+    int (*init_worker)(void *worker_user, unsigned int worker_index, void *shared_user);
+    int (*merge_worker)(void *shared_user, void *worker_user);
+    void (*destroy_worker)(void *worker_user);
+    void *shared_user;
+} PbfStreamParallelOptions;
+
 #define PBF_STREAM_SKIP_NODE_TAGS (1U << 0)
 #define PBF_STREAM_SKIP_WAY_TAGS  (1U << 1)
 #define PBF_STREAM_SKIP_RELATION_ROLES (1U << 2)
@@ -97,5 +106,6 @@ void pbf_summary_init(PbfSummary *summary);
 int pbf_read_summary(const char *path, PbfSummary *summary, char *error, size_t error_capacity);
 int pbf_read_summary_parallel(const char *path, unsigned int worker_count, PbfSummary *summary, char *error, size_t error_capacity);
 int pbf_stream_entities(const char *path, const PbfStreamCallbacks *callbacks, void *user, char *error, size_t error_capacity);
+int pbf_stream_entities_parallel(const char *path, unsigned int worker_count, const PbfStreamParallelOptions *options, char *error, size_t error_capacity);
 
 #endif

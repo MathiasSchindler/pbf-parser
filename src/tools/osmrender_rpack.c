@@ -99,6 +99,9 @@ typedef struct {
     const char *node_index_path;
     const char *way_index_path;
     const char *relation_index_path;
+    unsigned long long v2_boundary_payload_offset;
+    unsigned long long v2_boundary_payload_size;
+    unsigned int v2_boundary_feature_count;
     unsigned int boundary_feature_count;
     int city_enabled;
     int boundary_fade;
@@ -218,7 +221,7 @@ static const RenderLayer render_layers[] = {
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " PACK.osmrpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]\n");
+    rt_write_cstr(2, " PACK.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]\n");
 }
 
 static void write_profile_ms(const char *label, unsigned long long elapsed_ms) {
@@ -257,6 +260,32 @@ static int parse_uint_arg(const char *text, unsigned int *value_out) {
     if (rt_parse_uint(text, &value) != 0 || value == 0ULL || value > 10000ULL) return -1;
     *value_out = (unsigned int)value;
     return 0;
+}
+
+static unsigned int clamp_dimension(unsigned long long value) {
+    if (value < 1ULL) return 1U;
+    if (value > 10000ULL) return 10000U;
+    return (unsigned int)value;
+}
+
+static void choose_missing_dimension(RenderContext *context, int width_explicit, int height_explicit) {
+    unsigned long long lon_span;
+    unsigned long long lat_span;
+    unsigned long long scaled_lon_span;
+
+    if (width_explicit == height_explicit) return;
+    if (context->max_lon_nano <= context->min_lon_nano || context->max_lat_nano <= context->min_lat_nano) return;
+    lon_span = (unsigned long long)(context->max_lon_nano - context->min_lon_nano);
+    lat_span = (unsigned long long)(context->max_lat_nano - context->min_lat_nano);
+    scaled_lon_span = (lon_span * 3ULL + 2ULL) / 5ULL;
+    if (scaled_lon_span == 0ULL) scaled_lon_span = 1ULL;
+    if (width_explicit) {
+        unsigned long long height = (lat_span * (unsigned long long)context->width + scaled_lon_span / 2ULL) / scaled_lon_span;
+        context->height = clamp_dimension(height);
+    } else {
+        unsigned long long width = (scaled_lon_span * (unsigned long long)context->height + lat_span / 2ULL) / lat_span;
+        context->width = clamp_dimension(width);
+    }
 }
 
 static int parse_coord_part(const char *text, size_t size, long long *value_out) {
@@ -924,6 +953,9 @@ static int apply_v2_place_bbox(int fd, const OsmrPackV2Header *header, RenderCon
     long long best_min_lat = 0;
     long long best_max_lon = 0;
     long long best_max_lat = 0;
+    unsigned long long best_boundary_payload_offset = 0ULL;
+    unsigned long long best_boundary_payload_size = 0ULL;
+    unsigned int best_boundary_feature_count = 0U;
     int found = 0;
 
     if (!context->city_enabled || context->city_name == 0 || header->place_count == 0ULL) return 0;
@@ -935,7 +967,10 @@ static int apply_v2_place_bbox(int fd, const OsmrPackV2Header *header, RenderCon
         long long max_lon;
         long long max_lat;
         unsigned long long name_offset;
+        unsigned long long boundary_payload_offset;
+        unsigned long long boundary_payload_size;
         unsigned int name_size;
+        unsigned int boundary_feature_count;
         unsigned int rank_score;
         long long next_record_offset = (long long)(header->place_directory_offset + (place_index + 1ULL) * OSMRPACK_V2_PLACE_RECORD_SIZE);
         int match;
@@ -948,6 +983,9 @@ static int apply_v2_place_bbox(int fd, const OsmrPackV2Header *header, RenderCon
         max_lat = read_i64_le(data + 48U);
         name_offset = read_u64_le(data + 56U);
         name_size = read_u32_le(data + 64U);
+        boundary_payload_offset = read_u64_le(data + 68U);
+        boundary_payload_size = read_u64_le(data + 76U);
+        boundary_feature_count = read_u32_le(data + 84U);
         match = v2_place_name_matches(fd, name_offset, name_size, context->city_name);
         if (match < 0) return -1;
         if (match && min_lon < max_lon && min_lat < max_lat && (!found || rank_score > best_rank)) {
@@ -956,6 +994,9 @@ static int apply_v2_place_bbox(int fd, const OsmrPackV2Header *header, RenderCon
             best_min_lat = min_lat;
             best_max_lon = max_lon;
             best_max_lat = max_lat;
+            best_boundary_payload_offset = boundary_payload_offset;
+            best_boundary_payload_size = boundary_payload_size;
+            best_boundary_feature_count = boundary_feature_count;
             found = 1;
         }
         if (platform_seek(fd, next_record_offset, PLATFORM_SEEK_SET) < 0) return -1;
@@ -969,8 +1010,43 @@ static int apply_v2_place_bbox(int fd, const OsmrPackV2Header *header, RenderCon
         context->max_lon_nano = best_max_lon + lon_padding;
         context->min_lat_nano = best_min_lat - lat_padding;
         context->max_lat_nano = best_max_lat + lat_padding;
+        context->v2_boundary_payload_offset = best_boundary_payload_offset;
+        context->v2_boundary_payload_size = best_boundary_payload_size;
+        context->v2_boundary_feature_count = best_boundary_feature_count;
         return 1;
     }
+    return 0;
+}
+
+static int collect_v2_place_boundary(RenderContext *context, int fd) {
+    unsigned char count_data[8];
+    unsigned long long feature_count;
+    unsigned long long feature_index;
+    unsigned long long payload_end;
+
+    if (!context->city_enabled || context->v2_boundary_payload_offset == 0ULL || context->v2_boundary_payload_size < 8ULL || context->v2_boundary_feature_count == 0U) return 0;
+    payload_end = context->v2_boundary_payload_offset + context->v2_boundary_payload_size;
+    if (payload_end < context->v2_boundary_payload_offset) return -1;
+    if (platform_seek(fd, (long long)context->v2_boundary_payload_offset, PLATFORM_SEEK_SET) < 0) return -1;
+    if (read_exact(fd, count_data, sizeof(count_data)) != 0) return -1;
+    feature_count = read_u64_le(count_data);
+    if (feature_count != (unsigned long long)context->v2_boundary_feature_count || feature_count > 1000000ULL) return -1;
+    for (feature_index = 0ULL; feature_index < feature_count; ++feature_index) {
+        PackFeatureHeader feature;
+        int *projected_points;
+
+        if (read_feature_header(fd, &feature) != 0) return -1;
+        if (feature.style_id != PACK_STYLE_BOUNDARY || feature.flags != 0U || feature.point_count < 2U || feature.point_count > 10000000U) return -1;
+        projected_points = (int *)rt_malloc(sizeof(int) * (size_t)feature.point_count * 2U);
+        if (projected_points == 0) return -1;
+        if (read_projected_feature_points(fd, &feature, context, projected_points) != 0 || append_visible_feature(context, &feature, projected_points) != 0) {
+            rt_free(projected_points);
+            return -1;
+        }
+        context->boundary_feature_count += 1U;
+        rt_free(projected_points);
+    }
+    if (platform_seek(fd, (long long)payload_end, PLATFORM_SEEK_SET) < 0) return -1;
     return 0;
 }
 
@@ -2187,7 +2263,7 @@ static void write_render_summary(const char *out_path, const RenderContext *cont
 }
 
 int main(int argc, char **argv) {
-    const char *program = argc > 0 ? argv[0] : "osmrenderpackrender";
+    const char *program = argc > 0 ? argv[0] : "osmrender-rpack";
     const char *pack_path;
     const char *out_path;
     char default_node_index_path[256];
@@ -2200,6 +2276,8 @@ int main(int argc, char **argv) {
     char error[OSMRPACK_ERROR_CAPACITY];
     int bbox_set = 0;
     int profile_enabled = 0;
+    int width_explicit = 0;
+    int height_explicit = 0;
     int fd;
     int argi = 3;
     int v2_header_result;
@@ -2257,6 +2335,7 @@ int main(int argc, char **argv) {
                 write_usage(program);
                 return 1;
             }
+            width_explicit = 1;
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--height") == 0) {
             argi += 1;
@@ -2264,6 +2343,7 @@ int main(int argc, char **argv) {
                 write_usage(program);
                 return 1;
             }
+            height_explicit = 1;
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--node-index") == 0) {
             argi += 1;
@@ -2307,7 +2387,7 @@ int main(int argc, char **argv) {
         }
     }
     if (!bbox_set && !context.city_enabled) {
-        rt_write_cstr(2, "osmrenderpackrender: missing --bbox or --city\n");
+        rt_write_cstr(2, "osmrender-rpack: missing --bbox or --city\n");
         return 1;
     }
     phase_start_ns = platform_get_monotonic_time_ns();
@@ -2316,7 +2396,7 @@ int main(int argc, char **argv) {
         if (context.way_index_path == 0 && infer_index_path_from_pack(pack_path, ".osmwidx", default_way_index_path, sizeof(default_way_index_path)) == 0 && path_exists(default_way_index_path)) context.way_index_path = default_way_index_path;
         if (context.relation_index_path == 0 && infer_index_path_from_pack(pack_path, ".osmridx", default_relation_index_path, sizeof(default_relation_index_path)) == 0 && path_exists(default_relation_index_path)) context.relation_index_path = default_relation_index_path;
         if (compute_city_boundary_bbox(&context) != 0) {
-            rt_write_cstr(2, "osmrenderpackrender: failed while computing city boundary bbox\n");
+            rt_write_cstr(2, "osmrender-rpack: failed while computing city boundary bbox\n");
             return 1;
         }
         if (render_bbox_is_valid(&context)) bbox_set = 1;
@@ -2326,7 +2406,7 @@ int main(int argc, char **argv) {
     phase_start_ns = platform_get_monotonic_time_ns();
     v2_header_result = read_v2_header_path(pack_path, &v2_header);
     if (v2_header_result < 0) {
-        rt_write_cstr(2, "osmrenderpackrender: could not read pack header\n");
+        rt_write_cstr(2, "osmrender-rpack: could not read pack header\n");
         return 1;
     }
     if (v2_header_result > 0) {
@@ -2337,28 +2417,29 @@ int main(int argc, char **argv) {
         phase_start_ns = platform_get_monotonic_time_ns();
         fd = platform_open_read(pack_path);
         if (fd < 0) {
-            rt_write_cstr(2, "osmrenderpackrender: could not open pack\n");
+            rt_write_cstr(2, "osmrender-rpack: could not open pack\n");
             return 1;
         }
-        if (!bbox_set && context.city_enabled) {
+        if (context.city_enabled) {
             int place_bbox_result = apply_v2_place_bbox(fd, &v2_header, &context);
             if (place_bbox_result < 0) {
                 (void)platform_close(fd);
-                rt_write_cstr(2, "osmrenderpackrender: failed while resolving v2 place bbox\n");
+                rt_write_cstr(2, "osmrender-rpack: failed while resolving v2 place bbox\n");
                 return 1;
             }
             if (place_bbox_result > 0 && render_bbox_is_valid(&context)) bbox_set = 1;
         }
         if (!bbox_set) {
             (void)platform_close(fd);
-            rt_write_cstr(2, "osmrenderpackrender: could not resolve city bbox\n");
+            rt_write_cstr(2, "osmrender-rpack: could not resolve city bbox\n");
             return 1;
         }
+        choose_missing_dimension(&context, width_explicit, height_explicit);
         open_tile_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
         phase_start_ns = platform_get_monotonic_time_ns();
         if (fill_background(&context) != 0) {
             (void)platform_close(fd);
-            rt_write_cstr(2, "osmrenderpackrender: could not allocate framebuffer\n");
+            rt_write_cstr(2, "osmrender-rpack: could not allocate framebuffer\n");
             return 1;
         }
         fill_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
@@ -2366,17 +2447,17 @@ int main(int argc, char **argv) {
         if (collect_visible_features_v2(fd, &v2_header, &context, &selected_tile_count, &selected_tile_features) != 0) {
             rt_free(context.pixels);
             (void)platform_close(fd);
-            rt_write_cstr(2, "osmrenderpackrender: failed while collecting visible v2 pack features\n");
+            rt_write_cstr(2, "osmrender-rpack: failed while collecting visible v2 pack features\n");
             return 1;
         }
         collect_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
         phase_start_ns = platform_get_monotonic_time_ns();
-        if (collect_city_boundary(&context) != 0) {
+        if (collect_v2_place_boundary(&context, fd) != 0 || (context.boundary_feature_count == 0U && collect_city_boundary(&context) != 0)) {
             rt_free(context.features);
             rt_free(context.points);
             rt_free(context.pixels);
             (void)platform_close(fd);
-            rt_write_cstr(2, "osmrenderpackrender: failed while collecting city boundary\n");
+            rt_write_cstr(2, "osmrender-rpack: failed while collecting city boundary\n");
             return 1;
         }
         boundary_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
@@ -2390,7 +2471,7 @@ int main(int argc, char **argv) {
             rt_free(context.features);
             rt_free(context.points);
             rt_free(context.pixels);
-            rt_write_cstr(2, "osmrenderpackrender: could not write PNG\n");
+            rt_write_cstr(2, "osmrender-rpack: could not write PNG\n");
             return 1;
         }
         png_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
@@ -2403,36 +2484,37 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (osmrpack_read_header(pack_path, &pack_header, error, sizeof(error)) != 0) {
-        rt_write_cstr(2, "osmrenderpackrender: ");
+        rt_write_cstr(2, "osmrender-rpack: ");
         rt_write_cstr(2, error[0] == '\0' ? "could not read pack" : error);
         rt_write_char(2, '\n');
         return 1;
     }
     if (pack_header.tile_count == 0ULL || pack_header.feature_data_size == 0ULL) {
-        rt_write_cstr(2, "osmrenderpackrender: pack contains no render tiles yet\n");
+        rt_write_cstr(2, "osmrender-rpack: pack contains no render tiles yet\n");
         return 2;
     }
     if (!bbox_set) {
-        rt_write_cstr(2, "osmrenderpackrender: could not resolve city bbox\n");
+        rt_write_cstr(2, "osmrender-rpack: could not resolve city bbox\n");
         return 1;
     }
+    choose_missing_dimension(&context, width_explicit, height_explicit);
     header_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
     phase_start_ns = platform_get_monotonic_time_ns();
     fd = platform_open_read(pack_path);
     if (fd < 0) {
-        rt_write_cstr(2, "osmrenderpackrender: could not open pack\n");
+        rt_write_cstr(2, "osmrender-rpack: could not open pack\n");
         return 1;
     }
     if (platform_seek(fd, (long long)pack_header.tile_directory_offset, PLATFORM_SEEK_SET) < 0 || osmrpack_read_tile_record_fd(fd, &tile_record) != 0) {
         (void)platform_close(fd);
-        rt_write_cstr(2, "osmrenderpackrender: could not read tile directory\n");
+        rt_write_cstr(2, "osmrender-rpack: could not read tile directory\n");
         return 1;
     }
     open_tile_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
     phase_start_ns = platform_get_monotonic_time_ns();
     if (fill_background(&context) != 0) {
         (void)platform_close(fd);
-        rt_write_cstr(2, "osmrenderpackrender: could not allocate framebuffer\n");
+        rt_write_cstr(2, "osmrender-rpack: could not allocate framebuffer\n");
         return 1;
     }
     fill_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
@@ -2440,7 +2522,7 @@ int main(int argc, char **argv) {
     if (collect_visible_features(fd, &pack_header, &context) != 0) {
         rt_free(context.pixels);
         (void)platform_close(fd);
-        rt_write_cstr(2, "osmrenderpackrender: failed while collecting visible pack features\n");
+        rt_write_cstr(2, "osmrender-rpack: failed while collecting visible pack features\n");
         return 1;
     }
     collect_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
@@ -2450,7 +2532,7 @@ int main(int argc, char **argv) {
         rt_free(context.points);
         rt_free(context.pixels);
         (void)platform_close(fd);
-        rt_write_cstr(2, "osmrenderpackrender: failed while collecting city boundary\n");
+        rt_write_cstr(2, "osmrender-rpack: failed while collecting city boundary\n");
         return 1;
     }
     boundary_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
@@ -2462,7 +2544,7 @@ int main(int argc, char **argv) {
     phase_start_ns = platform_get_monotonic_time_ns();
     if (write_png(out_path, &context) != 0) {
         rt_free(context.pixels);
-        rt_write_cstr(2, "osmrenderpackrender: could not write PNG\n");
+        rt_write_cstr(2, "osmrender-rpack: could not write PNG\n");
         return 1;
     }
     png_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
