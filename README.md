@@ -16,8 +16,9 @@ The repository currently provides:
 - `osmindex`, which builds node and way indexes together in one buffered pass through a PBF file.
 - `osmrelindex`, which builds a compact administrative relation index for fast city-boundary lookup.
 - `osmspindex`, which builds a way bounding-box index from node and way indexes for faster viewport filtering.
-- `osmrender`, an experimental BMP/PNG renderer with bbox, relation-boundary, city-name, green-area, and major-road rendering modes.
+- `osmrender`, an experimental BMP/PNG renderer with bbox, relation-boundary, city-name, green-area, major-road rendering modes, and a font-rendered status footer.
 - `threadtest`, a small validation tool for the Linux nolibc threading layer.
+- `fonttest`, a small smoke tool for the vendored TrueType renderer used by future map labels.
 
 The project is not intended to be a complete GIS engine. It is a compact parser and tool collection for exploring OSM PBF data with minimal runtime dependencies.
 
@@ -31,6 +32,8 @@ The code is split into platform, runtime, shared parser, and tool layers:
 - `src/shared/compression` contains the local zlib/deflate implementation used for PBF blobs.
 - `src/shared/pbf.c` and `src/shared/pbf.h` contain the OSM PBF and protobuf streaming parser.
 - `src/shared/osm_index.c` and `src/shared/osm_index.h` contain the reusable node, way, relation, and spatial index formats and lookup code.
+- `src/shared/fontrender` contains the vendored freestanding TrueType parser/rasterizer core from `~/fontrender`.
+- `src/shared/fontrender_runtime.c` installs this project's memory, file, and logging hooks for the font renderer.
 - `src/tools` contains the command-line tools built on top of the shared layers.
 
 The parser reads PBF fileblocks, decodes `OSMHeader` and `OSMData` blobs, inflates zlib-compressed payloads, parses protobuf fields, and exposes decoded OSM entities through streaming callbacks. Consumers can skip node tags or prefilter way and relation tags when they only need coordinates, IDs, renderable ways, or tag-only records.
@@ -70,6 +73,20 @@ Then a short city render command uses sane defaults:
 ```
 
 With `--city`, `osmrender` infers matching `build/<extract>.osmnidx`, `.osmwidx`, optional `.osmridx`, optional `.osmspidx`, the default style file, green-area rendering, major roads, aspect-aware output dimensions, and a brighter outside-boundary mask. If the inferred indexes are missing, it prints the commands needed to rebuild them.
+
+By default, `osmrender` appends a small white status footer below the map when a usable TrueType font is available. The footer reports map dimensions, render time, node/way/relation counters, polygons, and segments without changing the rendered map area. Use `--font FILE.ttf` to choose a font explicitly, or `--no-status-footer` for clean exports.
+
+## Fonts
+
+The project vendors the freestanding TrueType backend from `~/fontrender` under `src/shared/fontrender`. The core remains dependency-free and is connected to this runtime by `fontrender_runtime_install()`. `osmrender` uses it for the diagnostic footer; full map labels are still future work.
+
+A smoke test can load a `.ttf` and rasterize one glyph:
+
+```sh
+./build/freestanding-linux-x86_64/fonttest /path/to/font.ttf A 32
+```
+
+It prints glyph metrics and the number of non-empty bitmap pixels.
 
 ## Documentation
 

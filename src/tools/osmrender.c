@@ -2,6 +2,8 @@
 #include "osm_index.h"
 #include "compression/crc32.h"
 #include "compression/zlib.h"
+#include "fontrender/font_backend.h"
+#include "fontrender_runtime.h"
 #include "platform.h"
 #include "runtime.h"
 #include "simple_config.h"
@@ -108,6 +110,7 @@ typedef struct {
     const char *way_index_path;
     const char *relation_index_path;
     const char *spatial_index_path;
+    const char *font_path;
     const char *city_name;
     const OsmRenderStyleSheet *style_sheet;
     unsigned int render_step;
@@ -119,6 +122,8 @@ typedef struct {
     int no_relation_scan;
     int boundary_fade;
     int boundary_fade_applied;
+    int status_footer;
+    int status_footer_applied;
     int bbox_enabled;
     int relation_filter_enabled;
     int boundary_relation_enabled;
@@ -134,6 +139,7 @@ typedef struct {
     int stopped_after_ways;
     int stopped_after_drawn;
     int failed;
+    unsigned long long render_elapsed_ms;
 } OsmRenderContext;
 
 typedef struct {
@@ -190,7 +196,7 @@ struct OsmRenderStyleSheet {
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " FILE.osm.pbf OUT.bmp|OUT.png --bbox MINLON,MINLAT,MAXLON,MAXLAT [--city NAME] [--width N] [--height N] [--style FILE] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--spatial-index FILE] [--green-only] [--major-roads] [--no-fills] [--no-relation-scan] [--no-boundary-fade] [--max-way-refs N] [--relation-id ID] [--boundary-relation-id ID] [--node-points] [--tree-points] [--stop-after-nodes N] [--stop-after-trees N] [--stop-after-ways N] [--stop-after-drawn N]\n");
+    rt_write_cstr(2, " FILE.osm.pbf OUT.bmp|OUT.png --bbox MINLON,MINLAT,MAXLON,MAXLAT [--city NAME] [--width N] [--height N] [--style FILE] [--font FILE.ttf] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--spatial-index FILE] [--green-only] [--major-roads] [--no-fills] [--no-relation-scan] [--no-boundary-fade] [--no-status-footer] [--max-way-refs N] [--relation-id ID] [--boundary-relation-id ID] [--node-points] [--tree-points] [--stop-after-nodes N] [--stop-after-trees N] [--stop-after-ways N] [--stop-after-drawn N]\n");
 }
 
 static int path_exists(const char *path) {
@@ -218,6 +224,55 @@ static int append_text_n(char *buffer, size_t buffer_size, size_t *length_io, co
     memcpy(buffer + *length_io, text, text_length);
     *length_io += text_length;
     buffer[*length_io] = '\0';
+    return 0;
+}
+
+static int append_uint_text(char *buffer, size_t buffer_size, size_t *length_io, unsigned long long value) {
+    char number[32];
+
+    rt_unsigned_to_string(value, number, sizeof(number));
+    return append_text(buffer, buffer_size, length_io, number);
+}
+
+static int append_status_text(OsmRenderContext *context, char *buffer, size_t buffer_size, unsigned int map_width, unsigned int map_height, unsigned int image_height) {
+    size_t length = 0U;
+
+    buffer[0] = '\0';
+    if (context->city_enabled && context->city_name != 0) {
+        if (append_text(buffer, buffer_size, &length, context->city_name) != 0) return -1;
+        if (append_text(buffer, buffer_size, &length, " | ") != 0) return -1;
+    }
+    if (append_text(buffer, buffer_size, &length, "map=") != 0) return -1;
+    if (append_uint_text(buffer, buffer_size, &length, map_width) != 0) return -1;
+    if (append_text(buffer, buffer_size, &length, "x") != 0) return -1;
+    if (append_uint_text(buffer, buffer_size, &length, map_height) != 0) return -1;
+    if (append_text(buffer, buffer_size, &length, " img=") != 0) return -1;
+    if (append_uint_text(buffer, buffer_size, &length, context->width) != 0) return -1;
+    if (append_text(buffer, buffer_size, &length, "x") != 0) return -1;
+    if (append_uint_text(buffer, buffer_size, &length, image_height) != 0) return -1;
+    if (append_text(buffer, buffer_size, &length, " t=") != 0) return -1;
+    if (append_uint_text(buffer, buffer_size, &length, context->render_elapsed_ms) != 0) return -1;
+    if (append_text(buffer, buffer_size, &length, "ms n=") != 0) return -1;
+    if (append_uint_text(buffer, buffer_size, &length, context->node_count) != 0) return -1;
+    if (append_text(buffer, buffer_size, &length, " w=") != 0) return -1;
+    if (append_uint_text(buffer, buffer_size, &length, context->ways_drawn) != 0) return -1;
+    if (append_text(buffer, buffer_size, &length, "/") != 0) return -1;
+    if (append_uint_text(buffer, buffer_size, &length, context->ways_decoded) != 0) return -1;
+    if (append_text(buffer, buffer_size, &length, " r=") != 0) return -1;
+    if (append_uint_text(buffer, buffer_size, &length, context->relations_seen) != 0) return -1;
+    if (append_text(buffer, buffer_size, &length, " p=") != 0) return -1;
+    if (append_uint_text(buffer, buffer_size, &length, context->polygon_count) != 0) return -1;
+    if (append_text(buffer, buffer_size, &length, " s=") != 0) return -1;
+    if (append_uint_text(buffer, buffer_size, &length, context->segment_count) != 0) return -1;
+    return 0;
+}
+
+static const char *default_font_path(void) {
+    if (path_exists("fonts/Roboto-Regular.ttf")) return "fonts/Roboto-Regular.ttf";
+    if (path_exists("data/fonts/Roboto-Regular.ttf")) return "data/fonts/Roboto-Regular.ttf";
+    if (path_exists("/home/mathias/fontrender/Roboto/static/Roboto-Regular.ttf")) return "/home/mathias/fontrender/Roboto/static/Roboto-Regular.ttf";
+    if (path_exists("/home/mathias/fontrender/Roboto/Roboto-VariableFont_wdth,wght.ttf")) return "/home/mathias/fontrender/Roboto/Roboto-VariableFont_wdth,wght.ttf";
+    if (path_exists("/home/mathias/fontrender/Alegreya/static/Alegreya-Regular.ttf")) return "/home/mathias/fontrender/Alegreya/static/Alegreya-Regular.ttf";
     return 0;
 }
 
@@ -2115,6 +2170,88 @@ static void fill_background(OsmRenderContext *context) {
     }
 }
 
+static void fill_rgb_span(unsigned char *pixels, size_t pixel_offset, size_t count, unsigned char red, unsigned char green, unsigned char blue) {
+    size_t index;
+
+    for (index = 0U; index < count; ++index) {
+        pixels[(pixel_offset + index) * 3U + 0U] = red;
+        pixels[(pixel_offset + index) * 3U + 1U] = green;
+        pixels[(pixel_offset + index) * 3U + 2U] = blue;
+    }
+}
+
+static void draw_status_text(OsmRenderContext *context, FrFont *font, const char *text, unsigned int map_height, unsigned int footer_height) {
+    size_t text_length = rt_strlen(text);
+    size_t index = 0U;
+    int pixel_size = 12;
+    int cursor_x = 10;
+    int baseline = (int)map_height + ((int)footer_height + fr_font_line_height(font, pixel_size)) / 2 - 4;
+
+    while (index < text_length) {
+        unsigned int codepoint;
+        const FrGlyph *glyph;
+        int gx;
+        int gy;
+
+        if (rt_utf8_decode(text, text_length, &index, &codepoint) != 0) break;
+        if (codepoint == '\n' || codepoint == '\r') break;
+        glyph = fr_font_get_glyph(font, codepoint, pixel_size, 0U);
+        if (glyph == 0) continue;
+        for (gy = 0; gy < glyph->height; ++gy) {
+            for (gx = 0; gx < glyph->width; ++gx) {
+                unsigned char coverage = glyph->bitmap[(size_t)gy * (size_t)glyph->width + (size_t)gx];
+                if (coverage != 0U) {
+                    put_pixel_rgb(context, cursor_x + glyph->left + gx, baseline - glyph->top + gy, 0U, 0U, 0U, coverage);
+                }
+            }
+        }
+        cursor_x += glyph->advance;
+        if (cursor_x >= (int)context->width - 4) break;
+    }
+}
+
+static int append_status_footer(OsmRenderContext *context, unsigned int map_width, unsigned int map_height) {
+    const char *font_path;
+    FrFont *font = 0;
+    unsigned int footer_height = 32U;
+    unsigned int new_height;
+    unsigned char *pixels;
+    char text[1024];
+    size_t row;
+
+    if (!context->status_footer || context->width == 0U || context->height == 0U) return 0;
+    font_path = context->font_path != 0 ? context->font_path : default_font_path();
+    if (font_path == 0) return 0;
+    if (map_height > 0xffffffffU - footer_height) {
+        return -1;
+    }
+    new_height = map_height + footer_height;
+    if (fontrender_runtime_install() != 0 || fr_font_open(&font, font_path) != 0) return 0;
+    if (append_status_text(context, text, sizeof(text), map_width, map_height, new_height) != 0) {
+        fr_font_close(font);
+        return 0;
+    }
+    pixels = (unsigned char *)rt_malloc((size_t)context->width * (size_t)new_height * 3U);
+    if (pixels == 0) {
+        fr_font_close(font);
+        return -1;
+    }
+    for (row = 0U; row < (size_t)map_height; ++row) {
+        memcpy(pixels + row * (size_t)context->width * 3U, context->pixels + row * (size_t)context->width * 3U, (size_t)context->width * 3U);
+    }
+    for (row = (size_t)map_height; row < (size_t)new_height; ++row) {
+        fill_rgb_span(pixels, row * (size_t)context->width, context->width, 255U, 255U, 255U);
+    }
+    if (map_height < new_height) fill_rgb_span(pixels, (size_t)map_height * (size_t)context->width, context->width, 210U, 210U, 210U);
+    rt_free(context->pixels);
+    context->pixels = pixels;
+    context->height = new_height;
+    draw_status_text(context, font, text, map_height, footer_height);
+    fr_font_close(font);
+    context->status_footer_applied = 1;
+    return 0;
+}
+
 static unsigned long long count_visible_pixels(const OsmRenderContext *context) {
     size_t pixel_count = (size_t)context->width * (size_t)context->height;
     size_t index;
@@ -2457,6 +2594,7 @@ int main(int argc, char **argv) {
     int argi;
     int width_explicit = 0;
     int height_explicit = 0;
+    unsigned long long render_start_ns;
 
     if (argc < 4) {
         write_usage(program);
@@ -2474,6 +2612,8 @@ int main(int argc, char **argv) {
     style_sheet_init(&style_sheet);
     context.style_sheet = &style_sheet;
     context.boundary_fade = 1;
+    context.status_footer = 1;
+    render_start_ns = platform_get_monotonic_time_ns();
     default_node_index_path[0] = '\0';
     default_way_index_path[0] = '\0';
     default_relation_index_path[0] = '\0';
@@ -2518,6 +2658,14 @@ int main(int argc, char **argv) {
                 return 1;
             }
             style_path = argv[argi];
+            argi += 1;
+        } else if (rt_strcmp(argv[argi], "--font") == 0) {
+            argi += 1;
+            if (argi >= argc) {
+                write_usage(program);
+                return 1;
+            }
+            context.font_path = argv[argi];
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--node-index") == 0) {
             argi += 1;
@@ -2571,6 +2719,9 @@ int main(int argc, char **argv) {
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--no-boundary-fade") == 0) {
             context.boundary_fade = 0;
+            argi += 1;
+        } else if (rt_strcmp(argv[argi], "--no-status-footer") == 0) {
+            context.status_footer = 0;
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--max-way-refs") == 0) {
             argi += 1;
@@ -2802,6 +2953,17 @@ int main(int argc, char **argv) {
         draw_render_layers(&context);
     }
     context.visible_pixels = count_visible_pixels(&context);
+    {
+        unsigned int map_width = context.width;
+        unsigned int map_height = context.height;
+        unsigned long long render_end_ns = platform_get_monotonic_time_ns();
+        context.render_elapsed_ms = render_end_ns >= render_start_ns ? (render_end_ns - render_start_ns) / 1000000ULL : 0ULL;
+        if (append_status_footer(&context, map_width, map_height) != 0) {
+            rt_write_cstr(2, "osmrender: could not append status footer\n");
+            cleanup_context(&context);
+            return 1;
+        }
+    }
     if (write_render_output(out_path, &context) != 0) {
         rt_write_cstr(2, "osmrender: could not write output image\n");
         cleanup_context(&context);
@@ -2846,6 +3008,9 @@ int main(int argc, char **argv) {
     rt_write_cstr(1, "visible_pixels: ");
     rt_write_uint(1, context.visible_pixels);
     rt_write_char(1, '\n');
+    rt_write_cstr(1, "render_time_ms: ");
+    rt_write_uint(1, context.render_elapsed_ms);
+    rt_write_char(1, '\n');
     rt_write_cstr(1, "width: ");
     rt_write_uint(1, context.width);
     rt_write_char(1, '\n');
@@ -2887,6 +3052,9 @@ int main(int argc, char **argv) {
     rt_write_char(1, '\n');
     rt_write_cstr(1, "boundary_fade: ");
     rt_write_cstr(1, context.boundary_fade_applied ? "yes" : "no");
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "status_footer: ");
+    rt_write_cstr(1, context.status_footer_applied ? "yes" : "no");
     rt_write_char(1, '\n');
     cleanup_context(&context);
     return 0;

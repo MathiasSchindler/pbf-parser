@@ -101,4 +101,12 @@ typedef unsigned long long uintmax_t;
 #define INTMAX_MAX LLONG_MAX
 #define UINTMAX_MAX ULLONG_MAX
 
+#ifndef SIZE_MAX
+#ifdef __SIZE_MAX__
+#define SIZE_MAX __SIZE_MAX__
+#else
+#define SIZE_MAX ULONG_MAX
+#endif
+#endif
+
 #endif

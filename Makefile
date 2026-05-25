@@ -3,7 +3,7 @@ OS := linux
 ARCH := x86_64
 BUILD_DIR := build/freestanding-$(OS)-$(ARCH)
 
-CFLAGS := -std=c11 -Os -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fdata-sections -ffunction-sections -fno-asynchronous-unwind-tables -fno-unwind-tables -nostdinc -Isrc/shared -Isrc/platform/linux -DNEWOS_DISABLE_STACK_GUARD_INIT
+CFLAGS := -std=c11 -Os -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fdata-sections -ffunction-sections -fno-asynchronous-unwind-tables -fno-unwind-tables -nostdinc -Isrc/shared -Isrc/shared/fontrender -Isrc/platform/linux -Isrc/platform/common -DNEWOS_DISABLE_STACK_GUARD_INIT -DFR_RASTER_DISABLE_SIMD
 LDFLAGS := -nostdlib -static -no-pie -Wl,--gc-sections
 
 RUNTIME_SRCS := \
@@ -14,6 +14,13 @@ RUNTIME_SRCS := \
     src/shared/runtime/memory.c \
     src/shared/runtime/parse.c \
     src/shared/runtime/string.c
+
+FONTRENDER_SRCS := \
+    src/shared/fontrender/fr_platform.c \
+    src/shared/fontrender/fr_ttf.c \
+    src/shared/fontrender/fr_raster.c \
+    src/shared/fontrender/font_backend_truetype.c \
+    src/shared/fontrender_runtime.c
 
 PBFINFO_SRCS := \
     $(RUNTIME_SRCS) \
@@ -79,8 +86,11 @@ OSMADDRESSES_SRCS := \
 OSMRENDER_SRCS := \
     $(RUNTIME_SRCS) \
     src/platform/linux/fs.c \
+    src/platform/linux/time.c \
     src/shared/compression/crc32.c \
     src/shared/compression/zlib.c \
+    src/shared/runtime/unicode_utf8.c \
+    $(FONTRENDER_SRCS) \
     src/shared/osm_index.c \
     src/shared/pbf.c \
     src/shared/simple_config.c \
@@ -91,9 +101,15 @@ THREADTEST_SRCS := \
     src/platform/linux/thread.c \
     src/tools/threadtest.c
 
+FONTTEST_SRCS := \
+    $(RUNTIME_SRCS) \
+    src/platform/linux/fs.c \
+    $(FONTRENDER_SRCS) \
+    src/tools/fonttest.c
+
 .PHONY: all clean threadtest
 
-all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmwayindex $(BUILD_DIR)/osmindex $(BUILD_DIR)/osmrelindex $(BUILD_DIR)/osmspindex $(BUILD_DIR)/osmaddresses $(BUILD_DIR)/osmrender $(BUILD_DIR)/threadtest
+all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmwayindex $(BUILD_DIR)/osmindex $(BUILD_DIR)/osmrelindex $(BUILD_DIR)/osmspindex $(BUILD_DIR)/osmaddresses $(BUILD_DIR)/osmrender $(BUILD_DIR)/threadtest $(BUILD_DIR)/fonttest
 
 threadtest: $(BUILD_DIR)/threadtest
 
@@ -129,6 +145,9 @@ $(BUILD_DIR)/osmrender: $(OSMRENDER_SRCS) | $(BUILD_DIR)
 
 $(BUILD_DIR)/threadtest: $(THREADTEST_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(THREADTEST_SRCS) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/fonttest: $(FONTTEST_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(FONTTEST_SRCS) $(LDFLAGS) -o $@
 
 clean:
 	rm -rf build
