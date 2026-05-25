@@ -549,7 +549,7 @@ int osm_way_index_build_ex(const char *pbf_path, const char *index_path, unsigne
         osm_index_set_error(error, error_capacity, "could not write way index header");
         return -1;
     }
-    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_WAY_TAGS;
+    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_WAY_TAGS | PBF_STREAM_SKIP_RELATION_ROLES;
     callbacks.way = osm_way_index_on_way;
     stream_result = pbf_stream_entities(pbf_path, &callbacks, &context, error, error_capacity);
     if (osm_index_writer_close(&context.ref_writer) != 0) {
@@ -661,7 +661,7 @@ int osm_index_build_ex(const char *pbf_path, const char *node_index_path, const 
         return -1;
     }
 
-    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_WAY_TAGS;
+    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_WAY_TAGS | PBF_STREAM_SKIP_RELATION_ROLES;
     callbacks.node = osm_index_on_node;
     callbacks.way = osm_index_on_way;
     stream_result = pbf_stream_entities(pbf_path, &callbacks, &context, error, error_capacity);
@@ -883,7 +883,7 @@ int osm_relation_index_build(const char *pbf_path, const char *index_path, unsig
     context.flags = flags;
     context.error = error;
     context.error_capacity = error_capacity;
-    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_WAY_TAGS;
+    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_WAY_TAGS | PBF_STREAM_SKIP_RELATION_ROLES;
     callbacks.relation_tags = osm_relation_index_on_relation_tags;
     callbacks.relation = osm_relation_index_on_relation;
     stream_result = pbf_stream_entities(pbf_path, &callbacks, &context, error, error_capacity);

@@ -984,6 +984,7 @@ static int pbf_stream_relation_payload(const unsigned char *data, size_t size, P
     size_t roles_payload_size = 0;
     size_t member_ids_payload_size = 0;
     size_t member_types_payload_size = 0;
+    int skip_relation_roles = context->callbacks != 0 && (context->callbacks->flags & PBF_STREAM_SKIP_RELATION_ROLES) != 0U;
 
     rt_memset(&keys, 0, sizeof(keys));
     rt_memset(&values, 0, sizeof(values));
@@ -1020,7 +1021,7 @@ static int pbf_stream_relation_payload(const unsigned char *data, size_t size, P
             const unsigned char *packed;
             size_t packed_size;
             if (pbf_read_length(&reader, &packed, &packed_size) != 0) goto fail;
-            if (want_members) {
+            if (want_members && !skip_relation_roles) {
                 roles_payload = packed;
                 roles_payload_size = packed_size;
             }
@@ -1059,16 +1060,19 @@ static int pbf_stream_relation_payload(const unsigned char *data, size_t size, P
         rt_free(tags.items);
         return context->stop ? 1 : 0;
     }
-    if (roles_payload != 0 && pbf_parse_packed_uints(roles_payload, roles_payload_size, &roles) != 0) goto fail;
+    if (!skip_relation_roles && roles_payload != 0 && pbf_parse_packed_uints(roles_payload, roles_payload_size, &roles) != 0) goto fail;
     if (member_ids_payload != 0 && pbf_parse_packed_sints(member_ids_payload, member_ids_payload_size, &member_ids) != 0) goto fail;
     if (member_types_payload != 0 && pbf_parse_packed_uints(member_types_payload, member_types_payload_size, &member_types) != 0) goto fail;
-    if (roles.count != member_ids.count || roles.count != member_types.count) goto fail;
+    if (member_ids.count != member_types.count || (!skip_relation_roles && roles.count != member_ids.count)) goto fail;
     for (index = 0U; index < member_ids.count; ++index) {
         PbfRelationMember member;
         member_id += member_ids.items[index];
         member.id = member_id;
         member.type = member_types.items[index];
-        if (pbf_resolve_string(&context->string_table, roles.items[index], &member.role) != 0) goto fail;
+        if (skip_relation_roles) {
+            member.role.data = "";
+            member.role.size = 0U;
+        } else if (pbf_resolve_string(&context->string_table, roles.items[index], &member.role) != 0) goto fail;
         if (pbf_member_list_append(&members, member) != 0) goto fail;
     }
     relation.members = members.items;

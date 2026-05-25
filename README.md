@@ -74,7 +74,7 @@ Then a short city render command uses sane defaults:
 
 With `--city`, `osmrender` infers matching `build/<extract>.osmnidx`, `.osmwidx`, optional `.osmridx`, optional `.osmspidx`, the default style file, green-area rendering, major roads, aspect-aware output dimensions, and a brighter outside-boundary mask. If the inferred indexes are missing, it prints the commands needed to rebuild them.
 
-By default, `osmrender` appends a small white status footer below the map when a usable TrueType font is available. The footer reports map dimensions, render time, node/way/relation counters, polygons, and segments without changing the rendered map area. Use `--font FILE.ttf` to choose a font explicitly, or `--no-status-footer` for clean exports.
+By default, `osmrender` appends a small status footer below the map when the configured TrueType font is available. Footer font, colors, size, and text are configured with `footer.*` keys in `styles/osmrender-default.conf`; `--font FILE.ttf` overrides the configured font for one run, and `--no-status-footer` disables the footer for clean exports. Available footer variables are documented in `docs/osmrender_footer.md`.
 
 ## Fonts
 
@@ -95,6 +95,7 @@ Additional notes are in:
 - `docs/threading.md`
 - `docs/osm_streaming.md`
 - `docs/osm_rendering.md`
+- `docs/osmrender_footer.md`
 - `docs/berlin_green_data.md`
 
 ## Generation And License

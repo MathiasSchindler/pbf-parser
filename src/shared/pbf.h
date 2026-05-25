@@ -91,6 +91,7 @@ typedef struct {
 
 #define PBF_STREAM_SKIP_NODE_TAGS (1U << 0)
 #define PBF_STREAM_SKIP_WAY_TAGS  (1U << 1)
+#define PBF_STREAM_SKIP_RELATION_ROLES (1U << 2)
 
 void pbf_summary_init(PbfSummary *summary);
 int pbf_read_summary(const char *path, PbfSummary *summary, char *error, size_t error_capacity);

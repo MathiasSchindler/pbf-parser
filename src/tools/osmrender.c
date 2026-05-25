@@ -78,6 +78,7 @@ typedef struct {
     OsmRenderRelationWayRef *relation_way_order;
     int *polygon_points;
     unsigned int node_capacity;
+    unsigned int node_entry_count;
     unsigned int node_count;
     unsigned long long node_index_record_count;
     unsigned int segment_capacity;
@@ -134,6 +135,7 @@ typedef struct {
     int way_index_open;
     int relation_index_open;
     int spatial_index_open;
+    int lazy_node_index;
     int stopped_after_nodes;
     int stopped_after_trees;
     int stopped_after_ways;
@@ -190,6 +192,20 @@ struct OsmRenderStyleSheet {
     unsigned char background_r;
     unsigned char background_g;
     unsigned char background_b;
+    unsigned char footer_background_r;
+    unsigned char footer_background_g;
+    unsigned char footer_background_b;
+    unsigned char footer_text_r;
+    unsigned char footer_text_g;
+    unsigned char footer_text_b;
+    unsigned char footer_rule_r;
+    unsigned char footer_rule_g;
+    unsigned char footer_rule_b;
+    unsigned int footer_height;
+    unsigned int footer_font_size;
+    int footer_enabled;
+    char footer_font_path[256];
+    char footer_text[1024];
     OsmRenderStyle styles[OSM_RENDER_STYLE_COUNT];
 };
 
@@ -234,36 +250,85 @@ static int append_uint_text(char *buffer, size_t buffer_size, size_t *length_io,
     return append_text(buffer, buffer_size, length_io, number);
 }
 
+static int append_bool_text(char *buffer, size_t buffer_size, size_t *length_io, int value) {
+    return append_text(buffer, buffer_size, length_io, value ? "yes" : "no");
+}
+
+static int footer_variable_equals(const char *name, size_t name_size, const char *expected) {
+    size_t expected_size = rt_strlen(expected);
+
+    return name_size == expected_size && memcmp(name, expected, expected_size) == 0;
+}
+
+static int append_footer_variable(OsmRenderContext *context, char *buffer, size_t buffer_size, size_t *length_io, const char *name, size_t name_size, unsigned int map_width, unsigned int map_height, unsigned int image_height) {
+    if (footer_variable_equals(name, name_size, "city")) return append_text(buffer, buffer_size, length_io, context->city_name != 0 ? context->city_name : "");
+    if (footer_variable_equals(name, name_size, "map_width")) return append_uint_text(buffer, buffer_size, length_io, map_width);
+    if (footer_variable_equals(name, name_size, "map_height")) return append_uint_text(buffer, buffer_size, length_io, map_height);
+    if (footer_variable_equals(name, name_size, "image_width")) return append_uint_text(buffer, buffer_size, length_io, context->width);
+    if (footer_variable_equals(name, name_size, "image_height")) return append_uint_text(buffer, buffer_size, length_io, image_height);
+    if (footer_variable_equals(name, name_size, "render_time_ms")) return append_uint_text(buffer, buffer_size, length_io, context->render_elapsed_ms);
+    if (footer_variable_equals(name, name_size, "nodes_in_bbox")) return append_uint_text(buffer, buffer_size, length_io, context->node_count);
+    if (footer_variable_equals(name, name_size, "ways_seen")) return append_uint_text(buffer, buffer_size, length_io, context->ways_seen);
+    if (footer_variable_equals(name, name_size, "ways_decoded")) return append_uint_text(buffer, buffer_size, length_io, context->ways_decoded);
+    if (footer_variable_equals(name, name_size, "ways_drawn")) return append_uint_text(buffer, buffer_size, length_io, context->ways_drawn);
+    if (footer_variable_equals(name, name_size, "segments_drawn")) return append_uint_text(buffer, buffer_size, length_io, context->segments_drawn);
+    if (footer_variable_equals(name, name_size, "segments_collected")) return append_uint_text(buffer, buffer_size, length_io, context->segment_count);
+    if (footer_variable_equals(name, name_size, "tree_nodes_drawn")) return append_uint_text(buffer, buffer_size, length_io, context->tree_nodes_drawn);
+    if (footer_variable_equals(name, name_size, "relations_seen")) return append_uint_text(buffer, buffer_size, length_io, context->relations_seen);
+    if (footer_variable_equals(name, name_size, "relation_members_collected")) return append_uint_text(buffer, buffer_size, length_io, context->relation_members_collected);
+    if (footer_variable_equals(name, name_size, "relation_ways_matched")) return append_uint_text(buffer, buffer_size, length_io, context->relation_ways_matched);
+    if (footer_variable_equals(name, name_size, "way_refs_skipped")) return append_uint_text(buffer, buffer_size, length_io, context->way_refs_skipped);
+    if (footer_variable_equals(name, name_size, "polygons_collected")) return append_uint_text(buffer, buffer_size, length_io, context->polygon_count);
+    if (footer_variable_equals(name, name_size, "visible_pixels")) return append_uint_text(buffer, buffer_size, length_io, context->visible_pixels);
+    if (footer_variable_equals(name, name_size, "node_index")) return append_bool_text(buffer, buffer_size, length_io, context->node_index_open);
+    if (footer_variable_equals(name, name_size, "lazy_node_index")) return append_bool_text(buffer, buffer_size, length_io, context->lazy_node_index);
+    if (footer_variable_equals(name, name_size, "way_index")) return append_bool_text(buffer, buffer_size, length_io, context->way_index_open);
+    if (footer_variable_equals(name, name_size, "relation_index")) return append_bool_text(buffer, buffer_size, length_io, context->relation_index_open);
+    if (footer_variable_equals(name, name_size, "spatial_index")) return append_bool_text(buffer, buffer_size, length_io, context->spatial_index_open);
+    if (footer_variable_equals(name, name_size, "bounded")) return append_bool_text(buffer, buffer_size, length_io, context->bbox_enabled);
+    if (footer_variable_equals(name, name_size, "green_only")) return append_bool_text(buffer, buffer_size, length_io, context->green_only);
+    if (footer_variable_equals(name, name_size, "major_roads")) return append_bool_text(buffer, buffer_size, length_io, context->major_roads);
+    if (footer_variable_equals(name, name_size, "no_fills")) return append_bool_text(buffer, buffer_size, length_io, context->no_fills);
+    if (footer_variable_equals(name, name_size, "relation_scan")) return append_bool_text(buffer, buffer_size, length_io, !context->no_relation_scan);
+    if (footer_variable_equals(name, name_size, "boundary_fade")) return append_bool_text(buffer, buffer_size, length_io, context->boundary_fade_applied);
+    if (footer_variable_equals(name, name_size, "width")) return append_uint_text(buffer, buffer_size, length_io, context->width);
+    if (footer_variable_equals(name, name_size, "height")) return append_uint_text(buffer, buffer_size, length_io, image_height);
+
+    if (append_text(buffer, buffer_size, length_io, "{") != 0) return -1;
+    if (append_text_n(buffer, buffer_size, length_io, name, name_size) != 0) return -1;
+    return append_text(buffer, buffer_size, length_io, "}");
+}
+
 static int append_status_text(OsmRenderContext *context, char *buffer, size_t buffer_size, unsigned int map_width, unsigned int map_height, unsigned int image_height) {
+    const char *text = context->style_sheet->footer_text;
     size_t length = 0U;
+    size_t index = 0U;
 
     buffer[0] = '\0';
-    if (context->city_enabled && context->city_name != 0) {
-        if (append_text(buffer, buffer_size, &length, context->city_name) != 0) return -1;
-        if (append_text(buffer, buffer_size, &length, " | ") != 0) return -1;
+    while (text[index] != '\0') {
+        if (text[index] == '{') {
+            size_t name_start = index + 1U;
+            size_t name_end = name_start;
+
+            if (text[name_start] == '{') {
+                if (append_text(buffer, buffer_size, &length, "{") != 0) return -1;
+                index += 2U;
+                continue;
+            }
+            while (text[name_end] != '\0' && text[name_end] != '}') name_end += 1U;
+            if (text[name_end] == '}') {
+                if (append_footer_variable(context, buffer, buffer_size, &length, text + name_start, name_end - name_start, map_width, map_height, image_height) != 0) return -1;
+                index = name_end + 1U;
+                continue;
+            }
+        } else if (text[index] == '}' && text[index + 1U] == '}') {
+            if (append_text(buffer, buffer_size, &length, "}") != 0) return -1;
+            index += 2U;
+            continue;
+        }
+        if (append_text_n(buffer, buffer_size, &length, text + index, 1U) != 0) return -1;
+        index += 1U;
     }
-    if (append_text(buffer, buffer_size, &length, "map=") != 0) return -1;
-    if (append_uint_text(buffer, buffer_size, &length, map_width) != 0) return -1;
-    if (append_text(buffer, buffer_size, &length, "x") != 0) return -1;
-    if (append_uint_text(buffer, buffer_size, &length, map_height) != 0) return -1;
-    if (append_text(buffer, buffer_size, &length, " img=") != 0) return -1;
-    if (append_uint_text(buffer, buffer_size, &length, context->width) != 0) return -1;
-    if (append_text(buffer, buffer_size, &length, "x") != 0) return -1;
-    if (append_uint_text(buffer, buffer_size, &length, image_height) != 0) return -1;
-    if (append_text(buffer, buffer_size, &length, " t=") != 0) return -1;
-    if (append_uint_text(buffer, buffer_size, &length, context->render_elapsed_ms) != 0) return -1;
-    if (append_text(buffer, buffer_size, &length, "ms n=") != 0) return -1;
-    if (append_uint_text(buffer, buffer_size, &length, context->node_count) != 0) return -1;
-    if (append_text(buffer, buffer_size, &length, " w=") != 0) return -1;
-    if (append_uint_text(buffer, buffer_size, &length, context->ways_drawn) != 0) return -1;
-    if (append_text(buffer, buffer_size, &length, "/") != 0) return -1;
-    if (append_uint_text(buffer, buffer_size, &length, context->ways_decoded) != 0) return -1;
-    if (append_text(buffer, buffer_size, &length, " r=") != 0) return -1;
-    if (append_uint_text(buffer, buffer_size, &length, context->relations_seen) != 0) return -1;
-    if (append_text(buffer, buffer_size, &length, " p=") != 0) return -1;
-    if (append_uint_text(buffer, buffer_size, &length, context->polygon_count) != 0) return -1;
-    if (append_text(buffer, buffer_size, &length, " s=") != 0) return -1;
-    if (append_uint_text(buffer, buffer_size, &length, context->segment_count) != 0) return -1;
     return 0;
 }
 
@@ -539,10 +604,27 @@ static void set_casing_style(OsmRenderStyle *style, unsigned char red, unsigned 
 }
 
 static void style_sheet_init(OsmRenderStyleSheet *style_sheet) {
+    static const char default_footer_font[] = "data/fonts/Roboto-Regular.ttf";
+    static const char default_footer_text[] = "map={map_width}x{map_height} img={image_width}x{image_height} t={render_time_ms}ms n={nodes_in_bbox} w={ways_drawn}/{ways_decoded} r={relations_seen} p={polygons_collected} s={segments_drawn}";
+
     rt_memset(style_sheet, 0, sizeof(*style_sheet));
     style_sheet->background_r = 242U;
     style_sheet->background_g = 239U;
     style_sheet->background_b = 232U;
+    style_sheet->footer_background_r = 255U;
+    style_sheet->footer_background_g = 255U;
+    style_sheet->footer_background_b = 255U;
+    style_sheet->footer_text_r = 0U;
+    style_sheet->footer_text_g = 0U;
+    style_sheet->footer_text_b = 0U;
+    style_sheet->footer_rule_r = 210U;
+    style_sheet->footer_rule_g = 210U;
+    style_sheet->footer_rule_b = 210U;
+    style_sheet->footer_height = 32U;
+    style_sheet->footer_font_size = 12U;
+    style_sheet->footer_enabled = 1;
+    memcpy(style_sheet->footer_font_path, default_footer_font, sizeof(default_footer_font));
+    memcpy(style_sheet->footer_text, default_footer_text, sizeof(default_footer_text));
     set_fill_style(&style_sheet->styles[OSM_RENDER_STYLE_WATER], 154U, 196U, 214U, 230U);
     set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_WATER], 94U, 151U, 183U, 2U);
     set_line_style(&style_sheet->styles[OSM_RENDER_STYLE_WATERWAY], 92U, 158U, 194U, 2U);
@@ -825,7 +907,7 @@ static int resolve_city_boundary(const char *pbf_path, OsmRenderContext *context
     }
 
     rt_memset(&callbacks, 0, sizeof(callbacks));
-    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS;
+    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_RELATION_ROLES;
     callbacks.relation_tags = on_city_relation_tags;
     callbacks.relation = on_city_relation;
     if (pbf_stream_entities(pbf_path, &callbacks, context, error, error_capacity) != 0 || context->failed) return -1;
@@ -834,7 +916,7 @@ static int resolve_city_boundary(const char *pbf_path, OsmRenderContext *context
     context->boundary_relation_enabled = 1;
     if (context->bbox_enabled) return 0;
     rt_memset(&callbacks, 0, sizeof(callbacks));
-    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS;
+    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_RELATION_ROLES;
     callbacks.relation_tags = on_city_boundary_tags;
     callbacks.relation = on_city_boundary_relation;
     if (pbf_stream_entities(pbf_path, &callbacks, context, error, error_capacity) != 0 || context->failed) return -1;
@@ -895,9 +977,18 @@ static int node_map_grow(OsmRenderContext *context, unsigned int needed) {
 }
 
 static int node_map_insert(OsmRenderContext *context, long long id, long long lat_nano, long long lon_nano) {
-    if (node_map_grow(context, context->node_count + 1U) != 0) return -1;
+    if (node_map_grow(context, context->node_entry_count + 1U) != 0) return -1;
     if (node_map_insert_raw(context->nodes, context->node_capacity, id, lat_nano, lon_nano) != 0) return -1;
+    context->node_entry_count += 1U;
     context->node_count += 1U;
+    return 0;
+}
+
+static int node_map_cache(OsmRenderContext *context, long long id, long long lat_nano, long long lon_nano) {
+    if (node_map_grow(context, context->node_entry_count + 1U) != 0) return -1;
+    if (node_map_insert_raw(context->nodes, context->node_capacity, id, lat_nano, lon_nano) != 0) return -1;
+    context->node_entry_count += 1U;
+    if (node_in_bbox(context, lat_nano, lon_nano) && context->node_count < 0xffffffffU) context->node_count += 1U;
     return 0;
 }
 
@@ -1044,6 +1135,9 @@ static int resolve_node(OsmRenderContext *context, long long id, OsmRenderNodeEn
         node_out->lat_nano = record.lat_nano;
         node_out->lon_nano = record.lon_nano;
         node_out->used = 1;
+        if (node_map_cache(context, record.id, record.lat_nano, record.lon_nano) != 0) {
+            context->failed = 1;
+        }
         return 1;
     }
     return 0;
@@ -1391,6 +1485,26 @@ static int parse_style_uint_value(const char *text, unsigned int max_value, unsi
     return 0;
 }
 
+static int parse_style_bool_value(const char *text, int *value_out) {
+    if (rt_strcmp(text, "1") == 0 || rt_strcmp(text, "yes") == 0 || rt_strcmp(text, "true") == 0 || rt_strcmp(text, "on") == 0) {
+        *value_out = 1;
+        return 0;
+    }
+    if (rt_strcmp(text, "0") == 0 || rt_strcmp(text, "no") == 0 || rt_strcmp(text, "false") == 0 || rt_strcmp(text, "off") == 0) {
+        *value_out = 0;
+        return 0;
+    }
+    return -1;
+}
+
+static int copy_style_text_value(const char *text, char *buffer, size_t buffer_size) {
+    size_t text_size = rt_strlen(text);
+
+    if (buffer_size == 0U || text_size + 1U > buffer_size) return -1;
+    memcpy(buffer, text, text_size + 1U);
+    return 0;
+}
+
 static void skip_style_spaces(const char **text_io) {
     while (rt_is_space(**text_io)) *text_io += 1;
 }
@@ -1458,6 +1572,23 @@ static int style_config_visit(const char *key, const char *value, void *user) {
     OsmRenderStyleId style_id;
     OsmRenderStyle *style;
 
+    if (rt_strcmp(key, "footer.enabled") == 0) return parse_style_bool_value(value, &style_sheet->footer_enabled);
+    if (rt_strcmp(key, "footer.font") == 0) return copy_style_text_value(value, style_sheet->footer_font_path, sizeof(style_sheet->footer_font_path));
+    if (rt_strcmp(key, "footer.text") == 0) return copy_style_text_value(value, style_sheet->footer_text, sizeof(style_sheet->footer_text));
+    if (rt_strcmp(key, "footer.height") == 0) return parse_style_uint_value(value, 512U, &style_sheet->footer_height);
+    if (rt_strcmp(key, "footer.font_size") == 0) return parse_style_uint_value(value, 128U, &style_sheet->footer_font_size);
+    if (rt_strcmp(key, "footer.background") == 0) {
+        unsigned char alpha;
+        return parse_style_color(value, 255U, &style_sheet->footer_background_r, &style_sheet->footer_background_g, &style_sheet->footer_background_b, &alpha);
+    }
+    if (rt_strcmp(key, "footer.text_color") == 0) {
+        unsigned char alpha;
+        return parse_style_color(value, 255U, &style_sheet->footer_text_r, &style_sheet->footer_text_g, &style_sheet->footer_text_b, &alpha);
+    }
+    if (rt_strcmp(key, "footer.rule") == 0) {
+        unsigned char alpha;
+        return parse_style_color(value, 255U, &style_sheet->footer_rule_r, &style_sheet->footer_rule_g, &style_sheet->footer_rule_b, &alpha);
+    }
     if (rt_strcmp(key, "background") == 0) {
         unsigned char alpha;
         return parse_style_color(value, 255U, &style_sheet->background_r, &style_sheet->background_g, &style_sheet->background_b, &alpha);
@@ -1680,6 +1811,11 @@ static int on_relation_tags(void *user, long long id, const PbfTag *tags, unsign
     return style_id_is_green_context(style_id);
 }
 
+static int relation_member_way_in_render_bbox(OsmRenderContext *context, long long id) {
+    if (!context->spatial_index_open) return 1;
+    return osm_spatial_index_way_intersects(&context->spatial_index, id, context->min_lon_nano, context->min_lat_nano, context->max_lon_nano, context->max_lat_nano);
+}
+
 static int on_relation(void *user, const PbfRelation *relation) {
     OsmRenderContext *context = (OsmRenderContext *)user;
     OsmRenderStyleId style_id;
@@ -1704,7 +1840,7 @@ static int on_relation(void *user, const PbfRelation *relation) {
     context->relations_seen += 1ULL;
     for (index = 0U; index < relation->member_count; ++index) {
         const PbfRelationMember *member = &relation->members[index];
-        if (member->type == PBF_RELATION_MEMBER_WAY) {
+        if (member->type == PBF_RELATION_MEMBER_WAY && relation_member_way_in_render_bbox(context, member->id)) {
             if (relation_way_insert(context, member->id, (unsigned int)style_id) != 0) {
                 context->failed = 1;
                 return 1;
@@ -2183,7 +2319,7 @@ static void fill_rgb_span(unsigned char *pixels, size_t pixel_offset, size_t cou
 static void draw_status_text(OsmRenderContext *context, FrFont *font, const char *text, unsigned int map_height, unsigned int footer_height) {
     size_t text_length = rt_strlen(text);
     size_t index = 0U;
-    int pixel_size = 12;
+    int pixel_size = (int)context->style_sheet->footer_font_size;
     int cursor_x = 10;
     int baseline = (int)map_height + ((int)footer_height + fr_font_line_height(font, pixel_size)) / 2 - 4;
 
@@ -2201,7 +2337,7 @@ static void draw_status_text(OsmRenderContext *context, FrFont *font, const char
             for (gx = 0; gx < glyph->width; ++gx) {
                 unsigned char coverage = glyph->bitmap[(size_t)gy * (size_t)glyph->width + (size_t)gx];
                 if (coverage != 0U) {
-                    put_pixel_rgb(context, cursor_x + glyph->left + gx, baseline - glyph->top + gy, 0U, 0U, 0U, coverage);
+                    put_pixel_rgb(context, cursor_x + glyph->left + gx, baseline - glyph->top + gy, context->style_sheet->footer_text_r, context->style_sheet->footer_text_g, context->style_sheet->footer_text_b, coverage);
                 }
             }
         }
@@ -2213,14 +2349,14 @@ static void draw_status_text(OsmRenderContext *context, FrFont *font, const char
 static int append_status_footer(OsmRenderContext *context, unsigned int map_width, unsigned int map_height) {
     const char *font_path;
     FrFont *font = 0;
-    unsigned int footer_height = 32U;
+    unsigned int footer_height = context->style_sheet->footer_height;
     unsigned int new_height;
     unsigned char *pixels;
     char text[1024];
     size_t row;
 
-    if (!context->status_footer || context->width == 0U || context->height == 0U) return 0;
-    font_path = context->font_path != 0 ? context->font_path : default_font_path();
+    if (!context->status_footer || !context->style_sheet->footer_enabled || context->width == 0U || context->height == 0U || footer_height == 0U || context->style_sheet->footer_font_size == 0U) return 0;
+    font_path = context->font_path != 0 ? context->font_path : (context->style_sheet->footer_font_path[0] != '\0' ? context->style_sheet->footer_font_path : default_font_path());
     if (font_path == 0) return 0;
     if (map_height > 0xffffffffU - footer_height) {
         return -1;
@@ -2240,9 +2376,9 @@ static int append_status_footer(OsmRenderContext *context, unsigned int map_widt
         memcpy(pixels + row * (size_t)context->width * 3U, context->pixels + row * (size_t)context->width * 3U, (size_t)context->width * 3U);
     }
     for (row = (size_t)map_height; row < (size_t)new_height; ++row) {
-        fill_rgb_span(pixels, row * (size_t)context->width, context->width, 255U, 255U, 255U);
+        fill_rgb_span(pixels, row * (size_t)context->width, context->width, context->style_sheet->footer_background_r, context->style_sheet->footer_background_g, context->style_sheet->footer_background_b);
     }
-    if (map_height < new_height) fill_rgb_span(pixels, (size_t)map_height * (size_t)context->width, context->width, 210U, 210U, 210U);
+    if (map_height < new_height) fill_rgb_span(pixels, (size_t)map_height * (size_t)context->width, context->width, context->style_sheet->footer_rule_r, context->style_sheet->footer_rule_g, context->style_sheet->footer_rule_b);
     rt_free(context->pixels);
     context->pixels = pixels;
     context->height = new_height;
@@ -2898,7 +3034,11 @@ int main(int argc, char **argv) {
     }
     fill_background(&context);
 
-    if (!context.node_index_open || context.tree_points || (context.node_index_open && context.node_index_records == 0 && !context.tree_points)) {
+    {
+        int lazy_index_nodes = context.node_index_open && context.node_index_records == 0 && context.spatial_index_open && !context.tree_points && !context.node_points && context.stop_after_nodes == 0U;
+
+        context.lazy_node_index = lazy_index_nodes;
+        if (!lazy_index_nodes && (!context.node_index_open || context.tree_points || (context.node_index_open && context.node_index_records == 0 && !context.tree_points))) {
         rt_memset(&callbacks, 0, sizeof(callbacks));
         callbacks.flags = context.tree_points ? 0U : PBF_STREAM_SKIP_NODE_TAGS;
         callbacks.node = on_node;
@@ -2910,13 +3050,14 @@ int main(int argc, char **argv) {
             cleanup_context(&context);
             return 1;
         }
-    } else {
-        collect_loaded_index_nodes(&context);
+        } else if (context.node_index_records != 0) {
+            collect_loaded_index_nodes(&context);
+        }
     }
     if (!context.stopped_after_nodes && !context.stopped_after_trees && !context.stopped_after_ways && !context.stopped_after_drawn) {
         if (!context.no_relation_scan) {
             rt_memset(&callbacks, 0, sizeof(callbacks));
-            callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS;
+            callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_RELATION_ROLES;
             callbacks.relation_tags = on_relation_tags;
             callbacks.relation = on_relation;
             error[0] = '\0';
@@ -3019,6 +3160,9 @@ int main(int argc, char **argv) {
     rt_write_char(1, '\n');
     rt_write_cstr(1, "node_index: ");
     rt_write_cstr(1, context.node_index_open ? "yes" : "no");
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "lazy_node_index: ");
+    rt_write_cstr(1, context.lazy_node_index ? "yes" : "no");
     rt_write_char(1, '\n');
     rt_write_cstr(1, "way_index: ");
     rt_write_cstr(1, context.way_index_open ? "yes" : "no");

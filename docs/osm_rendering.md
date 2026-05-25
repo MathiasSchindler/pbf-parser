@@ -145,7 +145,7 @@ Germany-wide indexing is practical with the combined buffered builder:
 ./build/freestanding-linux-x86_64/osmindex --progress data/germany-260524.osm.pbf build/germany.osmnidx build/germany.osmwidx
 ```
 
-Measured result: 433,974,413 nodes, 70,233,055 ways, and 590,335,612 refs in 81.40 seconds, producing a 9.8 GB node index and a 6.0 GB way index. Full-Germany city rendering is a separate bottleneck: `osmrender` still streams the complete PBF and falls back to on-disk node lookups for indexes this large, so state extracts remain better for interactive map iteration until spatial way filtering or tiled indexes are added.
+Measured result: 433,974,413 nodes, 70,233,055 ways, and 590,335,612 refs in 81.40 seconds, producing a 9.8 GB node index and a 6.0 GB way index. Full-Germany city rendering is a separate bottleneck: `osmrender` still streams the complete PBF for relation and way tags, so state extracts remain better for interactive map iteration until render-style/tag indexes are added.
 
 The first spatial way index can be built from the Germany node and way indexes:
 
@@ -155,5 +155,40 @@ The first spatial way index can be built from the Germany node and way indexes:
 ```
 
 Measured on `data/germany-260524.osm.pbf`, `osmrelindex` indexed 32,045 administrative relations in 39.37 seconds and `osmspindex` indexed 70,233,055 way bboxes in 193.96 seconds, producing a 2.7 GB spatial index. A capped Potsdam smoke test with `--stop-after-drawn 200 --no-relation-scan` decodes only 200 ways by design; the uncapped Germany render without relation scanning drew 11,093 ways in 103.96 seconds, while the full Brandenburg render with relation scanning drew 11,568 ways in 6.70 seconds.
+
+With Germany node, way, relation, and spatial indexes available, `osmrender` now uses two automatic city-render shortcuts:
+
+- relation member ways are filtered through the spatial index before they are inserted into the render set;
+- for large node indexes that are not loaded into memory, nodes are resolved lazily through the node index only when selected ways reference them.
+
+The exact benchmark command:
+
+```sh
+/usr/bin/time -p ./build/freestanding-linux-x86_64/osmrender data/germany-260524.osm.pbf build/potsdam.png --city Potsdam
+```
+
+Measured on this machine before lazy node lookup, the relation-member filter reduced `relation_members_collected` from 816,073 to 907 but still took about 140 seconds because the renderer streamed all Germany nodes. With lazy node lookup enabled, the same command produced a 1174x1232 PNG in 90.04 seconds:
+
+```text
+nodes_in_bbox: 137693
+ways_decoded: 11571
+ways_drawn: 11568
+segments_drawn: 165300
+relations_seen: 168056
+relation_members_collected: 907
+relation_ways_matched: 907
+polygons_collected: 7602
+visible_pixels: 1223863
+render_time_ms: 89840
+width: 1174
+height: 1232
+node_index: yes
+lazy_node_index: yes
+way_index: yes
+relation_index: yes
+spatial_index: yes
+```
+
+In lazy mode, `nodes_in_bbox` counts indexed nodes resolved for selected render geometry, not every node physically inside the city bbox. That is why it is lower than older full-node-stream benchmarks while the rendered map geometry stays the same. Getting this Germany command down toward 5-10 seconds still requires avoiding the remaining full PBF scans for relation and way tags, most likely with a compact render-style/tag index and a renderable relation-member index.
 
 After `make clean`, the generated indexes are gone and must be rebuilt. The measured Germany index rebuild times were 81.40 seconds for the combined node+way index, 39.37 seconds for the relation index, and 193.96 seconds for the spatial index, about 5.2 minutes total on this machine. The outputs are large: about 9.8 GB, 6.0 GB, 4.5 MB, and 2.7 GB respectively.
