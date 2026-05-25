@@ -2533,9 +2533,9 @@ static int write_png(const char *path, const RenderContext *context) {
     }
     if (use_palette) png_write_filtered_index_rows(indexed_pixels, context->width, context->height, raw, row_size);
     else png_write_filtered_rows(context, raw, row_size);
-    compressed_capacity = compression_zlib_fixed_rle_bound(raw_size);
+    compressed_capacity = compression_zlib_fixed_lz77_bound(raw_size);
     compressed = (unsigned char *)rt_malloc(compressed_capacity);
-    if (compressed == 0 || compression_zlib_fixed_rle(raw, raw_size, compressed, compressed_capacity, &compressed_size) != 0) {
+    if (compressed == 0 || compression_zlib_fixed_lz77(raw, raw_size, compressed, compressed_capacity, &compressed_size) != 0) {
         rt_free(compressed);
         rt_free(raw);
         rt_free(indexed_pixels);

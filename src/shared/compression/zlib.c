@@ -8,6 +8,7 @@
 #define ZLIB_MAX_LITERAL_SYMBOLS 288U
 #define ZLIB_MAX_DISTANCE_SYMBOLS 32U
 #define ZLIB_MAX_CODE_LENGTH_SYMBOLS 19U
+#define ZLIB_LZ77_HASH_SLOTS 4U
 
 static unsigned int compression_adler32(const unsigned char *data, size_t length) {
     unsigned int s1 = 1U;
@@ -651,4 +652,94 @@ int compression_zlib_fixed_rle(const unsigned char *input, size_t input_size, un
     output[(*output_size_out)++] = (unsigned char)((adler >> 8U) & 0xffU);
     output[(*output_size_out)++] = (unsigned char)(adler & 0xffU);
     return 0;
+}
+
+size_t compression_zlib_fixed_lz77_bound(size_t input_size) {
+    if (input_size > 0xffffffffULL) return 0U;
+    return compression_zlib_fixed_rle_bound(input_size);
+}
+
+static unsigned int zlib_lz77_hash(const unsigned char *input) {
+    unsigned int value = ((unsigned int)input[0] << 16U) ^ ((unsigned int)input[1] << 8U) ^ (unsigned int)input[2];
+
+    value ^= value >> 9U;
+    value *= 2654435761U;
+    return (value >> 16U) & 65535U;
+}
+
+static void zlib_lz77_insert(const unsigned char *input, size_t input_size, unsigned int *head, size_t offset) {
+    unsigned int *bucket;
+    unsigned int slot;
+
+    if (offset + 2U >= input_size) return;
+    bucket = head + (size_t)zlib_lz77_hash(input + offset) * ZLIB_LZ77_HASH_SLOTS;
+    for (slot = ZLIB_LZ77_HASH_SLOTS - 1U; slot > 0U; --slot) bucket[slot] = bucket[slot - 1U];
+    bucket[0] = (unsigned int)offset;
+}
+
+int compression_zlib_fixed_lz77(const unsigned char *input, size_t input_size, unsigned char *output, size_t output_capacity, size_t *output_size_out) {
+    ZlibBitWriter writer;
+    unsigned int *head;
+    size_t input_offset = 0U;
+    unsigned int adler;
+    unsigned int index;
+    int result = -1;
+
+    if (input == 0 || output == 0 || output_size_out == 0 || compression_zlib_fixed_lz77_bound(input_size) == 0U || output_capacity < compression_zlib_fixed_lz77_bound(input_size)) return -1;
+    if (output_capacity < 6U) return -1;
+    head = (unsigned int *)rt_malloc(sizeof(unsigned int) * 65536U * ZLIB_LZ77_HASH_SLOTS);
+    if (head == 0) return -1;
+    for (index = 0U; index < 65536U * ZLIB_LZ77_HASH_SLOTS; ++index) head[index] = 0xffffffffU;
+    output[0] = 0x78U;
+    output[1] = 0x01U;
+    zlib_bit_writer_init(&writer, output + 2U, output_capacity - 6U);
+    if (zlib_write_bits(&writer, 1U, 1U) != 0 || zlib_write_bits(&writer, 1U, 2U) != 0) goto cleanup;
+    while (input_offset < input_size) {
+        unsigned int best_length = 0U;
+        unsigned int best_distance = 0U;
+
+        if (input_offset + 2U < input_size) {
+            unsigned int hash = zlib_lz77_hash(input + input_offset);
+            unsigned int *bucket = head + (size_t)hash * ZLIB_LZ77_HASH_SLOTS;
+            unsigned int slot;
+
+            for (slot = 0U; slot < ZLIB_LZ77_HASH_SLOTS; ++slot) {
+                unsigned int candidate = bucket[slot];
+                unsigned int length = 0U;
+                unsigned int max_length = input_size - input_offset > 258U ? 258U : (unsigned int)(input_size - input_offset);
+
+                if (candidate == 0xffffffffU || (size_t)candidate >= input_offset || input_offset - (size_t)candidate > 32768U) continue;
+                while (length < max_length && input[(size_t)candidate + (size_t)length] == input[input_offset + (size_t)length]) length += 1U;
+                if (length > best_length && length >= 3U) {
+                    best_length = length;
+                    best_distance = (unsigned int)(input_offset - (size_t)candidate);
+                    if (best_length == max_length) break;
+                }
+            }
+            zlib_lz77_insert(input, input_size, head, input_offset);
+        }
+        if (best_length >= 3U) {
+            unsigned int step;
+
+            if (zlib_write_fixed_match(&writer, best_length, best_distance) != 0) goto cleanup;
+            for (step = 1U; step < best_length; ++step) zlib_lz77_insert(input, input_size, head, input_offset + (size_t)step);
+            input_offset += (size_t)best_length;
+        } else {
+            if (zlib_write_fixed_symbol(&writer, input[input_offset]) != 0) goto cleanup;
+            input_offset += 1U;
+        }
+    }
+    if (zlib_write_fixed_symbol(&writer, 256U) != 0 || zlib_flush_bits(&writer) != 0) goto cleanup;
+    *output_size_out = 2U + writer.byte_offset;
+    if (*output_size_out + 4U > output_capacity) goto cleanup;
+    adler = compression_adler32(input, input_size);
+    output[(*output_size_out)++] = (unsigned char)((adler >> 24U) & 0xffU);
+    output[(*output_size_out)++] = (unsigned char)((adler >> 16U) & 0xffU);
+    output[(*output_size_out)++] = (unsigned char)((adler >> 8U) & 0xffU);
+    output[(*output_size_out)++] = (unsigned char)(adler & 0xffU);
+    result = 0;
+
+cleanup:
+    rt_free(head);
+    return result;
 }
