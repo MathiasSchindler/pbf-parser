@@ -12,6 +12,7 @@ The repository currently provides:
 - `osmlookup`, which streams nodes, ways, and relations and filters them by type, tags, IDs, names, and bounding boxes.
 - `osmaddresses`, which extracts address tags into TSV rows containing state, city, suburb, street, house number, and postcode fields.
 - `osmnodeindex`, which builds a compact node coordinate index for way geometry lookup.
+- `osmwayindex`, which builds a compact way-reference index for targeted relation rendering.
 - `osmrender`, an experimental BMP renderer used to validate rendering paths and benchmark indexing needs.
 - `threadtest`, a small validation tool for the Linux nolibc threading layer.
 
@@ -26,7 +27,7 @@ The code is split into platform, runtime, shared parser, and tool layers:
 - `src/shared/runtime` contains the small runtime functions used instead of libc.
 - `src/shared/compression` contains the local zlib/deflate implementation used for PBF blobs.
 - `src/shared/pbf.c` and `src/shared/pbf.h` contain the OSM PBF and protobuf streaming parser.
-- `src/shared/osm_index.c` and `src/shared/osm_index.h` contain the reusable node index format and lookup code.
+- `src/shared/osm_index.c` and `src/shared/osm_index.h` contain the reusable node and way index formats and lookup code.
 - `src/tools` contains the command-line tools built on top of the shared layers.
 
 The parser reads PBF fileblocks, decodes `OSMHeader` and `OSMData` blobs, inflates zlib-compressed payloads, parses protobuf fields, and exposes decoded OSM entities through streaming callbacks. Consumers can skip node tags or prefilter way and relation tags when they only need coordinates, IDs, renderable ways, or tag-only records.
@@ -55,6 +56,8 @@ Additional notes are in:
 
 - `docs/threading.md`
 - `docs/osm_streaming.md`
+- `docs/osm_rendering.md`
+- `docs/berlin_green_data.md`
 
 ## Generation And License
 

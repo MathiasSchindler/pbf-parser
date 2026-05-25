@@ -867,6 +867,7 @@ static int pbf_stream_way_payload(const unsigned char *data, size_t size, PbfStr
     long long ref = 0;
     int tags_ready = 0;
     int want_way = 1;
+    int skip_way_tags = context->callbacks != 0 && (context->callbacks->flags & PBF_STREAM_SKIP_WAY_TAGS) != 0U;
 
     rt_memset(&keys, 0, sizeof(keys));
     rt_memset(&values, 0, sizeof(values));
@@ -890,18 +891,18 @@ static int pbf_stream_way_payload(const unsigned char *data, size_t size, PbfStr
             const unsigned char *packed;
             size_t packed_size;
             if (pbf_read_length(&reader, &packed, &packed_size) != 0) goto fail;
-            if (pbf_parse_packed_uints(packed, packed_size, &keys) != 0) goto fail;
+            if (!skip_way_tags && pbf_parse_packed_uints(packed, packed_size, &keys) != 0) goto fail;
         } else if (field == 3U && wire_type == 2U) {
             const unsigned char *packed;
             size_t packed_size;
             if (pbf_read_length(&reader, &packed, &packed_size) != 0) goto fail;
-            if (pbf_parse_packed_uints(packed, packed_size, &values) != 0) goto fail;
+            if (!skip_way_tags && pbf_parse_packed_uints(packed, packed_size, &values) != 0) goto fail;
         } else if (field == 8U && wire_type == 2U) {
             const unsigned char *packed;
             size_t packed_size;
             if (pbf_read_length(&reader, &packed, &packed_size) != 0) goto fail;
             if (!tags_ready) {
-                if (pbf_build_tags(&context->string_table, &keys, &values, &tags) != 0) goto fail;
+                if (!skip_way_tags && pbf_build_tags(&context->string_table, &keys, &values, &tags) != 0) goto fail;
                 tags_ready = 1;
                 if (context->callbacks != 0 && context->callbacks->way_tags != 0 &&
                     context->callbacks->way_tags(context->user, way.id, tags.items, tags.count) == 0) {
@@ -914,7 +915,7 @@ static int pbf_stream_way_payload(const unsigned char *data, size_t size, PbfStr
         }
     }
     if (!tags_ready) {
-        if (pbf_build_tags(&context->string_table, &keys, &values, &tags) != 0) goto fail;
+        if (!skip_way_tags && pbf_build_tags(&context->string_table, &keys, &values, &tags) != 0) goto fail;
         tags_ready = 1;
         if (context->callbacks != 0 && context->callbacks->way_tags != 0 &&
             context->callbacks->way_tags(context->user, way.id, tags.items, tags.count) == 0) {
@@ -969,6 +970,12 @@ static int pbf_stream_relation_payload(const unsigned char *data, size_t size, P
     long long member_id = 0;
     int want_members = context->callbacks != 0 && context->callbacks->relation != 0;
     int want_relation = 1;
+    const unsigned char *roles_payload = 0;
+    const unsigned char *member_ids_payload = 0;
+    const unsigned char *member_types_payload = 0;
+    size_t roles_payload_size = 0;
+    size_t member_ids_payload_size = 0;
+    size_t member_types_payload_size = 0;
 
     rt_memset(&keys, 0, sizeof(keys));
     rt_memset(&values, 0, sizeof(values));
@@ -1005,17 +1012,26 @@ static int pbf_stream_relation_payload(const unsigned char *data, size_t size, P
             const unsigned char *packed;
             size_t packed_size;
             if (pbf_read_length(&reader, &packed, &packed_size) != 0) goto fail;
-            if (want_members && pbf_parse_packed_uints(packed, packed_size, &roles) != 0) goto fail;
+            if (want_members) {
+                roles_payload = packed;
+                roles_payload_size = packed_size;
+            }
         } else if (field == 9U && wire_type == 2U) {
             const unsigned char *packed;
             size_t packed_size;
             if (pbf_read_length(&reader, &packed, &packed_size) != 0) goto fail;
-            if (want_members && pbf_parse_packed_sints(packed, packed_size, &member_ids) != 0) goto fail;
+            if (want_members) {
+                member_ids_payload = packed;
+                member_ids_payload_size = packed_size;
+            }
         } else if (field == 10U && wire_type == 2U) {
             const unsigned char *packed;
             size_t packed_size;
             if (pbf_read_length(&reader, &packed, &packed_size) != 0) goto fail;
-            if (want_members && pbf_parse_packed_uints(packed, packed_size, &member_types) != 0) goto fail;
+            if (want_members) {
+                member_types_payload = packed;
+                member_types_payload_size = packed_size;
+            }
         } else if (pbf_skip_field(&reader, wire_type) != 0) {
             goto fail;
         }
@@ -1035,6 +1051,9 @@ static int pbf_stream_relation_payload(const unsigned char *data, size_t size, P
         rt_free(tags.items);
         return context->stop ? 1 : 0;
     }
+    if (roles_payload != 0 && pbf_parse_packed_uints(roles_payload, roles_payload_size, &roles) != 0) goto fail;
+    if (member_ids_payload != 0 && pbf_parse_packed_sints(member_ids_payload, member_ids_payload_size, &member_ids) != 0) goto fail;
+    if (member_types_payload != 0 && pbf_parse_packed_uints(member_types_payload, member_types_payload_size, &member_types) != 0) goto fail;
     if (roles.count != member_ids.count || roles.count != member_types.count) goto fail;
     for (index = 0U; index < member_ids.count; ++index) {
         PbfRelationMember member;
