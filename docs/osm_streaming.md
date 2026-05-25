@@ -12,6 +12,7 @@ typedef struct {
     int (*node)(void *user, const PbfNode *node);
     int (*way_tags)(void *user, long long id, const PbfTag *tags, unsigned int tag_count);
     int (*way)(void *user, const PbfWay *way);
+    int (*relation_tags)(void *user, long long id, const PbfTag *tags, unsigned int tag_count);
     int (*relation)(void *user, const PbfRelation *relation);
 } PbfStreamCallbacks;
 
@@ -29,6 +30,8 @@ Each callback receives data that is valid only for the duration of the callback.
 `PBF_STREAM_SKIP_NODE_TAGS` lets node-only consumers skip dense-node tag decoding. When this flag is set, dense-node streaming decodes IDs and coordinates directly from the packed protobuf fields instead of first materializing temporary arrays. `osmnodeindex` and `osmrender` use this because they only need node IDs and coordinates.
 
 `way_tags` is an optional prefilter. It receives decoded way tags before packed node refs are decoded. Returning `0` rejects the way and skips ref decoding; returning non-zero continues to the normal `way` callback. Renderers use this to avoid ref work for ways that do not match any visible style rule.
+
+`relation_tags` provides the same tag-only path for relations. Tag-only consumers can use it without a `relation` callback to avoid decoding relation members.
 
 Decoded entities include:
 
@@ -108,18 +111,18 @@ make all
 Output columns:
 
 ```text
-type    id    lat    lon    street    housenumber    postcode
+type    id    lat    lon    state    city    suburb    street    housenumber    postcode
 ```
 
 Node rows include coordinates. Way and relation rows leave the coordinate columns empty because this extractor only reads address tags; geometry can be resolved separately with the node index when needed.
 
 Options:
 
-- `--include-incomplete`, emit records that have at least one of street, housenumber, or postcode.
+- `--include-incomplete`, emit records that have at least one of state, city, suburb, street, housenumber, or postcode.
 - `--no-header`, omit the TSV header row.
 - `--limit N`, stop after writing `N` rows when the limit is reached from node or relation callbacks.
 
-The tool uses the `way_tags` prefilter to write address ways without decoding their packed node refs. This keeps way address extraction cheaper than a full geometry lookup.
+The tool uses buffered TSV output and the `way_tags` / `relation_tags` prefilters. Address ways are written without decoding packed node refs, and address relations are written without decoding relation members. This keeps address extraction cheaper than a full geometry lookup.
 
 Smoke validation on `data/hamburg-260524.osm.pbf`:
 
@@ -127,13 +130,25 @@ Smoke validation on `data/hamburg-260524.osm.pbf`:
 ./build/freestanding-linux-x86_64/osmaddresses data/hamburg-260524.osm.pbf build/hamburg-addresses-sample.tsv --limit 5
 ```
 
-Result:
+Small bounded validation result:
 
 ```text
 addresses_written: 5
 node_addresses: 5
 way_addresses: 0
 relation_addresses: 0
+```
+
+Full Hamburg extraction after adding buffered output and relation tag prefiltering:
+
+```text
+addresses_written: 262415
+node_addresses: 52076
+way_addresses: 210108
+relation_addresses: 231
+elapsed: 0:01.72
+maxrss_kb: 7168
+output: 14 MB
 ```
 
 ## osmnodeindex

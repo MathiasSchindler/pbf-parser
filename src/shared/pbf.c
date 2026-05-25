@@ -967,6 +967,8 @@ static int pbf_stream_relation_payload(const unsigned char *data, size_t size, P
     PbfRelation relation;
     unsigned int index;
     long long member_id = 0;
+    int want_members = context->callbacks != 0 && context->callbacks->relation != 0;
+    int want_relation = 1;
 
     rt_memset(&keys, 0, sizeof(keys));
     rt_memset(&values, 0, sizeof(values));
@@ -1003,20 +1005,35 @@ static int pbf_stream_relation_payload(const unsigned char *data, size_t size, P
             const unsigned char *packed;
             size_t packed_size;
             if (pbf_read_length(&reader, &packed, &packed_size) != 0) goto fail;
-            if (pbf_parse_packed_uints(packed, packed_size, &roles) != 0) goto fail;
+            if (want_members && pbf_parse_packed_uints(packed, packed_size, &roles) != 0) goto fail;
         } else if (field == 9U && wire_type == 2U) {
             const unsigned char *packed;
             size_t packed_size;
             if (pbf_read_length(&reader, &packed, &packed_size) != 0) goto fail;
-            if (pbf_parse_packed_sints(packed, packed_size, &member_ids) != 0) goto fail;
+            if (want_members && pbf_parse_packed_sints(packed, packed_size, &member_ids) != 0) goto fail;
         } else if (field == 10U && wire_type == 2U) {
             const unsigned char *packed;
             size_t packed_size;
             if (pbf_read_length(&reader, &packed, &packed_size) != 0) goto fail;
-            if (pbf_parse_packed_uints(packed, packed_size, &member_types) != 0) goto fail;
+            if (want_members && pbf_parse_packed_uints(packed, packed_size, &member_types) != 0) goto fail;
         } else if (pbf_skip_field(&reader, wire_type) != 0) {
             goto fail;
         }
+    }
+    if (pbf_build_tags(&context->string_table, &keys, &values, &tags) != 0) goto fail;
+    if (context->callbacks != 0 && context->callbacks->relation_tags != 0 &&
+        context->callbacks->relation_tags(context->user, relation.id, tags.items, tags.count) == 0) {
+        want_relation = 0;
+    }
+    if (!want_relation || !want_members) {
+        rt_free(keys.items);
+        rt_free(values.items);
+        rt_free(roles.items);
+        rt_free(member_ids.items);
+        rt_free(member_types.items);
+        rt_free(members.items);
+        rt_free(tags.items);
+        return context->stop ? 1 : 0;
     }
     if (roles.count != member_ids.count || roles.count != member_types.count) goto fail;
     for (index = 0U; index < member_ids.count; ++index) {
@@ -1027,7 +1044,6 @@ static int pbf_stream_relation_payload(const unsigned char *data, size_t size, P
         if (pbf_resolve_string(&context->string_table, roles.items[index], &member.role) != 0) goto fail;
         if (pbf_member_list_append(&members, member) != 0) goto fail;
     }
-    if (pbf_build_tags(&context->string_table, &keys, &values, &tags) != 0) goto fail;
     relation.members = members.items;
     relation.member_count = members.count;
     relation.tags = tags.items;
@@ -1080,7 +1096,7 @@ static int pbf_stream_primitive_group(const unsigned char *data, size_t size, Pb
                 result = pbf_stream_dense_nodes(payload, payload_size, context);
             } else if (field == 3U && context->callbacks != 0 && (context->callbacks->way != 0 || context->callbacks->way_tags != 0)) {
                 result = pbf_stream_way_payload(payload, payload_size, context);
-            } else if (field == 4U && context->callbacks != 0 && context->callbacks->relation != 0) {
+            } else if (field == 4U && context->callbacks != 0 && (context->callbacks->relation != 0 || context->callbacks->relation_tags != 0)) {
                 result = pbf_stream_relation_payload(payload, payload_size, context);
             } else {
                 result = 0;

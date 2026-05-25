@@ -10,7 +10,7 @@ The repository currently provides:
 
 - `pbfinfo`, which reads OSM PBF fileblocks and reports summary counts and metadata.
 - `osmlookup`, which streams nodes, ways, and relations and filters them by type, tags, IDs, names, and bounding boxes.
-- `osmaddresses`, which extracts address tags into TSV rows containing street names, house numbers, and postcodes.
+- `osmaddresses`, which extracts address tags into TSV rows containing state, city, suburb, street, house number, and postcode fields.
 - `osmnodeindex`, which builds a compact node coordinate index for way geometry lookup.
 - `osmrender`, an experimental BMP renderer used to validate rendering paths and benchmark indexing needs.
 - `threadtest`, a small validation tool for the Linux nolibc threading layer.
@@ -29,7 +29,7 @@ The code is split into platform, runtime, shared parser, and tool layers:
 - `src/shared/osm_index.c` and `src/shared/osm_index.h` contain the reusable node index format and lookup code.
 - `src/tools` contains the command-line tools built on top of the shared layers.
 
-The parser reads PBF fileblocks, decodes `OSMHeader` and `OSMData` blobs, inflates zlib-compressed payloads, parses protobuf fields, and exposes decoded OSM entities through streaming callbacks. Consumers can skip node tags or prefilter way tags when they only need coordinates, IDs, or renderable ways.
+The parser reads PBF fileblocks, decodes `OSMHeader` and `OSMData` blobs, inflates zlib-compressed payloads, parses protobuf fields, and exposes decoded OSM entities through streaming callbacks. Consumers can skip node tags or prefilter way and relation tags when they only need coordinates, IDs, renderable ways, or tag-only records.
 
 ## Build
 
