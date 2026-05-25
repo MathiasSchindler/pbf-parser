@@ -52,6 +52,11 @@ typedef struct {
 } OsmRenderPngColorCount;
 
 typedef struct {
+    int x;
+    int y;
+} OsmRenderBoundaryEndpoint;
+
+typedef struct {
     long long min_lon_nano;
     long long min_lat_nano;
     long long max_lon_nano;
@@ -112,6 +117,8 @@ typedef struct {
     int major_roads;
     int no_fills;
     int no_relation_scan;
+    int boundary_fade;
+    int boundary_fade_applied;
     int bbox_enabled;
     int relation_filter_enabled;
     int boundary_relation_enabled;
@@ -183,7 +190,114 @@ struct OsmRenderStyleSheet {
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " FILE.osm.pbf OUT.bmp|OUT.png --bbox MINLON,MINLAT,MAXLON,MAXLAT [--city NAME] [--width N] [--height N] [--style FILE] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--spatial-index FILE] [--green-only] [--major-roads] [--no-fills] [--no-relation-scan] [--max-way-refs N] [--relation-id ID] [--boundary-relation-id ID] [--node-points] [--tree-points] [--stop-after-nodes N] [--stop-after-trees N] [--stop-after-ways N] [--stop-after-drawn N]\n");
+    rt_write_cstr(2, " FILE.osm.pbf OUT.bmp|OUT.png --bbox MINLON,MINLAT,MAXLON,MAXLAT [--city NAME] [--width N] [--height N] [--style FILE] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--spatial-index FILE] [--green-only] [--major-roads] [--no-fills] [--no-relation-scan] [--no-boundary-fade] [--max-way-refs N] [--relation-id ID] [--boundary-relation-id ID] [--node-points] [--tree-points] [--stop-after-nodes N] [--stop-after-trees N] [--stop-after-ways N] [--stop-after-drawn N]\n");
+}
+
+static int path_exists(const char *path) {
+    int fd;
+
+    if (path == 0) return 0;
+    fd = platform_open_read(path);
+    if (fd < 0) return 0;
+    (void)platform_close(fd);
+    return 1;
+}
+
+static int append_text(char *buffer, size_t buffer_size, size_t *length_io, const char *text) {
+    size_t text_length = rt_strlen(text);
+
+    if (*length_io + text_length + 1U > buffer_size) return -1;
+    memcpy(buffer + *length_io, text, text_length);
+    *length_io += text_length;
+    buffer[*length_io] = '\0';
+    return 0;
+}
+
+static int append_text_n(char *buffer, size_t buffer_size, size_t *length_io, const char *text, size_t text_length) {
+    if (*length_io + text_length + 1U > buffer_size) return -1;
+    memcpy(buffer + *length_io, text, text_length);
+    *length_io += text_length;
+    buffer[*length_io] = '\0';
+    return 0;
+}
+
+static int pbf_base_name(const char *path, const char **name_out, size_t *name_size_out) {
+    const char *name = path;
+    size_t index;
+    size_t size;
+
+    for (index = 0U; path[index] != '\0'; ++index) {
+        if (path[index] == '/') name = path + index + 1U;
+    }
+    size = rt_strlen(name);
+    if (size > 8U && memcmp(name + size - 8U, ".osm.pbf", 8U) == 0) size -= 8U;
+    else if (size > 4U && memcmp(name + size - 4U, ".pbf", 4U) == 0) size -= 4U;
+    if (size == 0U) return -1;
+    *name_out = name;
+    *name_size_out = size;
+    return 0;
+}
+
+static size_t strip_date_suffix_size(const char *name, size_t name_size) {
+    size_t dash = name_size;
+    size_t index;
+
+    while (dash > 0U && name[dash - 1U] != '-') dash -= 1U;
+    if (dash == 0U || dash + 1U >= name_size) return name_size;
+    for (index = dash; index < name_size; ++index) {
+        if (name[index] < '0' || name[index] > '9') return name_size;
+    }
+    return dash - 1U;
+}
+
+static int make_index_path(char *buffer, size_t buffer_size, const char *name, size_t name_size, const char *extension) {
+    size_t length = 0U;
+
+    buffer[0] = '\0';
+    if (append_text(buffer, buffer_size, &length, "build/") != 0) return -1;
+    if (append_text_n(buffer, buffer_size, &length, name, name_size) != 0) return -1;
+    if (append_text(buffer, buffer_size, &length, extension) != 0) return -1;
+    return 0;
+}
+
+static int infer_index_path(const char *pbf_path, const char *extension, char *buffer, size_t buffer_size) {
+    const char *name;
+    size_t name_size;
+    size_t stripped_size;
+
+    if (pbf_base_name(pbf_path, &name, &name_size) != 0) return -1;
+    stripped_size = strip_date_suffix_size(name, name_size);
+    if (stripped_size != name_size && make_index_path(buffer, buffer_size, name, stripped_size, extension) == 0 && path_exists(buffer)) return 0;
+    if (make_index_path(buffer, buffer_size, name, name_size, extension) == 0 && path_exists(buffer)) return 0;
+    if (stripped_size != name_size) return make_index_path(buffer, buffer_size, name, stripped_size, extension);
+    return make_index_path(buffer, buffer_size, name, name_size, extension);
+}
+
+static void write_city_index_hint(const char *pbf_path, const char *node_index_path, const char *way_index_path, const char *relation_index_path, const char *spatial_index_path) {
+    rt_write_cstr(2, "osmrender: for --city, build or pass matching indexes. Suggested commands:\n");
+    rt_write_cstr(2, "  ./build/freestanding-linux-x86_64/osmindex --progress ");
+    rt_write_cstr(2, pbf_path);
+    rt_write_char(2, ' ');
+    rt_write_cstr(2, node_index_path);
+    rt_write_char(2, ' ');
+    rt_write_cstr(2, way_index_path);
+    rt_write_char(2, '\n');
+    if (relation_index_path != 0) {
+        rt_write_cstr(2, "  ./build/freestanding-linux-x86_64/osmrelindex --progress ");
+        rt_write_cstr(2, pbf_path);
+        rt_write_char(2, ' ');
+        rt_write_cstr(2, relation_index_path);
+        rt_write_char(2, '\n');
+    }
+    if (spatial_index_path != 0) {
+        rt_write_cstr(2, "  ./build/freestanding-linux-x86_64/osmspindex --progress ");
+        rt_write_cstr(2, node_index_path);
+        rt_write_char(2, ' ');
+        rt_write_cstr(2, way_index_path);
+        rt_write_char(2, ' ');
+        rt_write_cstr(2, spatial_index_path);
+        rt_write_char(2, '\n');
+    }
 }
 
 static int parse_uint_arg(const char *text, unsigned int *value_out) {
@@ -202,6 +316,48 @@ static int parse_uint_arg(const char *text, unsigned int *value_out) {
     if (value == 0ULL) return -1;
     *value_out = (unsigned int)value;
     return 0;
+}
+
+static unsigned int clamp_dimension(unsigned long long value) {
+    if (value < 1ULL) return 1U;
+    if (value > 8192ULL) return 8192U;
+    return (unsigned int)value;
+}
+
+static void choose_default_dimensions(OsmRenderContext *context, int width_explicit, int height_explicit) {
+    unsigned long long lon_span;
+    unsigned long long lat_span;
+    unsigned long long scaled_lon_span;
+    unsigned long long long_side = context->city_enabled ? 1200ULL : 1024ULL;
+    unsigned long long min_side = context->city_enabled ? 640ULL : 512ULL;
+
+    if (context->width != 0U && context->height != 0U) return;
+    if (context->max_lon_nano <= context->min_lon_nano || context->max_lat_nano <= context->min_lat_nano) {
+        if (context->width == 0U) context->width = 1024U;
+        if (context->height == 0U) context->height = 1024U;
+        return;
+    }
+    lon_span = (unsigned long long)(context->max_lon_nano - context->min_lon_nano);
+    lat_span = (unsigned long long)(context->max_lat_nano - context->min_lat_nano);
+    scaled_lon_span = (lon_span * 3ULL + 2ULL) / 5ULL;
+    if (scaled_lon_span == 0ULL) scaled_lon_span = 1ULL;
+    if (!width_explicit && !height_explicit) {
+        if (scaled_lon_span >= lat_span) {
+            unsigned long long height = (lat_span * long_side + scaled_lon_span / 2ULL) / scaled_lon_span;
+            context->width = (unsigned int)long_side;
+            context->height = clamp_dimension(height < min_side ? min_side : height);
+        } else {
+            unsigned long long width = (scaled_lon_span * long_side + lat_span / 2ULL) / lat_span;
+            context->height = (unsigned int)long_side;
+            context->width = clamp_dimension(width < min_side ? min_side : width);
+        }
+    } else if (width_explicit && !height_explicit) {
+        unsigned long long height = scaled_lon_span >= lat_span ? (lat_span * (unsigned long long)context->width + scaled_lon_span / 2ULL) / scaled_lon_span : ((unsigned long long)context->width * lat_span + scaled_lon_span / 2ULL) / scaled_lon_span;
+        context->height = clamp_dimension(height);
+    } else if (!width_explicit && height_explicit) {
+        unsigned long long width = scaled_lon_span >= lat_span ? ((unsigned long long)context->height * scaled_lon_span + lat_span / 2ULL) / lat_span : (scaled_lon_span * (unsigned long long)context->height + lat_span / 2ULL) / lat_span;
+        context->width = clamp_dimension(width);
+    }
 }
 
 static int parse_id_arg(const char *text, long long *value_out) {
@@ -752,13 +908,21 @@ static int relation_way_grow(OsmRenderContext *context, unsigned int needed) {
 
 static int relation_way_insert(OsmRenderContext *context, long long id, unsigned int style_id) {
     unsigned int slot;
+    unsigned int order_index;
 
     if (context->relation_way_capacity != 0U) {
         slot = (unsigned int)(hash_id(id) & (unsigned long long)(context->relation_way_capacity - 1U));
         for (;;) {
             if (!context->relation_ways[slot].used) break;
             if (context->relation_ways[slot].id == id) {
+                if (context->relation_ways[slot].style_id == (unsigned int)OSM_RENDER_STYLE_BOUNDARY && style_id != (unsigned int)OSM_RENDER_STYLE_BOUNDARY) return 0;
                 context->relation_ways[slot].style_id = style_id;
+                for (order_index = 0U; order_index < context->relation_way_count; ++order_index) {
+                    if (context->relation_way_order[order_index].id == id) {
+                        context->relation_way_order[order_index].style_id = style_id;
+                        break;
+                    }
+                }
                 return 0;
             }
             slot = (slot + 1U) & (context->relation_way_capacity - 1U);
@@ -2029,6 +2193,195 @@ static const OsmRenderLayer render_layers[] = {
     { OSM_RENDER_STEP_LINE, OSM_RENDER_STYLE_BOUNDARY }
 };
 
+static void fade_pixel_outside_boundary(OsmRenderContext *context, int x, int y) {
+    unsigned char *pixel;
+
+    if (x < 0 || y < 0 || x >= (int)context->width || y >= (int)context->height) return;
+    pixel = context->pixels + ((size_t)y * (size_t)context->width + (size_t)x) * 3U;
+    pixel[0] = blend_channel(pixel[0], 250U, 150U);
+    pixel[1] = blend_channel(pixel[1], 250U, 150U);
+    pixel[2] = blend_channel(pixel[2], 246U, 150U);
+}
+
+static void boundary_mask_mark(unsigned char *mask, unsigned int width, unsigned int height, int x, int y) {
+    int radius = 3;
+    int dy;
+
+    for (dy = -radius; dy <= radius; ++dy) {
+        int dx;
+        int yy = y + dy;
+        if (yy < 0 || yy >= (int)height) continue;
+        for (dx = -radius; dx <= radius; ++dx) {
+            int xx = x + dx;
+            if (xx < 0 || xx >= (int)width) continue;
+            if (dx * dx + dy * dy <= radius * radius) mask[(size_t)yy * (size_t)width + (size_t)xx] = 1U;
+        }
+    }
+}
+
+static void boundary_mask_line(unsigned char *mask, unsigned int width, unsigned int height, int x0, int y0, int x1, int y1) {
+    int dx = abs_int(x1 - x0);
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = -abs_int(y1 - y0);
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+
+    for (;;) {
+        int twice_err;
+
+        boundary_mask_mark(mask, width, height, x0, y0);
+        if (x0 == x1 && y0 == y1) break;
+        twice_err = 2 * err;
+        if (twice_err >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (twice_err <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+static int boundary_mask_enqueue(unsigned char *mask, unsigned int *queue, unsigned int width, unsigned int height, unsigned int *tail_io, int x, int y) {
+    unsigned int index;
+
+    if (x < 0 || y < 0 || x >= (int)width || y >= (int)height) return 0;
+    index = (unsigned int)((size_t)y * (size_t)width + (size_t)x);
+    if (mask[index] != 0U) return 0;
+    mask[index] = 2U;
+    queue[*tail_io] = index;
+    *tail_io += 1U;
+    return 0;
+}
+
+static void fade_outside_city_boundary(OsmRenderContext *context) {
+    unsigned int boundary_way_count = 0U;
+    unsigned int relation_index;
+    unsigned int pixel_count;
+    unsigned char *mask;
+    unsigned int *queue;
+    OsmRenderBoundaryEndpoint *endpoints;
+    unsigned int endpoint_count = 0U;
+    unsigned int head = 0U;
+    unsigned int tail = 0U;
+    unsigned int x;
+    unsigned int y;
+    unsigned int index;
+
+    if (!context->city_enabled || !context->boundary_fade || context->width == 0U || context->height == 0U) return;
+    if (!context->way_index_open) return;
+    if ((size_t)context->width > ((size_t)-1) / (size_t)context->height) return;
+    pixel_count = (unsigned int)((size_t)context->width * (size_t)context->height);
+    if ((size_t)pixel_count != (size_t)context->width * (size_t)context->height) return;
+    for (relation_index = 0U; relation_index < context->relation_way_count; ++relation_index) {
+        if (context->relation_way_order[relation_index].style_id == (unsigned int)OSM_RENDER_STYLE_BOUNDARY) boundary_way_count += 1U;
+    }
+    if (boundary_way_count < 2U) return;
+    mask = (unsigned char *)rt_malloc((size_t)pixel_count);
+    queue = (unsigned int *)rt_malloc(sizeof(unsigned int) * (size_t)pixel_count);
+    endpoints = (OsmRenderBoundaryEndpoint *)rt_malloc(sizeof(OsmRenderBoundaryEndpoint) * (size_t)boundary_way_count * 2U);
+    if (mask == 0 || queue == 0 || endpoints == 0) {
+        rt_free(mask);
+        rt_free(queue);
+        rt_free(endpoints);
+        return;
+    }
+    rt_memset(mask, 0, (size_t)pixel_count);
+    for (relation_index = 0U; relation_index < context->relation_way_count; ++relation_index) {
+        OsmWayIndexRecord record;
+        long long *refs = 0;
+        char error[OSM_INDEX_ERROR_CAPACITY];
+        unsigned int ref_index;
+        int has_previous = 0;
+        int has_first = 0;
+        int previous_x = 0;
+        int previous_y = 0;
+        int first_x = 0;
+        int first_y = 0;
+        int last_x = 0;
+        int last_y = 0;
+        int found;
+
+        if (context->relation_way_order[relation_index].style_id != (unsigned int)OSM_RENDER_STYLE_BOUNDARY) continue;
+        error[0] = '\0';
+        found = osm_way_index_find(&context->way_index, context->relation_way_order[relation_index].id, &record, error, sizeof(error));
+        if (found <= 0) continue;
+        if (osm_way_index_read_refs(&context->way_index, &record, &refs, error, sizeof(error)) != 0) continue;
+        for (ref_index = 0U; ref_index < record.ref_count; ++ref_index) {
+            OsmRenderNodeEntry node;
+            long long projected_x;
+            long long projected_y;
+
+            if (!resolve_node(context, refs[ref_index], &node) || project_point_ll(context, &node, &projected_x, &projected_y) != 0) {
+                has_previous = 0;
+                continue;
+            }
+            if (projected_x < -2147483647LL || projected_x > 2147483647LL || projected_y < -2147483647LL || projected_y > 2147483647LL) {
+                has_previous = 0;
+                continue;
+            }
+            if (!has_first) {
+                first_x = (int)projected_x;
+                first_y = (int)projected_y;
+                has_first = 1;
+            }
+            if (has_previous) boundary_mask_line(mask, context->width, context->height, previous_x, previous_y, (int)projected_x, (int)projected_y);
+            previous_x = (int)projected_x;
+            previous_y = (int)projected_y;
+            last_x = (int)projected_x;
+            last_y = (int)projected_y;
+            has_previous = 1;
+        }
+        rt_free(refs);
+        if (has_first && endpoint_count + 1U < boundary_way_count * 2U) {
+            endpoints[endpoint_count].x = first_x;
+            endpoints[endpoint_count].y = first_y;
+            endpoint_count += 1U;
+            endpoints[endpoint_count].x = last_x;
+            endpoints[endpoint_count].y = last_y;
+            endpoint_count += 1U;
+        }
+    }
+    for (index = 0U; index < endpoint_count; ++index) {
+        unsigned int other;
+        for (other = index + 1U; other < endpoint_count; ++other) {
+            int dx = endpoints[index].x - endpoints[other].x;
+            int dy = endpoints[index].y - endpoints[other].y;
+            int distance2 = dx * dx + dy * dy;
+            if (distance2 > 0 && distance2 <= 32 * 32) {
+                boundary_mask_line(mask, context->width, context->height, endpoints[index].x, endpoints[index].y, endpoints[other].x, endpoints[other].y);
+            }
+        }
+    }
+    for (x = 0U; x < context->width; ++x) {
+        (void)boundary_mask_enqueue(mask, queue, context->width, context->height, &tail, (int)x, 0);
+        (void)boundary_mask_enqueue(mask, queue, context->width, context->height, &tail, (int)x, (int)context->height - 1);
+    }
+    for (y = 1U; y + 1U < context->height; ++y) {
+        (void)boundary_mask_enqueue(mask, queue, context->width, context->height, &tail, 0, (int)y);
+        (void)boundary_mask_enqueue(mask, queue, context->width, context->height, &tail, (int)context->width - 1, (int)y);
+    }
+    while (head < tail) {
+        unsigned int pixel = queue[head++];
+        int px = (int)(pixel % context->width);
+        int py = (int)(pixel / context->width);
+
+        (void)boundary_mask_enqueue(mask, queue, context->width, context->height, &tail, px - 1, py);
+        (void)boundary_mask_enqueue(mask, queue, context->width, context->height, &tail, px + 1, py);
+        (void)boundary_mask_enqueue(mask, queue, context->width, context->height, &tail, px, py - 1);
+        (void)boundary_mask_enqueue(mask, queue, context->width, context->height, &tail, px, py + 1);
+    }
+    for (index = 0U; index < pixel_count; ++index) {
+        if (mask[index] == 2U) {
+            fade_pixel_outside_boundary(context, (int)(index % context->width), (int)(index / context->width));
+        }
+    }
+    rt_free(mask);
+    rt_free(queue);
+    rt_free(endpoints);
+}
+
 static void draw_render_layers(OsmRenderContext *context) {
     unsigned int layer_index;
 
@@ -2038,6 +2391,10 @@ static void draw_render_layers(OsmRenderContext *context) {
         unsigned int index;
 
         context->render_step = render_layers[layer_index].step;
+        if (!context->boundary_fade_applied && render_layers[layer_index].style_id == OSM_RENDER_STYLE_BOUNDARY) {
+            fade_outside_city_boundary(context);
+            context->boundary_fade_applied = 1;
+        }
         copy_style(context->style_sheet, render_layers[layer_index].style_id, &style);
         if (context->render_step == OSM_RENDER_STEP_AREA) {
             for (index = 0U; index < context->polygon_count; ++index) {
@@ -2089,11 +2446,17 @@ int main(int argc, char **argv) {
     const char *pbf_path;
     const char *out_path;
     const char *style_path = 0;
+    char default_node_index_path[256];
+    char default_way_index_path[256];
+    char default_relation_index_path[256];
+    char default_spatial_index_path[256];
     OsmRenderContext context;
     OsmRenderStyleSheet style_sheet;
     PbfStreamCallbacks callbacks;
     char error[PBF_ERROR_CAPACITY];
     int argi;
+    int width_explicit = 0;
+    int height_explicit = 0;
 
     if (argc < 4) {
         write_usage(program);
@@ -2110,8 +2473,11 @@ int main(int argc, char **argv) {
     rt_memset(&context, 0, sizeof(context));
     style_sheet_init(&style_sheet);
     context.style_sheet = &style_sheet;
-    context.width = 1024U;
-    context.height = 1024U;
+    context.boundary_fade = 1;
+    default_node_index_path[0] = '\0';
+    default_way_index_path[0] = '\0';
+    default_relation_index_path[0] = '\0';
+    default_spatial_index_path[0] = '\0';
     while (argi < argc) {
         if (rt_strcmp(argv[argi], "--bbox") == 0) {
             argi += 1;
@@ -2135,6 +2501,7 @@ int main(int argc, char **argv) {
                 write_usage(program);
                 return 1;
             }
+            width_explicit = 1;
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--height") == 0) {
             argi += 1;
@@ -2142,6 +2509,7 @@ int main(int argc, char **argv) {
                 write_usage(program);
                 return 1;
             }
+            height_explicit = 1;
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--style") == 0) {
             argi += 1;
@@ -2200,6 +2568,9 @@ int main(int argc, char **argv) {
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--no-relation-scan") == 0) {
             context.no_relation_scan = 1;
+            argi += 1;
+        } else if (rt_strcmp(argv[argi], "--no-boundary-fade") == 0) {
+            context.boundary_fade = 0;
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--max-way-refs") == 0) {
             argi += 1;
@@ -2265,9 +2636,20 @@ int main(int argc, char **argv) {
         write_usage(program);
         return 1;
     }
-    if (context.city_enabled && (context.node_index_path == 0 || context.way_index_path == 0)) {
-        rt_write_cstr(2, "osmrender: --city requires --node-index and --way-index\n");
-        return 1;
+    if (context.city_enabled) {
+        if (!context.green_only && !context.node_points && !context.tree_points) context.green_only = 1;
+        if (!context.major_roads && !context.node_points && !context.tree_points) context.major_roads = 1;
+        if (context.node_index_path == 0 && infer_index_path(pbf_path, ".osmnidx", default_node_index_path, sizeof(default_node_index_path)) == 0) context.node_index_path = default_node_index_path;
+        if (context.way_index_path == 0 && infer_index_path(pbf_path, ".osmwidx", default_way_index_path, sizeof(default_way_index_path)) == 0) context.way_index_path = default_way_index_path;
+        if (context.relation_index_path == 0 && infer_index_path(pbf_path, ".osmridx", default_relation_index_path, sizeof(default_relation_index_path)) == 0 && path_exists(default_relation_index_path)) context.relation_index_path = default_relation_index_path;
+        if (context.spatial_index_path == 0 && infer_index_path(pbf_path, ".osmspidx", default_spatial_index_path, sizeof(default_spatial_index_path)) == 0 && path_exists(default_spatial_index_path)) context.spatial_index_path = default_spatial_index_path;
+        if (context.node_index_path == 0 || context.way_index_path == 0) {
+            rt_write_cstr(2, "osmrender: --city requires node and way indexes\n");
+            return 1;
+        }
+    }
+    if (style_path == 0 && path_exists("styles/osmrender-default.conf")) {
+        style_path = "styles/osmrender-default.conf";
     }
     if (style_path != 0 && load_style_sheet(style_path, &style_sheet) != 0) {
         rt_write_cstr(2, "osmrender: could not parse style file: ");
@@ -2283,6 +2665,7 @@ int main(int argc, char **argv) {
             rt_write_cstr(2, "osmrender: ");
             rt_write_cstr(2, index_error[0] == '\0' ? "could not open node index" : index_error);
             rt_write_char(2, '\n');
+            if (context.city_enabled) write_city_index_hint(pbf_path, context.node_index_path, context.way_index_path, default_relation_index_path[0] != '\0' ? default_relation_index_path : 0, default_spatial_index_path[0] != '\0' ? default_spatial_index_path : 0);
             return 1;
         }
         context.node_index_open = 1;
@@ -2304,6 +2687,7 @@ int main(int argc, char **argv) {
             rt_write_cstr(2, "osmrender: ");
             rt_write_cstr(2, index_error[0] == '\0' ? "could not open way index" : index_error);
             rt_write_char(2, '\n');
+            if (context.city_enabled) write_city_index_hint(pbf_path, context.node_index_path, context.way_index_path, default_relation_index_path[0] != '\0' ? default_relation_index_path : 0, default_spatial_index_path[0] != '\0' ? default_spatial_index_path : 0);
             cleanup_context(&context);
             return 1;
         }
@@ -2349,6 +2733,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    choose_default_dimensions(&context, width_explicit, height_explicit);
     if (!context.bbox_enabled) {
         rt_write_cstr(2, "osmrender: missing bbox\n");
         cleanup_context(&context);
@@ -2461,11 +2846,23 @@ int main(int argc, char **argv) {
     rt_write_cstr(1, "visible_pixels: ");
     rt_write_uint(1, context.visible_pixels);
     rt_write_char(1, '\n');
+    rt_write_cstr(1, "width: ");
+    rt_write_uint(1, context.width);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "height: ");
+    rt_write_uint(1, context.height);
+    rt_write_char(1, '\n');
     rt_write_cstr(1, "node_index: ");
     rt_write_cstr(1, context.node_index_open ? "yes" : "no");
     rt_write_char(1, '\n');
     rt_write_cstr(1, "way_index: ");
     rt_write_cstr(1, context.way_index_open ? "yes" : "no");
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "relation_index: ");
+    rt_write_cstr(1, context.relation_index_open ? "yes" : "no");
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "spatial_index: ");
+    rt_write_cstr(1, context.spatial_index_open ? "yes" : "no");
     rt_write_char(1, '\n');
     rt_write_cstr(1, "bounded: ");
     rt_write_cstr(1, (context.stopped_after_nodes || context.stopped_after_trees || context.stopped_after_ways || context.stopped_after_drawn) ? "yes" : "no");
@@ -2487,6 +2884,9 @@ int main(int argc, char **argv) {
     rt_write_char(1, '\n');
     rt_write_cstr(1, "relation_scan: ");
     rt_write_cstr(1, context.no_relation_scan ? "no" : "yes");
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "boundary_fade: ");
+    rt_write_cstr(1, context.boundary_fade_applied ? "yes" : "no");
     rt_write_char(1, '\n');
     cleanup_context(&context);
     return 0;

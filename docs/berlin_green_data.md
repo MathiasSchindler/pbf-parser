@@ -133,6 +133,14 @@ Potsdam from the Brandenburg extract:
 ./build/freestanding-linux-x86_64/osmrender data/brandenburg-260524.osm.pbf build/potsdam-city.png --city Potsdam --width 1600 --height 1200 --style styles/osmrender-default.conf --node-index build/brandenburg.osmnidx --way-index build/brandenburg.osmwidx --relation-index build/brandenburg.osmridx --spatial-index build/brandenburg.osmspidx --green-only --major-roads
 ```
 
+Once those indexes exist, the short form is equivalent to the green city-map defaults:
+
+```sh
+./build/freestanding-linux-x86_64/osmrender data/brandenburg-260524.osm.pbf build/potsdam-short-default.png --city Potsdam
+```
+
+This defaults to the project style, green areas plus major roads, relation scanning, optional spatial filtering, aspect-aware output dimensions, and a brighter outside-boundary mask.
+
 The sparse `germany-potsdam-spatial*.png` benchmark images were produced with `--stop-after-drawn 200` and/or `--no-relation-scan`. Those flags are useful for timing parser/index changes, but they are not full green-map commands: `--stop-after-drawn` stops after a tiny sample, and `--no-relation-scan` skips many multipolygon green areas.
 
 Germany-wide indexes can now be built directly with the combined buffered indexer:
@@ -151,6 +159,8 @@ Additional Germany indexes are now available for boundary lookup and spatial way
 ```
 
 Measured results: `osmrelindex` built `build/germany.osmridx` in 39.37 seconds, and `osmspindex` built `build/germany.osmspidx` in 193.96 seconds. With the drawn-way cap removed, a Germany/Potsdam render using `--no-relation-scan` drew 11,093 ways, but the richer Brandenburg/Potsdam render with relation scanning drew 11,568 ways and includes many more relation-based green shapes.
+
+If `make clean` has removed the generated indexes, rebuild Germany city-rendering indexes in this order: `osmindex`, `osmrelindex`, then `osmspindex`. On the current machine the measured total was about 5.2 minutes, dominated by the spatial index build.
 
 Tree-point checkpoint:
 

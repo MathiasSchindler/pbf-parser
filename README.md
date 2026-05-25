@@ -45,6 +45,8 @@ make all
 
 The build output and local PBF data files are intentionally ignored by git.
 
+`make clean` removes the whole build directory, including generated OSM indexes. Recreate the binaries with `make`, then recreate any needed `.osm*idx` files before city rendering from a large extract.
+
 ## Data
 
 Place local `.osm.pbf` files under `data/` when running the tools. Example:
@@ -52,6 +54,22 @@ Place local `.osm.pbf` files under `data/` when running the tools. Example:
 ```sh
 ./build/freestanding-linux-x86_64/pbfinfo data/example.osm.pbf
 ```
+
+For city rendering, build the indexes once for the matching extract:
+
+```sh
+./build/freestanding-linux-x86_64/osmindex --progress data/germany-260524.osm.pbf build/germany.osmnidx build/germany.osmwidx
+./build/freestanding-linux-x86_64/osmrelindex --progress data/germany-260524.osm.pbf build/germany.osmridx
+./build/freestanding-linux-x86_64/osmspindex --progress build/germany.osmnidx build/germany.osmwidx build/germany.osmspidx
+```
+
+Then a short city render command uses sane defaults:
+
+```sh
+./build/freestanding-linux-x86_64/osmrender data/germany-260524.osm.pbf city.png --city Berlin
+```
+
+With `--city`, `osmrender` infers matching `build/<extract>.osmnidx`, `.osmwidx`, optional `.osmridx`, optional `.osmspidx`, the default style file, green-area rendering, major roads, aspect-aware output dimensions, and a brighter outside-boundary mask. If the inferred indexes are missing, it prints the commands needed to rebuild them.
 
 ## Documentation
 

@@ -113,6 +113,14 @@ Potsdam can be rendered from the Brandenburg extract:
 ./build/freestanding-linux-x86_64/osmrender data/brandenburg-260524.osm.pbf build/potsdam-city.png --city Potsdam --width 1600 --height 1200 --style styles/osmrender-default.conf --node-index build/brandenburg.osmnidx --way-index build/brandenburg.osmwidx --relation-index build/brandenburg.osmridx --spatial-index build/brandenburg.osmspidx --green-only --major-roads
 ```
 
+The shorter command uses those defaults automatically when the inferred index files exist:
+
+```sh
+./build/freestanding-linux-x86_64/osmrender data/brandenburg-260524.osm.pbf build/potsdam-short-default.png --city Potsdam
+```
+
+For `data/brandenburg-260524.osm.pbf`, `--city Potsdam` infers `build/brandenburg.osmnidx`, `build/brandenburg.osmwidx`, `build/brandenburg.osmridx`, `build/brandenburg.osmspidx`, `styles/osmrender-default.conf`, `--green-only`, and `--major-roads`. It also chooses aspect-aware dimensions from the city boundary and fades pixels outside the city boundary before drawing the boundary overlay. The fade can be disabled with `--no-boundary-fade`.
+
 Do not use `--stop-after-drawn` for final maps; it intentionally produces sparse smoke-test output. `--no-relation-scan` is also a benchmark shortcut: it keeps boundary lookup from the relation index, but it omits many green multipolygon relations, so parks, forests, woods, and water areas can be visibly incomplete.
 
 Observed Potsdam counters:
@@ -147,3 +155,5 @@ The first spatial way index can be built from the Germany node and way indexes:
 ```
 
 Measured on `data/germany-260524.osm.pbf`, `osmrelindex` indexed 32,045 administrative relations in 39.37 seconds and `osmspindex` indexed 70,233,055 way bboxes in 193.96 seconds, producing a 2.7 GB spatial index. A capped Potsdam smoke test with `--stop-after-drawn 200 --no-relation-scan` decodes only 200 ways by design; the uncapped Germany render without relation scanning drew 11,093 ways in 103.96 seconds, while the full Brandenburg render with relation scanning drew 11,568 ways in 6.70 seconds.
+
+After `make clean`, the generated indexes are gone and must be rebuilt. The measured Germany index rebuild times were 81.40 seconds for the combined node+way index, 39.37 seconds for the relation index, and 193.96 seconds for the spatial index, about 5.2 minutes total on this machine. The outputs are large: about 9.8 GB, 6.0 GB, 4.5 MB, and 2.7 GB respectively.
