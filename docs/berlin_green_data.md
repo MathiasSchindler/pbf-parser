@@ -115,20 +115,42 @@ visible_pixels: 987325
 major_roads: yes
 ```
 
-## Toward Generic City Rendering
+## Generic City Rendering
 
-A generic Germany-wide command should resolve the city boundary before rendering. The intended workflow is:
+`osmrender --city NAME` resolves the city boundary before rendering. The workflow is:
 
-1. Build Germany-wide node and way indexes once.
+1. Build node and way indexes for the extract once.
 2. Find the administrative boundary relation by `name=<city>`, `boundary=administrative`, and a city-level `admin_level`.
 3. Use the boundary relation's member ways and the indexes to compute a padded bbox automatically.
 4. Render the bbox with `--green-only`, `--boundary-relation-id <id>`, and optional `--major-roads`.
 
-A future CLI can hide those steps behind a city name, for example:
+Potsdam from the Brandenburg extract:
 
 ```sh
-./build/freestanding-linux-x86_64/osmrender data/germany-260524.osm.pbf city.png --city Berlin --node-index build/germany.osmnidx --way-index build/germany.osmwidx --green-only --major-roads
+./build/freestanding-linux-x86_64/osmindex --progress data/brandenburg-260524.osm.pbf build/brandenburg.osmnidx build/brandenburg.osmwidx
+./build/freestanding-linux-x86_64/osmrelindex --progress data/brandenburg-260524.osm.pbf build/brandenburg.osmridx
+./build/freestanding-linux-x86_64/osmspindex --progress build/brandenburg.osmnidx build/brandenburg.osmwidx build/brandenburg.osmspidx
+./build/freestanding-linux-x86_64/osmrender data/brandenburg-260524.osm.pbf build/potsdam-city.png --city Potsdam --width 1600 --height 1200 --style styles/osmrender-default.conf --node-index build/brandenburg.osmnidx --way-index build/brandenburg.osmwidx --relation-index build/brandenburg.osmridx --spatial-index build/brandenburg.osmspidx --green-only --major-roads
 ```
+
+The sparse `germany-potsdam-spatial*.png` benchmark images were produced with `--stop-after-drawn 200` and/or `--no-relation-scan`. Those flags are useful for timing parser/index changes, but they are not full green-map commands: `--stop-after-drawn` stops after a tiny sample, and `--no-relation-scan` skips many multipolygon green areas.
+
+Germany-wide indexes can now be built directly with the combined buffered indexer:
+
+```sh
+./build/freestanding-linux-x86_64/osmindex --progress data/germany-260524.osm.pbf build/germany.osmnidx build/germany.osmwidx
+```
+
+Measured on `data/germany-260524.osm.pbf`: 433,974,413 nodes, 70,233,055 ways, and 590,335,612 refs were indexed in 81.40 seconds. The outputs were 9.8 GB and 6.0 GB. Rendering a city directly from the full Germany PBF is still slower than rendering from a state extract because `osmrender` must stream the whole PBF and perform many on-disk node-index lookups; the next renderer-scale improvement is spatial way filtering or tiled indexes.
+
+Additional Germany indexes are now available for boundary lookup and spatial way filtering:
+
+```sh
+./build/freestanding-linux-x86_64/osmrelindex --progress data/germany-260524.osm.pbf build/germany.osmridx
+./build/freestanding-linux-x86_64/osmspindex --progress build/germany.osmnidx build/germany.osmwidx build/germany.osmspidx
+```
+
+Measured results: `osmrelindex` built `build/germany.osmridx` in 39.37 seconds, and `osmspindex` built `build/germany.osmspidx` in 193.96 seconds. With the drawn-way cap removed, a Germany/Potsdam render using `--no-relation-scan` drew 11,093 ways, but the richer Brandenburg/Potsdam render with relation scanning drew 11,568 ways and includes many more relation-based green shapes.
 
 Tree-point checkpoint:
 

@@ -62,6 +62,8 @@ typedef struct {
     OsmRenderNodeEntry *nodes;
     OsmNodeIndex node_index;
     OsmWayIndex way_index;
+    OsmRelationIndex relation_index;
+    OsmSpatialIndex spatial_index;
     OsmNodeIndexRecord *node_index_records;
     OsmRenderSegment *segments;
     OsmRenderPolygon *polygons;
@@ -96,8 +98,12 @@ typedef struct {
     unsigned int max_way_refs;
     long long relation_filter_id;
     long long boundary_relation_id;
+    long long city_relation_id;
     const char *node_index_path;
     const char *way_index_path;
+    const char *relation_index_path;
+    const char *spatial_index_path;
+    const char *city_name;
     const OsmRenderStyleSheet *style_sheet;
     unsigned int render_step;
     int node_points;
@@ -105,10 +111,17 @@ typedef struct {
     int green_only;
     int major_roads;
     int no_fills;
+    int no_relation_scan;
+    int bbox_enabled;
     int relation_filter_enabled;
     int boundary_relation_enabled;
+    int city_enabled;
+    int city_relation_found;
+    unsigned int city_relation_score;
     int node_index_open;
     int way_index_open;
+    int relation_index_open;
+    int spatial_index_open;
     int stopped_after_nodes;
     int stopped_after_trees;
     int stopped_after_ways;
@@ -137,6 +150,8 @@ typedef struct {
 #define OSM_RENDER_STYLE_LINE   (1U << 0)
 #define OSM_RENDER_STYLE_FILL   (1U << 1)
 #define OSM_RENDER_STYLE_CASING (1U << 2)
+
+#define OSM_RENDER_NODE_INDEX_LOAD_LIMIT 50000000ULL
 
 #define OSM_RENDER_STEP_AREA   0U
 #define OSM_RENDER_STEP_CASING 1U
@@ -168,7 +183,7 @@ struct OsmRenderStyleSheet {
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " FILE.osm.pbf OUT.bmp|OUT.png --bbox MINLON,MINLAT,MAXLON,MAXLAT [--width N] [--height N] [--style FILE] [--node-index FILE] [--way-index FILE] [--green-only] [--major-roads] [--no-fills] [--max-way-refs N] [--relation-id ID] [--boundary-relation-id ID] [--node-points] [--tree-points] [--stop-after-nodes N] [--stop-after-trees N] [--stop-after-ways N] [--stop-after-drawn N]\n");
+    rt_write_cstr(2, " FILE.osm.pbf OUT.bmp|OUT.png --bbox MINLON,MINLAT,MAXLON,MAXLAT [--city NAME] [--width N] [--height N] [--style FILE] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--spatial-index FILE] [--green-only] [--major-roads] [--no-fills] [--no-relation-scan] [--max-way-refs N] [--relation-id ID] [--boundary-relation-id ID] [--node-points] [--tree-points] [--stop-after-nodes N] [--stop-after-trees N] [--stop-after-ways N] [--stop-after-drawn N]\n");
 }
 
 static int parse_uint_arg(const char *text, unsigned int *value_out) {
@@ -259,7 +274,9 @@ static int parse_bbox_arg(const char *text, OsmRenderContext *context) {
         parse_coord_part(parts[3], sizes[3], &context->max_lat_nano) != 0) {
         return -1;
     }
-    return context->min_lon_nano < context->max_lon_nano && context->min_lat_nano < context->max_lat_nano ? 0 : -1;
+    if (context->min_lon_nano >= context->max_lon_nano || context->min_lat_nano >= context->max_lat_nano) return -1;
+    context->bbox_enabled = 1;
+    return 0;
 }
 
 static int text_equals(PbfText text, const char *value) {
@@ -432,6 +449,187 @@ static int style_id_is_render_context(const OsmRenderContext *context, OsmRender
     return context->major_roads && style_id_is_major_road_context(style_id);
 }
 
+static int relation_way_insert(OsmRenderContext *context, long long id, unsigned int style_id);
+static int resolve_node(OsmRenderContext *context, long long id, OsmRenderNodeEntry *node_out);
+
+static unsigned int parse_admin_level_value(const PbfText *value) {
+    unsigned int level = 0U;
+    size_t index;
+
+    if (value == 0 || value->size == 0U) return 0U;
+    for (index = 0U; index < value->size; ++index) {
+        if (value->data[index] < '0' || value->data[index] > '9') return 0U;
+        level = level * 10U + (unsigned int)(value->data[index] - '0');
+        if (level > 20U) return 0U;
+    }
+    return level;
+}
+
+static unsigned int city_admin_level_score(unsigned int level) {
+    if (level == 6U) return 100U;
+    if (level == 8U) return 90U;
+    if (level == 4U) return 80U;
+    if (level == 5U || level == 7U) return 60U;
+    if (level == 9U || level == 10U) return 20U;
+    return 0U;
+}
+
+static int city_relation_tags_match(const OsmRenderContext *context, const PbfTag *tags, unsigned int tag_count, unsigned int *score_out) {
+    const PbfText *name = find_tag_value_in_tags(tags, tag_count, "name");
+    const PbfText *boundary = find_tag_value_in_tags(tags, tag_count, "boundary");
+    const PbfText *type = find_tag_value_in_tags(tags, tag_count, "type");
+    unsigned int admin_level = parse_admin_level_value(find_tag_value_in_tags(tags, tag_count, "admin_level"));
+    unsigned int score = city_admin_level_score(admin_level);
+
+    if (context->city_name == 0 || !tag_value_equals(name, context->city_name)) return 0;
+    if (!tag_value_equals(boundary, "administrative")) return 0;
+    if (type != 0 && !tag_value_equals(type, "boundary") && !tag_value_equals(type, "multipolygon")) return 0;
+    if (score == 0U) return 0;
+    *score_out = score;
+    return 1;
+}
+
+static int on_city_relation_tags(void *user, long long id, const PbfTag *tags, unsigned int tag_count) {
+    OsmRenderContext *context = (OsmRenderContext *)user;
+    unsigned int score;
+
+    (void)id;
+    return city_relation_tags_match(context, tags, tag_count, &score);
+}
+
+static int on_city_relation(void *user, const PbfRelation *relation) {
+    OsmRenderContext *context = (OsmRenderContext *)user;
+    unsigned int score;
+    unsigned int way_member_count = 0U;
+    unsigned int index;
+
+    if (!city_relation_tags_match(context, relation->tags, relation->tag_count, &score)) return 0;
+    for (index = 0U; index < relation->member_count; ++index) {
+        if (relation->members[index].type == PBF_RELATION_MEMBER_WAY) way_member_count += 1U;
+    }
+    score = score * 1000U + (way_member_count > 999U ? 999U : way_member_count);
+    if (!context->city_relation_found || score > context->city_relation_score) {
+        context->city_relation_found = 1;
+        context->city_relation_score = score;
+        context->city_relation_id = relation->id;
+    }
+    return 0;
+}
+
+static int on_city_boundary_tags(void *user, long long id, const PbfTag *tags, unsigned int tag_count) {
+    OsmRenderContext *context = (OsmRenderContext *)user;
+
+    (void)tags;
+    (void)tag_count;
+    return context->boundary_relation_enabled && id == context->boundary_relation_id;
+}
+
+static int on_city_boundary_relation(void *user, const PbfRelation *relation) {
+    OsmRenderContext *context = (OsmRenderContext *)user;
+    unsigned int index;
+
+    if (!context->boundary_relation_enabled || relation->id != context->boundary_relation_id) return 0;
+    for (index = 0U; index < relation->member_count; ++index) {
+        const PbfRelationMember *member = &relation->members[index];
+        if (member->type == PBF_RELATION_MEMBER_WAY) {
+            if (relation_way_insert(context, member->id, (unsigned int)OSM_RENDER_STYLE_BOUNDARY) != 0) {
+                context->failed = 1;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int compute_boundary_bbox(OsmRenderContext *context) {
+    long long min_lon = 9223372036854775807LL;
+    long long min_lat = 9223372036854775807LL;
+    long long max_lon = -9223372036854775807LL;
+    long long max_lat = -9223372036854775807LL;
+    unsigned long long nodes_resolved = 0ULL;
+    unsigned int index;
+
+    for (index = 0U; index < context->relation_way_count; ++index) {
+        OsmWayIndexRecord record;
+        long long *refs = 0;
+        unsigned int ref_index;
+        char error[OSM_INDEX_ERROR_CAPACITY];
+        int found;
+
+        error[0] = '\0';
+        found = osm_way_index_find(&context->way_index, context->relation_way_order[index].id, &record, error, sizeof(error));
+        if (found < 0) return -1;
+        if (found == 0) continue;
+        if (osm_way_index_read_refs(&context->way_index, &record, &refs, error, sizeof(error)) != 0) return -1;
+        for (ref_index = 0U; ref_index < record.ref_count; ++ref_index) {
+            OsmRenderNodeEntry node;
+
+            if (!resolve_node(context, refs[ref_index], &node)) continue;
+            if (node.lon_nano < min_lon) min_lon = node.lon_nano;
+            if (node.lon_nano > max_lon) max_lon = node.lon_nano;
+            if (node.lat_nano < min_lat) min_lat = node.lat_nano;
+            if (node.lat_nano > max_lat) max_lat = node.lat_nano;
+            nodes_resolved += 1ULL;
+        }
+        rt_free(refs);
+    }
+    if (nodes_resolved == 0ULL || min_lon >= max_lon || min_lat >= max_lat) return -1;
+    {
+        long long lon_padding = (max_lon - min_lon) / 10LL;
+        long long lat_padding = (max_lat - min_lat) / 10LL;
+        if (lon_padding < 5000000LL) lon_padding = 5000000LL;
+        if (lat_padding < 5000000LL) lat_padding = 5000000LL;
+        context->min_lon_nano = min_lon - lon_padding;
+        context->max_lon_nano = max_lon + lon_padding;
+        context->min_lat_nano = min_lat - lat_padding;
+        context->max_lat_nano = max_lat + lat_padding;
+        context->bbox_enabled = 1;
+    }
+    return 0;
+}
+
+static int resolve_city_boundary(const char *pbf_path, OsmRenderContext *context, char *error, size_t error_capacity) {
+    PbfStreamCallbacks callbacks;
+    unsigned int index;
+
+    if (context->relation_index_open) {
+        OsmRelationIndexRecord record;
+
+        if (!osm_relation_index_find_city(&context->relation_index, context->city_name, &record)) return -1;
+        context->city_relation_found = 1;
+        context->city_relation_id = record.id;
+        context->city_relation_score = record.score;
+        context->boundary_relation_id = record.id;
+        context->boundary_relation_enabled = 1;
+        for (index = 0U; index < record.member_count; ++index) {
+            unsigned long long member_index = record.member_offset + (unsigned long long)index;
+            if (member_index >= context->relation_index.member_count) return -1;
+            if (relation_way_insert(context, context->relation_index.members[member_index], (unsigned int)OSM_RENDER_STYLE_BOUNDARY) != 0) {
+                context->failed = 1;
+                return -1;
+            }
+        }
+        if (context->bbox_enabled) return 0;
+        return compute_boundary_bbox(context);
+    }
+
+    rt_memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS;
+    callbacks.relation_tags = on_city_relation_tags;
+    callbacks.relation = on_city_relation;
+    if (pbf_stream_entities(pbf_path, &callbacks, context, error, error_capacity) != 0 || context->failed) return -1;
+    if (!context->city_relation_found) return -1;
+    context->boundary_relation_id = context->city_relation_id;
+    context->boundary_relation_enabled = 1;
+    if (context->bbox_enabled) return 0;
+    rt_memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS;
+    callbacks.relation_tags = on_city_boundary_tags;
+    callbacks.relation = on_city_boundary_relation;
+    if (pbf_stream_entities(pbf_path, &callbacks, context, error, error_capacity) != 0 || context->failed) return -1;
+    return compute_boundary_bbox(context);
+}
+
 static int node_in_bbox(const OsmRenderContext *context, long long lat_nano, long long lon_nano) {
     return lon_nano >= context->min_lon_nano && lon_nano <= context->max_lon_nano &&
            lat_nano >= context->min_lat_nano && lat_nano <= context->max_lat_nano;
@@ -591,6 +789,7 @@ static int relation_way_find(const OsmRenderContext *context, long long id, unsi
 }
 
 static int resolve_node(OsmRenderContext *context, long long id, OsmRenderNodeEntry *node_out) {
+    if (node_map_find(context, id, node_out)) return 1;
     if (context->node_index_records != 0) {
         unsigned long long left = 0ULL;
         unsigned long long right = context->node_index_record_count;
@@ -628,7 +827,7 @@ static int resolve_node(OsmRenderContext *context, long long id, OsmRenderNodeEn
         node_out->used = 1;
         return 1;
     }
-    return node_map_find(context, id, node_out);
+    return 0;
 }
 
 static int project_point_ll(const OsmRenderContext *context, const OsmRenderNodeEntry *node, long long *x_out, long long *y_out);
@@ -1236,11 +1435,19 @@ static int on_way_tags(void *user, long long id, const PbfTag *tags, unsigned in
     way.id = id;
     way.tags = tags;
     way.tag_count = tag_count;
+    if (context->spatial_index_open && !osm_spatial_index_way_intersects(&context->spatial_index, id, context->min_lon_nano, context->min_lat_nano, context->max_lon_nano, context->max_lat_nano)) return 0;
     if (context->relation_filter_enabled) return relation_way_find(context, id, &style_id);
     if (relation_way_find(context, id, &style_id)) return 1;
     if (!classify_way(context->style_sheet, &way, &style, &style_id)) return 0;
     if (context->green_only && !style_id_is_render_context(context, style_id)) return 0;
     return (style.flags & (OSM_RENDER_STYLE_FILL | OSM_RENDER_STYLE_LINE | OSM_RENDER_STYLE_CASING)) != 0U;
+}
+
+static int on_way_id(void *user, long long id) {
+    OsmRenderContext *context = (OsmRenderContext *)user;
+
+    if (!context->spatial_index_open) return 1;
+    return osm_spatial_index_way_intersects(&context->spatial_index, id, context->min_lon_nano, context->min_lat_nano, context->max_lon_nano, context->max_lat_nano);
 }
 
 static int on_relation_tags(void *user, long long id, const PbfTag *tags, unsigned int tag_count) {
@@ -1859,6 +2066,14 @@ static void cleanup_context(OsmRenderContext *context) {
         osm_way_index_close(&context->way_index);
         context->way_index_open = 0;
     }
+    if (context->relation_index_open) {
+        osm_relation_index_close(&context->relation_index);
+        context->relation_index_open = 0;
+    }
+    if (context->spatial_index_open) {
+        osm_spatial_index_close(&context->spatial_index);
+        context->spatial_index_open = 0;
+    }
     rt_free(context->nodes);
     rt_free(context->node_index_records);
     rt_free(context->segments);
@@ -1905,6 +2120,15 @@ int main(int argc, char **argv) {
                 return 1;
             }
             argi += 1;
+        } else if (rt_strcmp(argv[argi], "--city") == 0) {
+            argi += 1;
+            if (argi >= argc || argv[argi][0] == '\0') {
+                write_usage(program);
+                return 1;
+            }
+            context.city_name = argv[argi];
+            context.city_enabled = 1;
+            argi += 1;
         } else if (rt_strcmp(argv[argi], "--width") == 0) {
             argi += 1;
             if (argi >= argc || parse_uint_arg(argv[argi], &context.width) != 0) {
@@ -1943,6 +2167,22 @@ int main(int argc, char **argv) {
             }
             context.way_index_path = argv[argi];
             argi += 1;
+        } else if (rt_strcmp(argv[argi], "--relation-index") == 0) {
+            argi += 1;
+            if (argi >= argc) {
+                write_usage(program);
+                return 1;
+            }
+            context.relation_index_path = argv[argi];
+            argi += 1;
+        } else if (rt_strcmp(argv[argi], "--spatial-index") == 0) {
+            argi += 1;
+            if (argi >= argc) {
+                write_usage(program);
+                return 1;
+            }
+            context.spatial_index_path = argv[argi];
+            argi += 1;
         } else if (rt_strcmp(argv[argi], "--node-points") == 0) {
             context.node_points = 1;
             argi += 1;
@@ -1957,6 +2197,9 @@ int main(int argc, char **argv) {
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--no-fills") == 0) {
             context.no_fills = 1;
+            argi += 1;
+        } else if (rt_strcmp(argv[argi], "--no-relation-scan") == 0) {
+            context.no_relation_scan = 1;
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--max-way-refs") == 0) {
             argi += 1;
@@ -2018,8 +2261,12 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    if (context.min_lon_nano == 0 && context.max_lon_nano == 0 && context.min_lat_nano == 0 && context.max_lat_nano == 0) {
+    if (!context.bbox_enabled && !context.city_enabled) {
         write_usage(program);
+        return 1;
+    }
+    if (context.city_enabled && (context.node_index_path == 0 || context.way_index_path == 0)) {
+        rt_write_cstr(2, "osmrender: --city requires --node-index and --way-index\n");
         return 1;
     }
     if (style_path != 0 && load_style_sheet(style_path, &style_sheet) != 0) {
@@ -2039,12 +2286,14 @@ int main(int argc, char **argv) {
             return 1;
         }
         context.node_index_open = 1;
-        if (osm_node_index_load_records(&context.node_index, &context.node_index_records, &context.node_index_record_count, index_error, sizeof(index_error)) != 0) {
-            rt_write_cstr(2, "osmrender: ");
-            rt_write_cstr(2, index_error[0] == '\0' ? "could not load node index" : index_error);
-            rt_write_char(2, '\n');
-            cleanup_context(&context);
-            return 1;
+        if (context.node_index.count <= OSM_RENDER_NODE_INDEX_LOAD_LIMIT) {
+            if (osm_node_index_load_records(&context.node_index, &context.node_index_records, &context.node_index_record_count, index_error, sizeof(index_error)) != 0) {
+                rt_write_cstr(2, "osmrender: ");
+                rt_write_cstr(2, index_error[0] == '\0' ? "could not load node index" : index_error);
+                rt_write_char(2, '\n');
+                cleanup_context(&context);
+                return 1;
+            }
         }
     }
     if (context.way_index_path != 0) {
@@ -2060,6 +2309,51 @@ int main(int argc, char **argv) {
         }
         context.way_index_open = 1;
     }
+    if (context.relation_index_path != 0) {
+        char index_error[OSM_INDEX_ERROR_CAPACITY];
+
+        index_error[0] = '\0';
+        if (osm_relation_index_open(&context.relation_index, context.relation_index_path, index_error, sizeof(index_error)) != 0) {
+            rt_write_cstr(2, "osmrender: ");
+            rt_write_cstr(2, index_error[0] == '\0' ? "could not open relation index" : index_error);
+            rt_write_char(2, '\n');
+            cleanup_context(&context);
+            return 1;
+        }
+        context.relation_index_open = 1;
+    }
+    if (context.spatial_index_path != 0) {
+        char index_error[OSM_INDEX_ERROR_CAPACITY];
+
+        index_error[0] = '\0';
+        if (osm_spatial_index_open(&context.spatial_index, context.spatial_index_path, index_error, sizeof(index_error)) != 0) {
+            rt_write_cstr(2, "osmrender: ");
+            rt_write_cstr(2, index_error[0] == '\0' ? "could not open spatial index" : index_error);
+            rt_write_char(2, '\n');
+            cleanup_context(&context);
+            return 1;
+        }
+        context.spatial_index_open = 1;
+    }
+    if (context.city_enabled) {
+        error[0] = '\0';
+        if (resolve_city_boundary(pbf_path, &context, error, sizeof(error)) != 0) {
+            rt_write_cstr(2, "osmrender: could not resolve city boundary: ");
+            rt_write_cstr(2, context.city_name);
+            if (error[0] != '\0') {
+                rt_write_cstr(2, ": ");
+                rt_write_cstr(2, error);
+            }
+            rt_write_char(2, '\n');
+            cleanup_context(&context);
+            return 1;
+        }
+    }
+    if (!context.bbox_enabled) {
+        rt_write_cstr(2, "osmrender: missing bbox\n");
+        cleanup_context(&context);
+        return 1;
+    }
     context.pixels = (unsigned char *)rt_malloc((size_t)context.width * (size_t)context.height * 3U);
     if (context.pixels == 0) {
         rt_write_cstr(2, "osmrender: out of memory\n");
@@ -2068,7 +2362,7 @@ int main(int argc, char **argv) {
     }
     fill_background(&context);
 
-    if (!context.node_index_open || context.tree_points) {
+    if (!context.node_index_open || context.tree_points || (context.node_index_open && context.node_index_records == 0 && !context.tree_points)) {
         rt_memset(&callbacks, 0, sizeof(callbacks));
         callbacks.flags = context.tree_points ? 0U : PBF_STREAM_SKIP_NODE_TAGS;
         callbacks.node = on_node;
@@ -2084,17 +2378,19 @@ int main(int argc, char **argv) {
         collect_loaded_index_nodes(&context);
     }
     if (!context.stopped_after_nodes && !context.stopped_after_trees && !context.stopped_after_ways && !context.stopped_after_drawn) {
-        rt_memset(&callbacks, 0, sizeof(callbacks));
-        callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS;
-        callbacks.relation_tags = on_relation_tags;
-        callbacks.relation = on_relation;
-        error[0] = '\0';
-        if (pbf_stream_entities(pbf_path, &callbacks, &context, error, sizeof(error)) != 0 || context.failed) {
-            rt_write_cstr(2, "osmrender: ");
-            rt_write_cstr(2, context.failed ? "out of memory while collecting relations" : (error[0] == '\0' ? "failed to collect relations" : error));
-            rt_write_char(2, '\n');
-            cleanup_context(&context);
-            return 1;
+        if (!context.no_relation_scan) {
+            rt_memset(&callbacks, 0, sizeof(callbacks));
+            callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS;
+            callbacks.relation_tags = on_relation_tags;
+            callbacks.relation = on_relation;
+            error[0] = '\0';
+            if (pbf_stream_entities(pbf_path, &callbacks, &context, error, sizeof(error)) != 0 || context.failed) {
+                rt_write_cstr(2, "osmrender: ");
+                rt_write_cstr(2, context.failed ? "out of memory while collecting relations" : (error[0] == '\0' ? "failed to collect relations" : error));
+                rt_write_char(2, '\n');
+                cleanup_context(&context);
+                return 1;
+            }
         }
         if (context.relation_filter_enabled && context.way_index_open) {
             if (render_indexed_relation_ways(&context) != 0 && context.failed) {
@@ -2106,6 +2402,7 @@ int main(int argc, char **argv) {
             rt_memset(&callbacks, 0, sizeof(callbacks));
             callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS;
             if (context.relation_filter_enabled) callbacks.flags |= PBF_STREAM_SKIP_WAY_TAGS;
+            callbacks.way_id = on_way_id;
             callbacks.way_tags = on_way_tags;
             callbacks.way = on_way;
             error[0] = '\0';
@@ -2187,6 +2484,9 @@ int main(int argc, char **argv) {
     rt_write_char(1, '\n');
     rt_write_cstr(1, "no_fills: ");
     rt_write_cstr(1, context.no_fills ? "yes" : "no");
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "relation_scan: ");
+    rt_write_cstr(1, context.no_relation_scan ? "no" : "yes");
     rt_write_char(1, '\n');
     cleanup_context(&context);
     return 0;

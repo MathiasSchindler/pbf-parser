@@ -4,13 +4,12 @@
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " [--progress] FILE.osm.pbf INDEX.osmwidx\n");
+    rt_write_cstr(2, " [--progress] NODE.osmnidx WAY.osmwidx SPATIAL.osmspidx\n");
 }
 
 int main(int argc, char **argv) {
-    const char *program = argc > 0 ? argv[0] : "osmwayindex";
+    const char *program = argc > 0 ? argv[0] : "osmspindex";
     unsigned long long way_count = 0ULL;
-    unsigned long long ref_count = 0ULL;
     unsigned int flags = 0U;
     int argi = 1;
     char error[OSM_INDEX_ERROR_CAPACITY];
@@ -23,22 +22,19 @@ int main(int argc, char **argv) {
         flags |= OSM_INDEX_BUILD_PROGRESS;
         argi += 1;
     }
-    if (argc - argi != 2) {
+    if (argc - argi != 3) {
         write_usage(program);
         return 1;
     }
     error[0] = '\0';
-    if (osm_way_index_build_ex(argv[argi], argv[argi + 1], &way_count, &ref_count, flags, error, sizeof(error)) != 0) {
-        rt_write_cstr(2, "osmwayindex: ");
-        rt_write_cstr(2, error[0] == '\0' ? "failed to build way index" : error);
+    if (osm_spatial_index_build(argv[argi], argv[argi + 1], argv[argi + 2], &way_count, flags, error, sizeof(error)) != 0) {
+        rt_write_cstr(2, "osmspindex: ");
+        rt_write_cstr(2, error[0] == '\0' ? "failed to build spatial index" : error);
         rt_write_char(2, '\n');
         return 1;
     }
-    rt_write_cstr(1, "ways_indexed: ");
+    rt_write_cstr(1, "spatial_ways_indexed: ");
     rt_write_uint(1, way_count);
-    rt_write_char(1, '\n');
-    rt_write_cstr(1, "refs_indexed: ");
-    rt_write_uint(1, ref_count);
     rt_write_char(1, '\n');
     return 0;
 }

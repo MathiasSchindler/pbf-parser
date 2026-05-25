@@ -99,3 +99,51 @@ way_index: yes
 ```
 
 This proves relation member geometry reaches the renderer without a linear way scan. It is still not full multipolygon assembly: closed member ways are filled individually and open member chains are drawn as outlines until relation ring stitching is implemented.
+
+## 4. City-Name Rendering
+
+`osmrender --city NAME` resolves an administrative boundary relation by exact `name`, computes a padded bbox from indexed boundary member ways, overlays that boundary, and renders the city. It requires both node and way indexes for the same extract.
+
+Potsdam can be rendered from the Brandenburg extract:
+
+```sh
+./build/freestanding-linux-x86_64/osmindex --progress data/brandenburg-260524.osm.pbf build/brandenburg.osmnidx build/brandenburg.osmwidx
+./build/freestanding-linux-x86_64/osmrelindex --progress data/brandenburg-260524.osm.pbf build/brandenburg.osmridx
+./build/freestanding-linux-x86_64/osmspindex --progress build/brandenburg.osmnidx build/brandenburg.osmwidx build/brandenburg.osmspidx
+./build/freestanding-linux-x86_64/osmrender data/brandenburg-260524.osm.pbf build/potsdam-city.png --city Potsdam --width 1600 --height 1200 --style styles/osmrender-default.conf --node-index build/brandenburg.osmnidx --way-index build/brandenburg.osmwidx --relation-index build/brandenburg.osmridx --spatial-index build/brandenburg.osmspidx --green-only --major-roads
+```
+
+Do not use `--stop-after-drawn` for final maps; it intentionally produces sparse smoke-test output. `--no-relation-scan` is also a benchmark shortcut: it keeps boundary lookup from the relation index, but it omits many green multipolygon relations, so parks, forests, woods, and water areas can be visibly incomplete.
+
+Observed Potsdam counters:
+
+```text
+nodes_in_bbox: 1033950
+ways_decoded: 468088
+ways_drawn: 11601
+segments_drawn: 165375
+relations_seen: 10083
+relation_members_collected: 45263
+relation_ways_matched: 43119
+polygons_collected: 265143
+visible_pixels: 1222807
+green_only: yes
+major_roads: yes
+```
+
+Germany-wide indexing is practical with the combined buffered builder:
+
+```sh
+./build/freestanding-linux-x86_64/osmindex --progress data/germany-260524.osm.pbf build/germany.osmnidx build/germany.osmwidx
+```
+
+Measured result: 433,974,413 nodes, 70,233,055 ways, and 590,335,612 refs in 81.40 seconds, producing a 9.8 GB node index and a 6.0 GB way index. Full-Germany city rendering is a separate bottleneck: `osmrender` still streams the complete PBF and falls back to on-disk node lookups for indexes this large, so state extracts remain better for interactive map iteration until spatial way filtering or tiled indexes are added.
+
+The first spatial way index can be built from the Germany node and way indexes:
+
+```sh
+./build/freestanding-linux-x86_64/osmrelindex --progress data/germany-260524.osm.pbf build/germany.osmridx
+./build/freestanding-linux-x86_64/osmspindex --progress build/germany.osmnidx build/germany.osmwidx build/germany.osmspidx
+```
+
+Measured on `data/germany-260524.osm.pbf`, `osmrelindex` indexed 32,045 administrative relations in 39.37 seconds and `osmspindex` indexed 70,233,055 way bboxes in 193.96 seconds, producing a 2.7 GB spatial index. A capped Potsdam smoke test with `--stop-after-drawn 200 --no-relation-scan` decodes only 200 ways by design; the uncapped Germany render without relation scanning drew 11,093 ways in 103.96 seconds, while the full Brandenburg render with relation scanning drew 11,568 ways in 6.70 seconds.

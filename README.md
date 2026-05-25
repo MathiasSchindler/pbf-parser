@@ -13,7 +13,10 @@ The repository currently provides:
 - `osmaddresses`, which extracts address tags into TSV rows containing state, city, suburb, street, house number, and postcode fields.
 - `osmnodeindex`, which builds a compact node coordinate index for way geometry lookup.
 - `osmwayindex`, which builds a compact way-reference index for targeted relation rendering.
-- `osmrender`, an experimental BMP/PNG renderer used to validate rendering paths and benchmark indexing needs.
+- `osmindex`, which builds node and way indexes together in one buffered pass through a PBF file.
+- `osmrelindex`, which builds a compact administrative relation index for fast city-boundary lookup.
+- `osmspindex`, which builds a way bounding-box index from node and way indexes for faster viewport filtering.
+- `osmrender`, an experimental BMP/PNG renderer with bbox, relation-boundary, city-name, green-area, and major-road rendering modes.
 - `threadtest`, a small validation tool for the Linux nolibc threading layer.
 
 The project is not intended to be a complete GIS engine. It is a compact parser and tool collection for exploring OSM PBF data with minimal runtime dependencies.
@@ -27,7 +30,7 @@ The code is split into platform, runtime, shared parser, and tool layers:
 - `src/shared/runtime` contains the small runtime functions used instead of libc.
 - `src/shared/compression` contains the local zlib/deflate implementation used for PBF blobs.
 - `src/shared/pbf.c` and `src/shared/pbf.h` contain the OSM PBF and protobuf streaming parser.
-- `src/shared/osm_index.c` and `src/shared/osm_index.h` contain the reusable node and way index formats and lookup code.
+- `src/shared/osm_index.c` and `src/shared/osm_index.h` contain the reusable node, way, relation, and spatial index formats and lookup code.
 - `src/tools` contains the command-line tools built on top of the shared layers.
 
 The parser reads PBF fileblocks, decodes `OSMHeader` and `OSMData` blobs, inflates zlib-compressed payloads, parses protobuf fields, and exposes decoded OSM entities through streaming callbacks. Consumers can skip node tags or prefilter way and relation tags when they only need coordinates, IDs, renderable ways, or tag-only records.

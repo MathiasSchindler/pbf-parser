@@ -151,7 +151,7 @@ maxrss_kb: 7168
 output: 14 MB
 ```
 
-## osmnodeindex
+## osmnodeindex and osmindex
 
 `osmnodeindex` builds a compact binary node coordinate index:
 
@@ -166,22 +166,29 @@ make all
 ./build/freestanding-linux-x86_64/osmnodeindex data/brandenburg-260524.osm.pbf build/brandenburg.osmnidx
 ```
 
+For rendering workflows, prefer the combined builder because it streams the PBF once and writes both node and way indexes with buffered output:
+
+```sh
+./build/freestanding-linux-x86_64/osmindex --progress data/brandenburg-260524.osm.pbf build/brandenburg.osmnidx build/brandenburg.osmwidx
+```
+
 The index format is intentionally simple:
 
 - 32-byte header with magic, version, record size, and record count.
 - 24-byte little-endian records: signed 64-bit node ID, latitude nanodegrees, longitude nanodegrees.
 - Records are expected to be sorted by node ID. The builder validates monotonic IDs while streaming.
 
-This keeps memory use low: the builder writes each node record as it streams through the PBF file and does not hold all nodes in memory.
+This keeps memory use low: the builders write buffered records as they stream through the PBF file and do not hold all nodes or ways in memory.
 
 Measured builds:
 
-| Input | Nodes | Elapsed | Max RSS | Output |
-| --- | ---: | ---: | ---: | ---: |
-| `data/brandenburg-260524.osm.pbf` | 26,778,793 | 1:36.72 | 10,112 KB | 613 MB |
-| `data/hamburg-260524.osm.pbf` | 3,968,966 | 0:13.84 | 6,272 KB | 91 MB |
+| Command | Input | Counts | Elapsed | Max RSS | Output |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `osmindex` | `data/hamburg-260524.osm.pbf` | 3,968,966 nodes; 693,074 ways; 5,003,670 refs | 0.83s | 9,024 KB | 91 MB + 55 MB |
+| `osmindex` | `data/brandenburg-260524.osm.pbf` | 26,778,793 nodes; 4,447,642 ways; 36,061,753 refs | 4.98s | 12,864 KB | 613 MB + 377 MB |
+| `osmindex` | `data/germany-260524.osm.pbf` | 433,974,413 nodes; 70,233,055 ways; 590,335,612 refs | 81.40s | 17,472 KB | 9.8 GB + 6.0 GB |
 
-The Brandenburg index was compared byte-for-byte against the earlier builder output after the dense-node fast path was added; the files were identical.
+The combined Hamburg and Brandenburg indexes were compared byte-for-byte against separate `osmnodeindex` and `osmwayindex` builds; the files were identical.
 
 ## Validation
 

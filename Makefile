@@ -46,6 +46,30 @@ OSMWAYINDEX_SRCS := \
     src/shared/pbf.c \
     src/tools/osmwayindex.c
 
+OSMINDEX_SRCS := \
+    $(RUNTIME_SRCS) \
+    src/platform/linux/fs.c \
+    src/shared/compression/zlib.c \
+    src/shared/osm_index.c \
+    src/shared/pbf.c \
+    src/tools/osmindex.c
+
+OSMRELINDEX_SRCS := \
+    $(RUNTIME_SRCS) \
+    src/platform/linux/fs.c \
+    src/shared/compression/zlib.c \
+    src/shared/osm_index.c \
+    src/shared/pbf.c \
+    src/tools/osmrelindex.c
+
+OSMSPINDEX_SRCS := \
+    $(RUNTIME_SRCS) \
+    src/platform/linux/fs.c \
+    src/shared/compression/zlib.c \
+    src/shared/osm_index.c \
+    src/shared/pbf.c \
+    src/tools/osmspindex.c
+
 OSMADDRESSES_SRCS := \
     $(RUNTIME_SRCS) \
     src/shared/compression/zlib.c \
@@ -69,7 +93,7 @@ THREADTEST_SRCS := \
 
 .PHONY: all clean threadtest
 
-all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmwayindex $(BUILD_DIR)/osmaddresses $(BUILD_DIR)/osmrender $(BUILD_DIR)/threadtest
+all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmwayindex $(BUILD_DIR)/osmindex $(BUILD_DIR)/osmrelindex $(BUILD_DIR)/osmspindex $(BUILD_DIR)/osmaddresses $(BUILD_DIR)/osmrender $(BUILD_DIR)/threadtest
 
 threadtest: $(BUILD_DIR)/threadtest
 
@@ -87,6 +111,15 @@ $(BUILD_DIR)/osmnodeindex: $(OSMNODEINDEX_SRCS) | $(BUILD_DIR)
 
 $(BUILD_DIR)/osmwayindex: $(OSMWAYINDEX_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMWAYINDEX_SRCS) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/osmindex: $(OSMINDEX_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(OSMINDEX_SRCS) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/osmrelindex: $(OSMRELINDEX_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(OSMRELINDEX_SRCS) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/osmspindex: $(OSMSPINDEX_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(OSMSPINDEX_SRCS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/osmaddresses: $(OSMADDRESSES_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMADDRESSES_SRCS) $(LDFLAGS) -o $@

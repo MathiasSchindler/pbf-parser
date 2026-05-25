@@ -82,6 +82,7 @@ typedef struct {
 typedef struct {
     unsigned int flags;
     int (*node)(void *user, const PbfNode *node);
+    int (*way_id)(void *user, long long id);
     int (*way_tags)(void *user, long long id, const PbfTag *tags, unsigned int tag_count);
     int (*way)(void *user, const PbfWay *way);
     int (*relation_tags)(void *user, long long id, const PbfTag *tags, unsigned int tag_count);

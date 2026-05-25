@@ -866,6 +866,7 @@ static int pbf_stream_way_payload(const unsigned char *data, size_t size, PbfStr
     unsigned int index;
     long long ref = 0;
     int tags_ready = 0;
+    int id_ready = 0;
     int want_way = 1;
     int skip_way_tags = context->callbacks != 0 && (context->callbacks->flags & PBF_STREAM_SKIP_WAY_TAGS) != 0U;
 
@@ -887,21 +888,25 @@ static int pbf_stream_way_payload(const unsigned char *data, size_t size, PbfStr
         if (field == 1U && wire_type == 0U) {
             if (pbf_read_varint(&reader, &value) != 0) goto fail;
             way.id = (long long)value;
+            id_ready = 1;
+            if (context->callbacks != 0 && context->callbacks->way_id != 0 && context->callbacks->way_id(context->user, way.id) == 0) {
+                want_way = 0;
+            }
         } else if (field == 2U && wire_type == 2U) {
             const unsigned char *packed;
             size_t packed_size;
             if (pbf_read_length(&reader, &packed, &packed_size) != 0) goto fail;
-            if (!skip_way_tags && pbf_parse_packed_uints(packed, packed_size, &keys) != 0) goto fail;
+            if (want_way && !skip_way_tags && pbf_parse_packed_uints(packed, packed_size, &keys) != 0) goto fail;
         } else if (field == 3U && wire_type == 2U) {
             const unsigned char *packed;
             size_t packed_size;
             if (pbf_read_length(&reader, &packed, &packed_size) != 0) goto fail;
-            if (!skip_way_tags && pbf_parse_packed_uints(packed, packed_size, &values) != 0) goto fail;
+            if (want_way && !skip_way_tags && pbf_parse_packed_uints(packed, packed_size, &values) != 0) goto fail;
         } else if (field == 8U && wire_type == 2U) {
             const unsigned char *packed;
             size_t packed_size;
             if (pbf_read_length(&reader, &packed, &packed_size) != 0) goto fail;
-            if (!tags_ready) {
+            if (want_way && !tags_ready) {
                 if (!skip_way_tags && pbf_build_tags(&context->string_table, &keys, &values, &tags) != 0) goto fail;
                 tags_ready = 1;
                 if (context->callbacks != 0 && context->callbacks->way_tags != 0 &&
@@ -914,7 +919,10 @@ static int pbf_stream_way_payload(const unsigned char *data, size_t size, PbfStr
             goto fail;
         }
     }
-    if (!tags_ready) {
+    if (!id_ready && context->callbacks != 0 && context->callbacks->way_id != 0 && context->callbacks->way_id(context->user, way.id) == 0) {
+        want_way = 0;
+    }
+    if (want_way && !tags_ready) {
         if (!skip_way_tags && pbf_build_tags(&context->string_table, &keys, &values, &tags) != 0) goto fail;
         tags_ready = 1;
         if (context->callbacks != 0 && context->callbacks->way_tags != 0 &&
