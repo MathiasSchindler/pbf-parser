@@ -12,6 +12,7 @@ RUNTIME_SRCS := \
     src/platform/linux/io.c \
     src/shared/runtime/io.c \
     src/shared/runtime/memory.c \
+    src/shared/runtime/parse.c \
     src/shared/runtime/string.c
 
 PBFINFO_SRCS := \
@@ -46,6 +47,7 @@ OSMRENDER_SRCS := \
     src/shared/compression/zlib.c \
     src/shared/osm_index.c \
     src/shared/pbf.c \
+    src/shared/simple_config.c \
     src/tools/osmrender.c
 
 THREADTEST_SRCS := \

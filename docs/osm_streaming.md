@@ -215,10 +215,10 @@ relations: 59572
 
 ## Rendering Path
 
-`osmrender` is an experimental bitmap renderer that writes 24-bit BMP output:
+`osmrender` is an experimental bitmap renderer that writes dependency-free 24-bit BMP output:
 
 ```sh
-./build/freestanding-linux-x86_64/osmrender data/hamburg-260524.osm.pbf build/hamburg.bmp --bbox 9.70,53.30,10.40,53.80 --width 1024 --height 768
+./build/freestanding-linux-x86_64/osmrender data/hamburg-260524.osm.pbf build/hamburg.bmp --bbox 9.70,53.30,10.40,53.80 --width 1024 --height 768 --style styles/osmrender-default.conf
 ```
 
 Options:
@@ -226,9 +226,39 @@ Options:
 - `--bbox MINLON,MINLAT,MAXLON,MAXLAT`
 - `--width N`
 - `--height N`
+- `--style FILE`, load a simple `key=value` render style file
 - `--node-points`, draw collected bbox nodes as pixels
 - `--stop-after-nodes N`, bounded smoke mode for node drawing
 - `--stop-after-drawn N`, bounded smoke mode for way drawing
+
+The renderer now applies a small built-in cartographic style set while staying inside the freestanding C runtime:
+
+- water, parks/green areas, forests, and buildings can be filled when they are closed ways
+- roads are classified into major, medium, minor, and path styles
+- roads and rails use soft casings, alpha blending, and round brushes instead of raw overwrite pixels
+- rendering runs in two passes: closed areas are filled first, then roads, waterways, paths, and rails are stroked above them
+- output remains plain 24-bit BMP; no font, image, graphics, or libc dependency is introduced
+
+Style files use decimal color channels so they can be parsed without libc or a JSON parser:
+
+```text
+background = 242,239,232
+water.fill = 154,196,214,230
+water.line = 94,151,183,255
+water.width = 2
+primary.casing = 202,145,98,220
+primary.casing_width = 6
+primary.line = 246,194,118,255
+primary.width = 4
+```
+
+Colors are `R,G,B` or `R,G,B,A`. Supported style groups are `water`, `waterway`, `forest`, `park`, `building`, `motorway`, `primary`, `secondary`, `minor_road`, `path`, and `rail`; supported properties are `fill`, `line`, `casing`, `width`, and `casing_width`.
+
+The first city-scale target is Hamburg:
+
+```sh
+./build/freestanding-linux-x86_64/osmrender data/hamburg-260524.osm.pbf build/hamburg-city.bmp --bbox 9.70,53.30,10.40,53.80 --width 1600 --height 1100 --style styles/osmrender-default.conf
+```
 
 Validated smoke runs:
 
@@ -236,14 +266,16 @@ Validated smoke runs:
 | --- | --- | ---: | ---: | --- |
 | Hamburg bbox, `--node-points --stop-after-nodes 5000` | `nodes_in_bbox=5000`, `bounded=yes` | 0:00.01 | 3,712 KB | valid 1024x768x24 BMP |
 | Hamburg bbox, `--stop-after-drawn 1` | `nodes_in_bbox=3952481`, `ways_drawn=1`, `segments_drawn=2`, `bounded=yes` | 0:01.60 | 526,976 KB | valid 1024x768x24 BMP |
+| Hamburg bbox, `--style styles/osmrender-default.conf --node-points --stop-after-nodes 5000` | `nodes_in_bbox=5000`, `bounded=yes` | smoke | smoke | valid 512x384x24 BMP, 3,037 non-background pixels |
 
 Negative render experiments are also important:
 
 - Random node-index lookup per way ref was too slow for rendering.
 - Narrow-bbox full way rendering did not produce a BMP before being terminated.
 - A 50-way bounded Hamburg render did not finish in the interactive benchmark window.
+- Styled linework over the full Hamburg bbox is still too slow for an interactive smoke check because it scans the PBF for node collection and then scans again for layered strokes.
 
-The current one-pass renderer depends on `Sort.Type_then_ID`: it collects bbox nodes first, then draws ways whose refs are already known. This can validate output and simple cases, but it is not the final map-rendering architecture. Full practical rendering needs a spatial or fileblock-level index so the tool can avoid scanning and retaining nearly all nodes for a small viewport.
+The current renderer depends on `Sort.Type_then_ID`: it collects bbox nodes first, then draws ways whose refs are already known. It now streams the file a second time for linework so areas do not cover roads and rails. This can validate output and simple city-scale cases, but it is not the final map-rendering architecture. Full practical rendering needs a spatial or fileblock-level index so the tool can avoid scanning and retaining nearly all nodes for a small viewport.
 
 Bitmap or vector map rendering should continue to build on this stream API, but it should not try to load the full PBF into memory. Ways usually contain only node IDs, so geometry rendering needs node coordinates.
 
