@@ -68,6 +68,28 @@ typedef struct {
 } BoundaryEndpoint;
 
 typedef struct {
+    long long min_lon_nano;
+    long long min_lat_nano;
+    long long max_lon_nano;
+    long long max_lat_nano;
+    unsigned int point_count;
+    unsigned int feature_count;
+} BoundaryComponent;
+
+typedef struct {
+    long long start_lon_nano;
+    long long start_lat_nano;
+    long long end_lon_nano;
+    long long end_lat_nano;
+    long long min_lon_nano;
+    long long min_lat_nano;
+    long long max_lon_nano;
+    long long max_lat_nano;
+    unsigned int point_count;
+    unsigned int parent;
+} BoundaryWayInfo;
+
+typedef struct {
     unsigned int count;
     unsigned int colors[256];
     short table[1024];
@@ -102,10 +124,17 @@ typedef struct {
     unsigned long long v2_boundary_payload_offset;
     unsigned long long v2_boundary_payload_size;
     unsigned int v2_boundary_feature_count;
+    long long exclave_min_lon_nano;
+    long long exclave_min_lat_nano;
+    long long exclave_max_lon_nano;
+    long long exclave_max_lat_nano;
     unsigned int boundary_feature_count;
+    unsigned int exclave_component_count;
     int city_enabled;
     int boundary_fade;
     int boundary_fade_applied;
+    int exclave_insets;
+    int have_exclave_bbox;
     int png_palette;
     unsigned long long features_seen;
     unsigned long long features_skipped;
@@ -221,7 +250,7 @@ static const RenderLayer render_layers[] = {
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " PACK.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]\n");
+    rt_write_cstr(2, " PACK.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--exclave-insets] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]\n");
 }
 
 static void write_profile_ms(const char *label, unsigned long long elapsed_ms) {
@@ -1018,6 +1047,270 @@ static int apply_v2_place_bbox(int fd, const OsmrPackV2Header *header, RenderCon
     return 0;
 }
 
+static void bbox_add_point(long long lon, long long lat, long long *min_lon, long long *min_lat, long long *max_lon, long long *max_lat) {
+    if (lon < *min_lon) *min_lon = lon;
+    if (lon > *max_lon) *max_lon = lon;
+    if (lat < *min_lat) *min_lat = lat;
+    if (lat > *max_lat) *max_lat = lat;
+}
+
+static void bbox_union_values(long long min_lon, long long min_lat, long long max_lon, long long max_lat,
+                              long long *bbox_min_lon, long long *bbox_min_lat, long long *bbox_max_lon, long long *bbox_max_lat) {
+    if (min_lon < *bbox_min_lon) *bbox_min_lon = min_lon;
+    if (max_lon > *bbox_max_lon) *bbox_max_lon = max_lon;
+    if (min_lat < *bbox_min_lat) *bbox_min_lat = min_lat;
+    if (max_lat > *bbox_max_lat) *bbox_max_lat = max_lat;
+}
+
+static void apply_bbox_padding(RenderContext *context, long long min_lon, long long min_lat, long long max_lon, long long max_lat) {
+    long long lon_padding = (max_lon - min_lon) / 10LL;
+    long long lat_padding = (max_lat - min_lat) / 10LL;
+
+    if (lon_padding < 5000000LL) lon_padding = 5000000LL;
+    if (lat_padding < 5000000LL) lat_padding = 5000000LL;
+    context->min_lon_nano = min_lon - lon_padding;
+    context->max_lon_nano = max_lon + lon_padding;
+    context->min_lat_nano = min_lat - lat_padding;
+    context->max_lat_nano = max_lat + lat_padding;
+}
+
+static unsigned int boundary_find_parent(BoundaryWayInfo *ways, unsigned int index) {
+    unsigned int parent = ways[index].parent;
+
+    while (ways[parent].parent != parent) parent = ways[parent].parent;
+    while (ways[index].parent != index) {
+        unsigned int next = ways[index].parent;
+        ways[index].parent = parent;
+        index = next;
+    }
+    return parent;
+}
+
+static void boundary_union_parent(BoundaryWayInfo *ways, unsigned int left, unsigned int right) {
+    unsigned int left_parent = boundary_find_parent(ways, left);
+    unsigned int right_parent = boundary_find_parent(ways, right);
+
+    if (left_parent != right_parent) ways[right_parent].parent = left_parent;
+}
+
+static int boundary_points_equal(long long lon_a, long long lat_a, long long lon_b, long long lat_b) {
+    return lon_a == lon_b && lat_a == lat_b;
+}
+
+static int boundary_ways_touch(const BoundaryWayInfo *left, const BoundaryWayInfo *right) {
+    if (boundary_points_equal(left->start_lon_nano, left->start_lat_nano, right->start_lon_nano, right->start_lat_nano)) return 1;
+    if (boundary_points_equal(left->start_lon_nano, left->start_lat_nano, right->end_lon_nano, right->end_lat_nano)) return 1;
+    if (boundary_points_equal(left->end_lon_nano, left->end_lat_nano, right->start_lon_nano, right->start_lat_nano)) return 1;
+    if (boundary_points_equal(left->end_lon_nano, left->end_lat_nano, right->end_lon_nano, right->end_lat_nano)) return 1;
+    return 0;
+}
+
+static unsigned long long bbox_area_score(long long min_lon, long long min_lat, long long max_lon, long long max_lat) {
+    unsigned long long lon_span;
+    unsigned long long lat_span;
+
+    if (max_lon <= min_lon || max_lat <= min_lat) return 1ULL;
+    lon_span = (unsigned long long)(max_lon - min_lon) / 1000ULL + 1ULL;
+    lat_span = (unsigned long long)(max_lat - min_lat) / 1000ULL + 1ULL;
+    if (lon_span > 0xffffffffULL) lon_span = 0xffffffffULL;
+    if (lat_span > 0xffffffffULL) lat_span = 0xffffffffULL;
+    return lon_span * lat_span;
+}
+
+static long long bbox_gap_1d(long long min_a, long long max_a, long long min_b, long long max_b) {
+    if (max_a < min_b) return min_b - max_a;
+    if (max_b < min_a) return min_a - max_b;
+    return 0LL;
+}
+
+static int boundary_component_is_far(const BoundaryComponent *primary, const BoundaryComponent *component) {
+    long long primary_lon_span = primary->max_lon_nano - primary->min_lon_nano;
+    long long primary_lat_span = primary->max_lat_nano - primary->min_lat_nano;
+    long long lon_gap = bbox_gap_1d(primary->min_lon_nano, primary->max_lon_nano, component->min_lon_nano, component->max_lon_nano);
+    long long lat_gap = bbox_gap_1d(primary->min_lat_nano, primary->max_lat_nano, component->min_lat_nano, component->max_lat_nano);
+    long long union_min_lon = primary->min_lon_nano;
+    long long union_min_lat = primary->min_lat_nano;
+    long long union_max_lon = primary->max_lon_nano;
+    long long union_max_lat = primary->max_lat_nano;
+    unsigned long long primary_area = bbox_area_score(primary->min_lon_nano, primary->min_lat_nano, primary->max_lon_nano, primary->max_lat_nano);
+    unsigned long long union_area;
+
+    if (lon_gap == 0LL && lat_gap == 0LL) return 0;
+    if ((unsigned long long)component->point_count * 2ULL >= (unsigned long long)primary->point_count) return 0;
+    bbox_union_values(component->min_lon_nano, component->min_lat_nano, component->max_lon_nano, component->max_lat_nano,
+                      &union_min_lon, &union_min_lat, &union_max_lon, &union_max_lat);
+    union_area = bbox_area_score(union_min_lon, union_min_lat, union_max_lon, union_max_lat);
+    if (union_area <= primary_area * 2ULL) return 0;
+    if (lon_gap > 100000000LL || lat_gap > 100000000LL) return 1;
+    if (primary_lon_span > 0LL && lon_gap > primary_lon_span / 3LL) return 1;
+    if (primary_lat_span > 0LL && lat_gap > primary_lat_span / 3LL) return 1;
+    return 0;
+}
+
+static int read_v2_boundary_way_infos(RenderContext *context, int fd, BoundaryWayInfo **ways_out, unsigned int *way_count_out) {
+    unsigned char count_data[8];
+    unsigned long long feature_count;
+    unsigned int feature_index;
+    BoundaryWayInfo *ways;
+
+    *ways_out = 0;
+    *way_count_out = 0U;
+    if (context->v2_boundary_payload_offset == 0ULL || context->v2_boundary_payload_size < 8ULL || context->v2_boundary_feature_count < 2U) return 0;
+    if (context->v2_boundary_feature_count > 8192U) return 0;
+    if (platform_seek(fd, (long long)context->v2_boundary_payload_offset, PLATFORM_SEEK_SET) < 0) return -1;
+    if (read_exact(fd, count_data, sizeof(count_data)) != 0) return -1;
+    feature_count = read_u64_le(count_data);
+    if (feature_count != (unsigned long long)context->v2_boundary_feature_count || feature_count > 8192ULL) return -1;
+    ways = (BoundaryWayInfo *)rt_malloc(sizeof(*ways) * (size_t)feature_count);
+    if (ways == 0) return -1;
+    for (feature_index = 0U; feature_index < (unsigned int)feature_count; ++feature_index) {
+        PackFeatureHeader feature;
+        unsigned char data[16];
+        long long min_lon = 9223372036854775807LL;
+        long long min_lat = 9223372036854775807LL;
+        long long max_lon = -9223372036854775807LL;
+        long long max_lat = -9223372036854775807LL;
+        long long lon;
+        long long lat;
+
+        if (read_feature_header(fd, &feature) != 0) {
+            rt_free(ways);
+            return -1;
+        }
+        if (feature.style_id != PACK_STYLE_BOUNDARY || feature.flags != 0U || feature.point_count < 2U || feature.point_count > 10000000U) {
+            rt_free(ways);
+            return -1;
+        }
+        if (read_exact(fd, data, sizeof(data)) != 0) {
+            rt_free(ways);
+            return -1;
+        }
+        lon = read_i64_le(data + 0U);
+        lat = read_i64_le(data + 8U);
+        ways[feature_index].start_lon_nano = lon;
+        ways[feature_index].start_lat_nano = lat;
+        bbox_add_point(lon, lat, &min_lon, &min_lat, &max_lon, &max_lat);
+        if (feature.point_count > 2U && skip_points(fd, feature.point_count - 2U) != 0) {
+            rt_free(ways);
+            return -1;
+        }
+        if (read_exact(fd, data, sizeof(data)) != 0) {
+            rt_free(ways);
+            return -1;
+        }
+        lon = read_i64_le(data + 0U);
+        lat = read_i64_le(data + 8U);
+        ways[feature_index].end_lon_nano = lon;
+        ways[feature_index].end_lat_nano = lat;
+        bbox_add_point(lon, lat, &min_lon, &min_lat, &max_lon, &max_lat);
+        ways[feature_index].min_lon_nano = feature.min_lon_nano < min_lon ? feature.min_lon_nano : min_lon;
+        ways[feature_index].min_lat_nano = feature.min_lat_nano < min_lat ? feature.min_lat_nano : min_lat;
+        ways[feature_index].max_lon_nano = feature.max_lon_nano > max_lon ? feature.max_lon_nano : max_lon;
+        ways[feature_index].max_lat_nano = feature.max_lat_nano > max_lat ? feature.max_lat_nano : max_lat;
+        ways[feature_index].point_count = feature.point_count;
+        ways[feature_index].parent = feature_index;
+    }
+    *ways_out = ways;
+    *way_count_out = (unsigned int)feature_count;
+    return 1;
+}
+
+static int compute_v2_boundary_viewports(RenderContext *context, int fd) {
+    BoundaryWayInfo *ways = 0;
+    BoundaryComponent *components = 0;
+    unsigned int *root_to_component = 0;
+    unsigned int way_count = 0U;
+    unsigned int component_count = 0U;
+    unsigned int primary_index = 0U;
+    unsigned int way_index;
+    unsigned int component_index;
+    long long main_min_lon;
+    long long main_min_lat;
+    long long main_max_lon;
+    long long main_max_lat;
+    int read_result;
+    int result = -1;
+
+    read_result = read_v2_boundary_way_infos(context, fd, &ways, &way_count);
+    if (read_result <= 0) return read_result;
+    for (way_index = 0U; way_index < way_count; ++way_index) {
+        unsigned int other;
+        for (other = way_index + 1U; other < way_count; ++other) {
+            if (boundary_find_parent(ways, way_index) != boundary_find_parent(ways, other) && boundary_ways_touch(&ways[way_index], &ways[other])) boundary_union_parent(ways, way_index, other);
+        }
+    }
+    components = (BoundaryComponent *)rt_malloc(sizeof(*components) * (size_t)way_count);
+    root_to_component = (unsigned int *)rt_malloc(sizeof(*root_to_component) * (size_t)way_count);
+    if (components == 0 || root_to_component == 0) goto cleanup;
+    for (way_index = 0U; way_index < way_count; ++way_index) root_to_component[way_index] = 0xffffffffU;
+    for (way_index = 0U; way_index < way_count; ++way_index) {
+        unsigned int root = boundary_find_parent(ways, way_index);
+        unsigned int target = root_to_component[root];
+
+        if (target == 0xffffffffU) {
+            target = component_count++;
+            root_to_component[root] = target;
+            components[target].min_lon_nano = ways[way_index].min_lon_nano;
+            components[target].min_lat_nano = ways[way_index].min_lat_nano;
+            components[target].max_lon_nano = ways[way_index].max_lon_nano;
+            components[target].max_lat_nano = ways[way_index].max_lat_nano;
+            components[target].point_count = ways[way_index].point_count;
+            components[target].feature_count = 1U;
+        } else {
+            bbox_union_values(ways[way_index].min_lon_nano, ways[way_index].min_lat_nano, ways[way_index].max_lon_nano, ways[way_index].max_lat_nano,
+                              &components[target].min_lon_nano, &components[target].min_lat_nano, &components[target].max_lon_nano, &components[target].max_lat_nano);
+            components[target].point_count += ways[way_index].point_count;
+            components[target].feature_count += 1U;
+        }
+    }
+    if (component_count <= 1U) {
+        result = 0;
+        goto cleanup;
+    }
+    for (component_index = 1U; component_index < component_count; ++component_index) {
+        if (components[component_index].point_count > components[primary_index].point_count) primary_index = component_index;
+    }
+    main_min_lon = components[primary_index].min_lon_nano;
+    main_min_lat = components[primary_index].min_lat_nano;
+    main_max_lon = components[primary_index].max_lon_nano;
+    main_max_lat = components[primary_index].max_lat_nano;
+    context->have_exclave_bbox = 0;
+    context->exclave_component_count = 0U;
+    for (component_index = 0U; component_index < component_count; ++component_index) {
+        if (component_index == primary_index) continue;
+        if (boundary_component_is_far(&components[primary_index], &components[component_index])) {
+            if (!context->have_exclave_bbox) {
+                context->exclave_min_lon_nano = components[component_index].min_lon_nano;
+                context->exclave_min_lat_nano = components[component_index].min_lat_nano;
+                context->exclave_max_lon_nano = components[component_index].max_lon_nano;
+                context->exclave_max_lat_nano = components[component_index].max_lat_nano;
+                context->have_exclave_bbox = 1;
+            } else {
+                bbox_union_values(components[component_index].min_lon_nano, components[component_index].min_lat_nano,
+                                  components[component_index].max_lon_nano, components[component_index].max_lat_nano,
+                                  &context->exclave_min_lon_nano, &context->exclave_min_lat_nano, &context->exclave_max_lon_nano, &context->exclave_max_lat_nano);
+            }
+            context->exclave_component_count += 1U;
+        } else {
+            bbox_union_values(components[component_index].min_lon_nano, components[component_index].min_lat_nano,
+                              components[component_index].max_lon_nano, components[component_index].max_lat_nano,
+                              &main_min_lon, &main_min_lat, &main_max_lon, &main_max_lat);
+        }
+    }
+    if (context->have_exclave_bbox) {
+        apply_bbox_padding(context, main_min_lon, main_min_lat, main_max_lon, main_max_lat);
+        result = 1;
+    } else {
+        result = 0;
+    }
+
+cleanup:
+    rt_free(root_to_component);
+    rt_free(components);
+    rt_free(ways);
+    return result;
+}
+
 static int collect_v2_place_boundary(RenderContext *context, int fd) {
     unsigned char count_data[8];
     unsigned long long feature_count;
@@ -1037,6 +1330,10 @@ static int collect_v2_place_boundary(RenderContext *context, int fd) {
 
         if (read_feature_header(fd, &feature) != 0) return -1;
         if (feature.style_id != PACK_STYLE_BOUNDARY || feature.flags != 0U || feature.point_count < 2U || feature.point_count > 10000000U) return -1;
+        if (!feature_intersects_render_bbox(context, &feature)) {
+            if (skip_points(fd, feature.point_count) != 0) return -1;
+            continue;
+        }
         projected_points = (int *)rt_malloc(sizeof(int) * (size_t)feature.point_count * 2U);
         if (projected_points == 0) return -1;
         if (read_projected_feature_points(fd, &feature, context, projected_points) != 0 || append_visible_feature(context, &feature, projected_points) != 0) {
@@ -1788,6 +2085,98 @@ static void draw_collected_layers(RenderContext *context) {
     }
 }
 
+static int fill_background(RenderContext *context);
+
+static void draw_rect_outline(RenderContext *context, int x, int y, unsigned int width, unsigned int height, unsigned char red, unsigned char green, unsigned char blue) {
+    unsigned int index;
+
+    if (width == 0U || height == 0U) return;
+    for (index = 0U; index < width; ++index) {
+        put_pixel_rgb(context, x + (int)index, y, red, green, blue, 255U);
+        put_pixel_rgb(context, x + (int)index, y + (int)height - 1, red, green, blue, 255U);
+    }
+    for (index = 0U; index < height; ++index) {
+        put_pixel_rgb(context, x, y + (int)index, red, green, blue, 255U);
+        put_pixel_rgb(context, x + (int)width - 1, y + (int)index, red, green, blue, 255U);
+    }
+}
+
+static void composite_inset(RenderContext *context, const RenderContext *inset, int x, int y) {
+    unsigned int row;
+
+    for (row = 0U; row < inset->height; ++row) {
+        unsigned int col;
+        for (col = 0U; col < inset->width; ++col) {
+            const unsigned char *src = inset->pixels + ((size_t)row * (size_t)inset->width + (size_t)col) * 3U;
+            put_pixel_rgb(context, x + (int)col, y + (int)row, src[0], src[1], src[2], 255U);
+        }
+    }
+}
+
+static void choose_inset_size(RenderContext *context, RenderContext *inset) {
+    unsigned int max_width = context->width / 3U;
+    unsigned int max_height = context->height / 3U;
+
+    if (max_width > 900U) max_width = 900U;
+    if (max_height > 700U) max_height = 700U;
+    if (max_width < 180U) max_width = context->width > 40U ? context->width - 40U : context->width;
+    if (max_height < 140U) max_height = context->height > 40U ? context->height - 40U : context->height;
+    inset->width = max_width;
+    inset->height = 0U;
+    choose_missing_dimension(inset, 1, 0);
+    if (inset->height > max_height) {
+        inset->height = max_height;
+        inset->width = 0U;
+        choose_missing_dimension(inset, 0, 1);
+        if (inset->width > max_width) inset->width = max_width;
+    }
+    if (inset->width == 0U) inset->width = 1U;
+    if (inset->height == 0U) inset->height = 1U;
+}
+
+static int render_exclave_insets_v2(int fd, const OsmrPackV2Header *header, RenderContext *context) {
+    RenderContext inset;
+    unsigned long long selected_tile_count = 0ULL;
+    unsigned long long selected_tile_features = 0ULL;
+    unsigned int margin;
+    unsigned int border = 3U;
+    int x;
+    int y;
+    int result = -1;
+
+    if (!context->exclave_insets || !context->have_exclave_bbox) return 0;
+    rt_memset(&inset, 0, sizeof(inset));
+    memcpy(inset.styles, context->styles, sizeof(inset.styles));
+    inset.city_enabled = context->city_enabled;
+    inset.city_name = context->city_name;
+    inset.boundary_fade = context->boundary_fade;
+    inset.png_palette = context->png_palette;
+    inset.v2_boundary_payload_offset = context->v2_boundary_payload_offset;
+    inset.v2_boundary_payload_size = context->v2_boundary_payload_size;
+    inset.v2_boundary_feature_count = context->v2_boundary_feature_count;
+    apply_bbox_padding(&inset, context->exclave_min_lon_nano, context->exclave_min_lat_nano, context->exclave_max_lon_nano, context->exclave_max_lat_nano);
+    choose_inset_size(context, &inset);
+    if (fill_background(&inset) != 0) goto cleanup;
+    if (collect_visible_features_v2(fd, header, &inset, &selected_tile_count, &selected_tile_features) != 0) goto cleanup;
+    if (collect_v2_place_boundary(&inset, fd) != 0) goto cleanup;
+    draw_collected_layers(&inset);
+    margin = context->width < 700U || context->height < 500U ? 10U : 24U;
+    if (inset.width + border * 2U + margin > context->width || inset.height + border * 2U + margin > context->height) goto cleanup;
+    x = (int)(context->width - inset.width - border * 2U - margin);
+    y = (int)margin;
+    draw_rect_outline(context, x, y, inset.width + border * 2U, inset.height + border * 2U, 40U, 45U, 48U);
+    draw_rect_outline(context, x + 1, y + 1, inset.width + border * 2U - 2U, inset.height + border * 2U - 2U, 255U, 255U, 255U);
+    composite_inset(context, &inset, x + (int)border, y + (int)border);
+    draw_rect_outline(context, x + (int)border - 1, y + (int)border - 1, inset.width + 2U, inset.height + 2U, 40U, 45U, 48U);
+    result = 0;
+
+cleanup:
+    rt_free(inset.features);
+    rt_free(inset.points);
+    rt_free(inset.pixels);
+    return result;
+}
+
 static int render_layer(int fd, const OsmrPackHeader *pack_header, RenderContext *context, unsigned int step, unsigned int style_id) {
     unsigned char count_data[8];
     unsigned long long feature_count;
@@ -2243,6 +2632,9 @@ static void write_render_summary(const char *out_path, const RenderContext *cont
     rt_write_cstr(1, "boundary_fade: ");
     rt_write_cstr(1, context->boundary_fade_applied ? "yes" : "no");
     rt_write_char(1, '\n');
+    rt_write_cstr(1, "exclave_insets: ");
+    rt_write_cstr(1, context->exclave_insets && context->have_exclave_bbox ? "yes" : "no");
+    rt_write_char(1, '\n');
     rt_write_cstr(1, "render_elapsed_ms: ");
     rt_write_uint(1, elapsed_ms);
     rt_write_char(1, '\n');
@@ -2372,6 +2764,9 @@ int main(int argc, char **argv) {
         } else if (rt_strcmp(argv[argi], "--no-boundary-fade") == 0) {
             context.boundary_fade = 0;
             argi += 1;
+        } else if (rt_strcmp(argv[argi], "--exclave-insets") == 0) {
+            context.exclave_insets = 1;
+            argi += 1;
         } else if (rt_strcmp(argv[argi], "--png-rgb") == 0) {
             context.png_palette = 0;
             argi += 1;
@@ -2429,6 +2824,15 @@ int main(int argc, char **argv) {
             }
             if (place_bbox_result > 0 && render_bbox_is_valid(&context)) bbox_set = 1;
         }
+        if (context.city_enabled && context.v2_boundary_payload_offset != 0ULL) {
+            int viewport_result = compute_v2_boundary_viewports(&context, fd);
+            if (viewport_result < 0) {
+                (void)platform_close(fd);
+                rt_write_cstr(2, "osmrender-rpack: failed while resolving boundary viewports\n");
+                return 1;
+            }
+            if (viewport_result > 0 && render_bbox_is_valid(&context)) bbox_set = 1;
+        }
         if (!bbox_set) {
             (void)platform_close(fd);
             rt_write_cstr(2, "osmrender-rpack: could not resolve city bbox\n");
@@ -2463,6 +2867,14 @@ int main(int argc, char **argv) {
         boundary_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
         phase_start_ns = platform_get_monotonic_time_ns();
         draw_collected_layers(&context);
+        if (render_exclave_insets_v2(fd, &v2_header, &context) != 0) {
+            rt_free(context.features);
+            rt_free(context.points);
+            rt_free(context.pixels);
+            (void)platform_close(fd);
+            rt_write_cstr(2, "osmrender-rpack: failed while rendering exclave insets\n");
+            return 1;
+        }
         draw_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
         elapsed_ms = collect_elapsed_ms + boundary_elapsed_ms + draw_elapsed_ms;
         (void)platform_close(fd);

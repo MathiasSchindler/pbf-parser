@@ -36,10 +36,12 @@ Inspect a pack header:
 Render from a pack:
 
 ```sh
-./build/freestanding-linux-x86_64/osmrender-rpack OUT.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]
+./build/freestanding-linux-x86_64/osmrender-rpack OUT.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--exclave-insets] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]
 ```
 
 If only `--width` or only `--height` is supplied, the renderer derives the missing dimension from the resolved bbox aspect ratio. Supplying both dimensions keeps the exact requested image size.
+
+For city renders with far-away boundary components, the renderer uses the primary boundary component as the default viewport. `--exclave-insets` renders those distant components in a corner inset without changing the `.rpack` format.
 
 ## Encoding Rules
 

@@ -86,7 +86,7 @@ For repeated renders from a large extract, build a render pack once and render f
 ./build/freestanding-linux-x86_64/osmrender-rpack build/germany.rpack city.png --city Berlin --width 1600 --height 1200 --profile
 ```
 
-`osmrender-rpack` can render directly from the pack-contained place directory, tile payloads, and embedded per-place boundary payloads. For `--city`, it draws the matching administrative boundary and fades pixels outside it without sidecar indexes; `.osmnidx`, `.osmwidx`, and `.osmridx` remain as a fallback for older packs. The pack format is documented in `docs/osmrpack_format.md`.
+`osmrender-rpack` can render directly from the pack-contained place directory, tile payloads, and embedded per-place boundary payloads. For `--city`, it draws the matching administrative boundary and fades pixels outside it without sidecar indexes; distant exclave components are excluded from the default viewport and can be shown with `--exclave-insets`. `.osmnidx`, `.osmwidx`, and `.osmridx` remain as a fallback for older packs. The pack format is documented in `docs/osmrpack_format.md`.
 
 ## Fonts
 
