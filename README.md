@@ -21,8 +21,9 @@ The repository currently provides:
 - `osmrpackinfo`, which prints render-pack header and directory metadata.
 - `osmrender-rpack`, which renders PNGs from `.rpack` files using `--city` or `--bbox` without scanning the source PBF.
 - `osmwalkroute`, which finds a walking route between two street addresses and can compare that result against a first-pass single-leg GTFS transit option for a departure time.
-- `osmroutepack`, an initial `OSMRTE01` route-pack converter that writes the binary container, source counts, metric tile metadata, bounds, sorted tile directory records, empty per-tile walking payload scaffolds, and a string-table section. It is not routeable yet; tiled walking graph and transit payload generation are the next phases.
+- `osmroutepack`, an `OSMRTE01` route-pack converter that writes the binary container, source counts, metric tile metadata, bounds, sorted tile directory records, address records, and tiled walking graph payloads.
 - `osmrteinfo`, which inspects `OSMRTE01` route-pack files, prints header and section metadata, checks whether address and GTFS sections are present, and can look up the route tile for a latitude/longitude pair.
+- `rtewalkroute`, which resolves two walking-route endpoint addresses from an `OSMRTE01` route pack, loads the endpoint tile neighborhood, snaps to walking graph nodes, and runs Dijkstra from the `.rte` file.
 - `threadtest`, a small validation tool for the Linux nolibc threading layer.
 - `fonttest`, a small smoke tool for the vendored TrueType renderer used by future map labels.
 
@@ -95,7 +96,7 @@ For repeated renders from a large extract, build a render pack once and render f
 ./build/freestanding-linux-x86_64/osmrender-rpack build/germany.rpack city.png --city Berlin --width 1600 --height 1200 --profile
 ```
 
-`osmrender-rpack` can render directly from the pack-contained place directory, tile payloads, and embedded per-place boundary payloads. For `--city`, it draws the matching administrative boundary and fades pixels outside it without sidecar indexes; distant exclave components are excluded from the default viewport and can be shown with `--exclave-insets`. `.osmnidx`, `.osmwidx`, and `.osmridx` remain as a fallback for older packs. The pack format is documented in `docs/osmrpack_format.md`.
+`osmrender-rpack` can render directly from the pack-contained place directory, tile payloads, and embedded per-place boundary payloads. For `--city`, it draws the matching administrative boundary and fades pixels outside it without sidecar indexes; distant exclave components are excluded from the default viewport and can be shown with `--exclave-insets`. A route overlay can be drawn with `--route-polyline FILE`, where the file contains one `lon,lat` point per line. `.osmnidx`, `.osmwidx`, and `.osmridx` remain as a fallback for older packs. The pack format is documented in `docs/osmrpack_format.md`.
 
 ## Routing
 
@@ -157,9 +158,9 @@ build/freestanding-macos-arm64/osmroutepack --tile-size-m 4000 --threads 2 \
 	data/brandenburg-260525.osm.pbf build/brandenburg.rte
 ```
 
-This milestone writes an `OSMRTE01` file with real metric route tiles, empty walking payload scaffolds, and a first global address section for exact street/house lookup. It validates the binary header, section layout, tile directory, tile payload layout, and address-record access before the heavier builder work fills tiled walking CSR arrays, snap grids, optimized address dictionaries, GTFS route-pattern arrays, and service-day bitsets. The target format is documented in `docs/OSMRTE01.md`.
+This milestone writes an `OSMRTE01` file with real metric route tiles, tiled walking nodes, edge-offset arrays, directed walking edges, minimal snap-grid records, and a first global address section for exact street/house lookup. GTFS route-pattern arrays, service-day bitsets, and optimized address dictionaries are still future work. The target format is documented in `docs/OSMRTE01.md`.
 
-Inspect a generated route pack before routing payloads are added:
+Inspect a generated route pack:
 
 ```sh
 make -B build/freestanding-macos-arm64/osmrteinfo
@@ -173,6 +174,30 @@ build/freestanding-macos-arm64/osmrteinfo build/brandenburg-tiles.rte \
 ```
 
 The current tiled milestone should report `addresses_present: yes` and `gtfs_present: no`. Address lookup does not require a tile coordinate; `--tile` is only a low-level tile-directory probe. Address queries use `street house` and may add `, city/suburb/postcode` to disambiguate. The inspector folds `Straße` and `Strasse` together for lookup. GTFS data still comes from the separate `data/GTFS` directory in the experimental `osmwalkroute` path; it is not embedded in `build/brandenburg-tiles.rte` yet.
+
+The first route-pack walking CLI resolves endpoints from `.rte` data:
+
+```sh
+make -B build/freestanding-macos-arm64/rtewalkroute
+build/freestanding-macos-arm64/rtewalkroute data/brandenburg.rte \
+	"Friedrich-Engels-Straße 22, Potsdam" \
+	"Hermann-Mattern-Promenade 25, Potsdam"
+```
+
+For the Potsdam sample above, the current route pack resolves node and building-way addresses, loads a small tile neighborhood, and reports `route_status: found`. `rtewalkroute` keeps the machine-readable key/value fields and also prints a human-readable walking summary with ANSI colors by default. Use `--no-color` when capturing output for scripts or logs.
+
+The macOS route CLI can also render a PNG map for a successful route:
+
+```sh
+build/freestanding-macos-arm64/rtewalkroute data/brandenburg.rte \
+	"Friedrich-Engels-Straße 22, Potsdam" \
+	"Hermann-Mattern-Promenade 25, Potsdam" \
+	--map build/route.png
+```
+
+`--map` writes the route path to a temporary `lon,lat` polyline and invokes the sibling `osmrender-rpack` binary with a render pack. Pass `--rpack FILE.rpack` to choose the map layer explicitly; otherwise the tool first looks for a matching `.rpack` next to the `.rte`, then for known local packs such as `build/brandenburg-260525.rpack` and `data/germany.rpack`. When both endpoints are in the same city, the map uses the renderer's `--city` viewport and still prints the computed route bbox as `map_bbox`.
+
+The human-readable directions are currently coarse graph directions such as “continue generally north-west for 450 m”; edge street names and fuller snap-grid edge snapping remain future work. The builder currently duplicates cross-tile walking segments into both endpoint tiles and writes minimal snap-grid headers; endpoint snapping in `rtewalkroute` uses nearest graph nodes.
 
 ## Fonts
 

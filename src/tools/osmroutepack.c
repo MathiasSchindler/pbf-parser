@@ -31,7 +31,9 @@ typedef struct {
     unsigned long long nodes_seen;
 } RoutePackBounds;
 
-typedef struct {
+typedef struct RoutePackTile RoutePackTile;
+
+struct RoutePackTile {
     unsigned long long tile_id;
     int x;
     int y;
@@ -41,9 +43,99 @@ typedef struct {
     int max_lon_e7;
     unsigned int source_node_count;
     unsigned int address_count;
+    unsigned int graph_segment_count;
+    unsigned int graph_segment_offset;
+    unsigned int graph_segment_cursor;
     unsigned long long payload_offset;
+    unsigned long long payload_size;
     unsigned long long neighbor_mask;
-} RoutePackTile;
+    void *graph;
+};
+
+typedef struct {
+    long long id;
+    int lat_e7;
+    int lon_e7;
+    int tile_x;
+    int tile_y;
+    RoutePackTile *tile;
+    unsigned int graph_index;
+    int found;
+} RoutePackWalkCoord;
+
+typedef struct {
+    long long id;
+    unsigned int index;
+    int used;
+} RoutePackWalkCoordSlot;
+
+typedef struct {
+    RoutePackWalkCoord *items;
+    RoutePackWalkCoordSlot *slots;
+    unsigned int count;
+    unsigned int capacity;
+    unsigned int slot_capacity;
+} RoutePackWalkCoordStore;
+
+typedef struct {
+    long long left_id;
+    long long right_id;
+} RoutePackWalkSegment;
+
+typedef struct {
+    RoutePackWalkSegment *items;
+    unsigned int count;
+    unsigned int capacity;
+} RoutePackWalkSegmentStore;
+
+typedef struct {
+    unsigned int tile_index;
+    unsigned int left_coord_index;
+    unsigned int right_coord_index;
+} RoutePackTileSegment;
+
+typedef struct {
+    RoutePackTileSegment *items;
+    unsigned int count;
+    unsigned int capacity;
+} RoutePackTileSegmentStore;
+
+typedef struct {
+    long long id;
+    int lat_e7;
+    int lon_e7;
+    unsigned int first_edge;
+} RoutePackTileGraphNode;
+
+typedef struct {
+    long long id;
+    unsigned int index;
+    int used;
+} RoutePackTileGraphNodeSlot;
+
+typedef struct {
+    unsigned int from;
+    unsigned int to;
+    unsigned int meters;
+} RoutePackTileGraphEdge;
+
+typedef struct {
+    RoutePackTileGraphNode *nodes;
+    RoutePackTileGraphNodeSlot *slots;
+    RoutePackTileGraphEdge *edges;
+    unsigned int node_count;
+    unsigned int node_capacity;
+    unsigned int slot_capacity;
+    unsigned int edge_count;
+    unsigned int edge_capacity;
+} RoutePackTileGraph;
+
+typedef struct {
+    RoutePackWalkCoordStore *coords;
+    unsigned long long walkable_way_count;
+    unsigned long long ref_count;
+    int failed;
+} RoutePackWalkCollectContext;
 
 typedef struct {
     unsigned long long tile_id;
@@ -58,6 +150,29 @@ typedef struct {
     unsigned int capacity;
     unsigned int slot_capacity;
 } RoutePackTileStore;
+
+typedef struct {
+    RoutePackWalkCoordStore *coords;
+    RoutePackTileStore *tiles;
+    unsigned long long segment_count;
+    unsigned long long tile_segment_count;
+    int failed;
+} RoutePackWalkCountContext;
+
+typedef struct {
+    RoutePackWalkCoordStore *coords;
+    RoutePackTileStore *tiles;
+    RoutePackTileSegmentStore *segments;
+    int origin_lat_e7;
+    int origin_lon_e7;
+    unsigned int meters_per_degree_lon;
+    unsigned int tile_size_m;
+    unsigned long long walkable_way_count;
+    unsigned long long segment_count;
+    unsigned long long inserted_segment_count;
+    unsigned long long next_progress_segment_count;
+    int failed;
+} RoutePackWalkMaterializeContext;
 
 typedef struct {
     RoutePackTileStore *store;
@@ -84,12 +199,20 @@ typedef struct {
 } RoutePackAddressFields;
 
 typedef struct {
+    long long node_id;
+    unsigned int address_index;
+} RoutePackAddressNodeRef;
+
+typedef struct {
     unsigned int entity_type;
     unsigned int flags;
     long long id;
     int lat_e7;
     int lon_e7;
     unsigned long long tile_id;
+    long long lat_nano_sum;
+    long long lon_nano_sum;
+    unsigned int coord_ref_count;
     unsigned int state_offset;
     unsigned int state_size;
     unsigned int city_offset;
@@ -111,6 +234,9 @@ typedef struct {
     char *strings;
     unsigned int string_size;
     unsigned int string_capacity;
+    RoutePackAddressNodeRef *node_refs;
+    unsigned int node_ref_count;
+    unsigned int node_ref_capacity;
 } RoutePackAddressStore;
 
 typedef struct {
@@ -122,6 +248,11 @@ typedef struct {
     unsigned int meters_per_degree_lon;
     int failed;
 } RoutePackAddressCollectContext;
+
+typedef struct {
+    RoutePackAddressStore *addresses;
+    int failed;
+} RoutePackAddressResolveContext;
 
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
@@ -218,6 +349,16 @@ static unsigned long long hash_tile_id(unsigned long long value) {
     return value;
 }
 
+static unsigned int hash_i64(long long value) {
+    unsigned long long x = (unsigned long long)value;
+    x ^= x >> 33U;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33U;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33U;
+    return (unsigned int)x;
+}
+
 static int compare_tile_by_id(const void *left_ptr, const void *right_ptr) {
     const RoutePackTile *left = (const RoutePackTile *)left_ptr;
     const RoutePackTile *right = (const RoutePackTile *)right_ptr;
@@ -225,6 +366,40 @@ static int compare_tile_by_id(const void *left_ptr, const void *right_ptr) {
     if (left->tile_id < right->tile_id) return -1;
     if (left->tile_id > right->tile_id) return 1;
     return 0;
+}
+
+static int compare_tile_segment_by_tile(const void *left_ptr, const void *right_ptr) {
+    const RoutePackTileSegment *left = (const RoutePackTileSegment *)left_ptr;
+    const RoutePackTileSegment *right = (const RoutePackTileSegment *)right_ptr;
+
+    if (left->tile_index < right->tile_index) return -1;
+    if (left->tile_index > right->tile_index) return 1;
+    if (left->left_coord_index < right->left_coord_index) return -1;
+    if (left->left_coord_index > right->left_coord_index) return 1;
+    if (left->right_coord_index < right->right_coord_index) return -1;
+    if (left->right_coord_index > right->right_coord_index) return 1;
+    return 0;
+}
+
+static int compare_u32_value(const void *left_ptr, const void *right_ptr) {
+    unsigned int left = *(const unsigned int *)left_ptr;
+    unsigned int right = *(const unsigned int *)right_ptr;
+
+    if (left < right) return -1;
+    if (left > right) return 1;
+    return 0;
+}
+
+static unsigned int lower_bound_u32(const unsigned int *items, unsigned int count, unsigned int value) {
+    unsigned int low = 0U;
+    unsigned int high = count;
+
+    while (low < high) {
+        unsigned int mid = low + (high - low) / 2U;
+        if (items[mid] < value) low = mid + 1U;
+        else high = mid;
+    }
+    return low;
 }
 
 static void write_u32_le(unsigned char *out, unsigned int value) {
@@ -248,6 +423,31 @@ static void write_u64_le(unsigned char *out, unsigned long long value) {
 
 static void write_i64_le(unsigned char *out, long long value) {
     write_u64_le(out, (unsigned long long)value);
+}
+
+static unsigned long long abs_i64(long long value) {
+    return value < 0 ? (unsigned long long)(-value) : (unsigned long long)value;
+}
+
+static unsigned long long isqrt_u64(unsigned long long value) {
+    unsigned long long result = 0ULL;
+    unsigned long long bit = 1ULL << 62U;
+
+    while (bit > value) bit >>= 2U;
+    while (bit != 0ULL) {
+        if (value >= result + bit) { value -= result + bit; result = (result >> 1U) + bit; }
+        else result >>= 1U;
+        bit >>= 2U;
+    }
+    return result;
+}
+
+static unsigned int distance_e7_m(int lat_a, int lon_a, int lat_b, int lon_b) {
+    unsigned long long dx = (abs_i64((long long)lon_a - (long long)lon_b) * 68000ULL + 5000000ULL) / 10000000ULL;
+    unsigned long long dy = (abs_i64((long long)lat_a - (long long)lat_b) * 111320ULL + 5000000ULL) / 10000000ULL;
+    unsigned long long distance = isqrt_u64(dx * dx + dy * dy);
+    if (distance == 0ULL) distance = 1ULL;
+    return distance > 0xffffffffULL ? 0xffffffffU : (unsigned int)distance;
 }
 
 static int tile_store_rehash(RoutePackTileStore *store, unsigned int new_slot_capacity) {
@@ -351,6 +551,172 @@ static int text_equals_cstr(PbfText text, const char *value) {
     return text.size == value_size && memcmp(text.data, value, value_size) == 0;
 }
 
+static int text_one_of(PbfText text, const char *a, const char *b, const char *c, const char *d) {
+    return (a != 0 && text_equals_cstr(text, a)) || (b != 0 && text_equals_cstr(text, b)) || (c != 0 && text_equals_cstr(text, c)) || (d != 0 && text_equals_cstr(text, d));
+}
+
+static PbfText tag_value(const PbfTag *tags, unsigned int tag_count, const char *key) {
+    PbfText empty;
+    unsigned int index;
+
+    empty.data = "";
+    empty.size = 0U;
+    for (index = 0U; index < tag_count; ++index) if (text_equals_cstr(tags[index].key, key)) return tags[index].value;
+    return empty;
+}
+
+static int way_walkable(const PbfTag *tags, unsigned int tag_count) {
+    PbfText highway = tag_value(tags, tag_count, "highway");
+    PbfText access = tag_value(tags, tag_count, "access");
+    PbfText foot = tag_value(tags, tag_count, "foot");
+
+    if (highway.size == 0U) return 0;
+    if (text_one_of(access, "private", "no", 0, 0) || text_one_of(foot, "private", "no", 0, 0)) return 0;
+    if (text_one_of(foot, "yes", "designated", "permissive", "official")) return 1;
+    if (text_one_of(highway, "motorway", "motorway_link", "trunk", "trunk_link")) return 0;
+    if (text_one_of(highway, "construction", "proposed", "raceway", "bus_guideway")) return 0;
+    if (text_one_of(highway, "footway", "path", "pedestrian", "steps")) return 1;
+    if (text_one_of(highway, "residential", "living_street", "service", "track")) return 1;
+    if (text_one_of(highway, "unclassified", "tertiary", "secondary", "primary")) return 1;
+    return text_one_of(highway, "tertiary_link", "secondary_link", "primary_link", "road");
+}
+
+static int walk_coord_reserve(RoutePackWalkCoordStore *store, unsigned int needed_count) {
+    unsigned int new_capacity;
+    RoutePackWalkCoord *new_items;
+
+    if (needed_count <= store->capacity) return 0;
+    new_capacity = store->capacity == 0U ? 262144U : store->capacity * 2U;
+    while (new_capacity < needed_count) new_capacity *= 2U;
+    new_items = (RoutePackWalkCoord *)rt_realloc(store->items, sizeof(*new_items) * new_capacity);
+    if (new_items == 0) return -1;
+    store->items = new_items;
+    store->capacity = new_capacity;
+    return 0;
+}
+
+static int walk_coord_rehash(RoutePackWalkCoordStore *store, unsigned int new_slot_capacity) {
+    RoutePackWalkCoordSlot *new_slots;
+    unsigned int index;
+
+    new_slots = (RoutePackWalkCoordSlot *)rt_malloc(sizeof(*new_slots) * new_slot_capacity);
+    if (new_slots == 0) return -1;
+    rt_memset(new_slots, 0, sizeof(*new_slots) * new_slot_capacity);
+    for (index = 0U; index < store->count; ++index) {
+        unsigned int slot = hash_i64(store->items[index].id) & (new_slot_capacity - 1U);
+        while (new_slots[slot].used) slot = (slot + 1U) & (new_slot_capacity - 1U);
+        new_slots[slot].used = 1;
+        new_slots[slot].id = store->items[index].id;
+        new_slots[slot].index = index;
+    }
+    rt_free(store->slots);
+    store->slots = new_slots;
+    store->slot_capacity = new_slot_capacity;
+    return 0;
+}
+
+static RoutePackWalkCoord *walk_coord_find(RoutePackWalkCoordStore *store, long long id) {
+    unsigned int slot;
+
+    if (store->slot_capacity == 0U) return 0;
+    slot = hash_i64(id) & (store->slot_capacity - 1U);
+    while (store->slots[slot].used) {
+        if (store->slots[slot].id == id) return store->items + store->slots[slot].index;
+        slot = (slot + 1U) & (store->slot_capacity - 1U);
+    }
+    return 0;
+}
+
+static int walk_coord_find_or_add(RoutePackWalkCoordStore *store, long long id) {
+    unsigned int slot;
+
+    if (store->slot_capacity == 0U) {
+        if (walk_coord_rehash(store, 524288U) != 0) return -1;
+    } else if ((store->count + 1U) * 2U >= store->slot_capacity) {
+        if (walk_coord_rehash(store, store->slot_capacity * 2U) != 0) return -1;
+    }
+    slot = hash_i64(id) & (store->slot_capacity - 1U);
+    while (store->slots[slot].used) {
+        if (store->slots[slot].id == id) return 0;
+        slot = (slot + 1U) & (store->slot_capacity - 1U);
+    }
+    if (walk_coord_reserve(store, store->count + 1U) != 0) return -1;
+    store->slots[slot].used = 1;
+    store->slots[slot].id = id;
+    store->slots[slot].index = store->count;
+    rt_memset(store->items + store->count, 0, sizeof(*store->items));
+    store->items[store->count].id = id;
+    store->items[store->count].graph_index = 0xffffffffU;
+    store->count += 1U;
+    return 0;
+}
+
+static int walk_segment_reserve(RoutePackWalkSegmentStore *store, unsigned int needed_count) {
+    unsigned int new_capacity;
+    RoutePackWalkSegment *new_items;
+
+    if (needed_count <= store->capacity) return 0;
+    new_capacity = store->capacity == 0U ? 262144U : store->capacity * 2U;
+    while (new_capacity < needed_count) new_capacity *= 2U;
+    new_items = (RoutePackWalkSegment *)rt_realloc(store->items, sizeof(*new_items) * new_capacity);
+    if (new_items == 0) return -1;
+    store->items = new_items;
+    store->capacity = new_capacity;
+    return 0;
+}
+
+static int walk_segment_add(RoutePackWalkSegmentStore *store, long long left_id, long long right_id) {
+    RoutePackWalkSegment *segment;
+
+    if (left_id == right_id) return 0;
+    if (walk_segment_reserve(store, store->count + 1U) != 0) return -1;
+    segment = store->items + store->count;
+    segment->left_id = left_id;
+    segment->right_id = right_id;
+    store->count += 1U;
+    return 0;
+}
+
+static int tile_segment_reserve(RoutePackTileSegmentStore *store, unsigned int needed_count) {
+    unsigned int new_capacity;
+    RoutePackTileSegment *new_items;
+
+    if (needed_count <= store->capacity) return 0;
+    new_capacity = store->capacity == 0U ? 262144U : store->capacity * 2U;
+    while (new_capacity < needed_count) new_capacity *= 2U;
+    new_items = (RoutePackTileSegment *)rt_realloc(store->items, sizeof(*new_items) * new_capacity);
+    if (new_items == 0) return -1;
+    store->items = new_items;
+    store->capacity = new_capacity;
+    return 0;
+}
+
+static int tile_segment_add(RoutePackTileSegmentStore *store, unsigned int tile_index, unsigned int left_coord_index, unsigned int right_coord_index) {
+    RoutePackTileSegment *segment;
+
+    if (tile_segment_reserve(store, store->count + 1U) != 0) return -1;
+    segment = store->items + store->count;
+    segment->tile_index = tile_index;
+    segment->left_coord_index = left_coord_index;
+    segment->right_coord_index = right_coord_index;
+    store->count += 1U;
+    return 0;
+}
+
+static int tile_segment_add_to_tile(RoutePackTileSegmentStore *store, RoutePackTile *tile, unsigned int tile_index, unsigned int left_coord_index, unsigned int right_coord_index) {
+    RoutePackTileSegment *segment;
+    unsigned int position = tile->graph_segment_cursor;
+
+    if (position >= store->capacity) return -1;
+    tile->graph_segment_cursor += 1U;
+    if (store->count < tile->graph_segment_cursor) store->count = tile->graph_segment_cursor;
+    segment = store->items + position;
+    segment->tile_index = tile_index;
+    segment->left_coord_index = left_coord_index;
+    segment->right_coord_index = right_coord_index;
+    return 0;
+}
+
 static void find_address_fields(const PbfTag *tags, unsigned int tag_count, RoutePackAddressFields *fields) {
     unsigned int index;
 
@@ -397,6 +763,31 @@ static int address_store_reserve_strings(RoutePackAddressStore *store, unsigned 
     return 0;
 }
 
+static int address_store_reserve_node_refs(RoutePackAddressStore *store, unsigned int needed_count) {
+    unsigned int new_capacity;
+    RoutePackAddressNodeRef *new_refs;
+
+    if (needed_count <= store->node_ref_capacity) return 0;
+    new_capacity = store->node_ref_capacity == 0U ? 262144U : store->node_ref_capacity * 2U;
+    while (new_capacity < needed_count) new_capacity *= 2U;
+    new_refs = (RoutePackAddressNodeRef *)rt_realloc(store->node_refs, sizeof(*new_refs) * new_capacity);
+    if (new_refs == 0) return -1;
+    store->node_refs = new_refs;
+    store->node_ref_capacity = new_capacity;
+    return 0;
+}
+
+static int address_store_add_node_ref(RoutePackAddressStore *store, long long node_id, unsigned int address_index) {
+    RoutePackAddressNodeRef *ref;
+
+    if (address_store_reserve_node_refs(store, store->node_ref_count + 1U) != 0) return -1;
+    ref = store->node_refs + store->node_ref_count;
+    ref->node_id = node_id;
+    ref->address_index = address_index;
+    store->node_ref_count += 1U;
+    return 0;
+}
+
 static int address_store_add_text(RoutePackAddressStore *store, PbfText text, unsigned int *offset_out, unsigned int *size_out) {
     if (text.size > 0xffffffffU || store->string_size > 0xffffffffU - (unsigned int)text.size) return -1;
     if (address_store_reserve_strings(store, store->string_size + (unsigned int)text.size) != 0) return -1;
@@ -407,12 +798,14 @@ static int address_store_add_text(RoutePackAddressStore *store, PbfText text, un
     return 0;
 }
 
-static int address_store_add(RoutePackAddressStore *store, unsigned int entity_type, long long id, int has_coord, int lat_e7, int lon_e7, unsigned long long tile_id, const RoutePackAddressFields *fields) {
+static int address_store_add(RoutePackAddressStore *store, unsigned int entity_type, long long id, int has_coord, int lat_e7, int lon_e7, unsigned long long tile_id, const RoutePackAddressFields *fields, unsigned int *index_out) {
     RoutePackAddressRecord *record;
+    unsigned int record_index;
 
     if (!address_fields_complete(fields)) return 0;
     if (address_store_reserve_records(store, store->count + 1U) != 0) return -1;
-    record = store->records + store->count;
+    record_index = store->count;
+    record = store->records + record_index;
     rt_memset(record, 0, sizeof(*record));
     record->entity_type = entity_type;
     record->flags = has_coord ? 1U : 0U;
@@ -427,6 +820,7 @@ static int address_store_add(RoutePackAddressStore *store, unsigned int entity_t
     if (address_store_add_text(store, fields->housenumber, &record->housenumber_offset, &record->housenumber_size) != 0) return -1;
     if (address_store_add_text(store, fields->postcode, &record->postcode_offset, &record->postcode_size) != 0) return -1;
     store->count += 1U;
+    if (index_out != 0) *index_out = record_index;
     return 0;
 }
 
@@ -489,6 +883,414 @@ static int route_pack_coord_to_tile(int lat_e7, int lon_e7, int origin_lat_e7, i
     return 0;
 }
 
+static int tile_graph_node_rehash(RoutePackTileGraph *graph, unsigned int new_slot_capacity) {
+    RoutePackTileGraphNodeSlot *new_slots;
+    unsigned int index;
+
+    new_slots = (RoutePackTileGraphNodeSlot *)rt_malloc(sizeof(*new_slots) * new_slot_capacity);
+    if (new_slots == 0) return -1;
+    rt_memset(new_slots, 0, sizeof(*new_slots) * new_slot_capacity);
+    for (index = 0U; index < graph->node_count; ++index) {
+        unsigned int slot = hash_i64(graph->nodes[index].id) & (new_slot_capacity - 1U);
+        while (new_slots[slot].used) slot = (slot + 1U) & (new_slot_capacity - 1U);
+        new_slots[slot].used = 1;
+        new_slots[slot].id = graph->nodes[index].id;
+        new_slots[slot].index = index;
+    }
+    rt_free(graph->slots);
+    graph->slots = new_slots;
+    graph->slot_capacity = new_slot_capacity;
+    return 0;
+}
+
+static int tile_graph_reserve_nodes(RoutePackTileGraph *graph, unsigned int needed_count) {
+    unsigned int new_capacity;
+    RoutePackTileGraphNode *new_nodes;
+
+    if (needed_count <= graph->node_capacity) return 0;
+    new_capacity = graph->node_capacity == 0U ? 512U : graph->node_capacity * 2U;
+    while (new_capacity < needed_count) new_capacity *= 2U;
+    new_nodes = (RoutePackTileGraphNode *)rt_realloc(graph->nodes, sizeof(*new_nodes) * new_capacity);
+    if (new_nodes == 0) return -1;
+    graph->nodes = new_nodes;
+    graph->node_capacity = new_capacity;
+    return 0;
+}
+
+static int tile_graph_reserve_edges(RoutePackTileGraph *graph, unsigned int needed_count) {
+    unsigned int new_capacity;
+    RoutePackTileGraphEdge *new_edges;
+
+    if (needed_count <= graph->edge_capacity) return 0;
+    new_capacity = graph->edge_capacity == 0U ? 1024U : graph->edge_capacity * 2U;
+    while (new_capacity < needed_count) new_capacity *= 2U;
+    new_edges = (RoutePackTileGraphEdge *)rt_realloc(graph->edges, sizeof(*new_edges) * new_capacity);
+    if (new_edges == 0) return -1;
+    graph->edges = new_edges;
+    graph->edge_capacity = new_capacity;
+    return 0;
+}
+
+static unsigned int next_power_of_two_u32(unsigned int value) {
+    unsigned int result = 1U;
+    while (result < value && result < 0x80000000U) result <<= 1U;
+    return result < value ? value : result;
+}
+
+static int tile_graph_preallocate(RoutePackTile *tile) {
+    RoutePackTileGraph *graph;
+    unsigned int node_capacity;
+    unsigned int slot_capacity;
+    unsigned int edge_capacity;
+
+    if (tile->graph_segment_count == 0U) return 0;
+    if (tile->graph == 0) {
+        tile->graph = rt_malloc(sizeof(RoutePackTileGraph));
+        if (tile->graph == 0) return -1;
+        rt_memset(tile->graph, 0, sizeof(RoutePackTileGraph));
+    }
+    graph = (RoutePackTileGraph *)tile->graph;
+    edge_capacity = tile->graph_segment_count > 0x7fffffffU ? 0xffffffffU : tile->graph_segment_count * 2U;
+    node_capacity = tile->graph_segment_count + 1U;
+    if (node_capacity < 512U) node_capacity = 512U;
+    slot_capacity = next_power_of_two_u32(node_capacity * 2U);
+    if (tile_graph_reserve_edges(graph, edge_capacity) != 0 || tile_graph_reserve_nodes(graph, node_capacity) != 0 || tile_graph_node_rehash(graph, slot_capacity) != 0) return -1;
+    return 0;
+}
+
+static int tile_graph_node_for_coord(RoutePackTileGraph *graph, const RoutePackWalkCoord *coord, unsigned int *node_out) {
+    unsigned int slot;
+
+    if (graph->slot_capacity == 0U) {
+        if (tile_graph_node_rehash(graph, 1024U) != 0) return -1;
+    } else if ((graph->node_count + 1U) * 2U >= graph->slot_capacity) {
+        if (tile_graph_node_rehash(graph, graph->slot_capacity * 2U) != 0) return -1;
+    }
+    slot = hash_i64(coord->id) & (graph->slot_capacity - 1U);
+    while (graph->slots[slot].used) {
+        if (graph->slots[slot].id == coord->id) { *node_out = graph->slots[slot].index; return 0; }
+        slot = (slot + 1U) & (graph->slot_capacity - 1U);
+    }
+    if (tile_graph_reserve_nodes(graph, graph->node_count + 1U) != 0) return -1;
+    graph->slots[slot].used = 1;
+    graph->slots[slot].id = coord->id;
+    graph->slots[slot].index = graph->node_count;
+    graph->nodes[graph->node_count].id = coord->id;
+    graph->nodes[graph->node_count].lat_e7 = coord->lat_e7;
+    graph->nodes[graph->node_count].lon_e7 = coord->lon_e7;
+    graph->nodes[graph->node_count].first_edge = 0U;
+    *node_out = graph->node_count;
+    graph->node_count += 1U;
+    return 0;
+}
+
+static int tile_graph_add_directed(RoutePackTileGraph *graph, unsigned int from, unsigned int to, unsigned int meters) {
+    RoutePackTileGraphEdge *edge;
+
+    if (from == to) return 0;
+    if (tile_graph_reserve_edges(graph, graph->edge_count + 1U) != 0) return -1;
+    edge = graph->edges + graph->edge_count;
+    edge->from = from;
+    edge->to = to;
+    edge->meters = meters;
+    graph->edge_count += 1U;
+    return 0;
+}
+
+static int tile_graph_node_for_coord_cached(RoutePackTile *tile, RoutePackTileGraph *graph, RoutePackWalkCoord *coord, unsigned int *node_out) {
+    if (coord->tile == tile && coord->graph_index != 0xffffffffU) {
+        *node_out = coord->graph_index;
+        return 0;
+    }
+    if (tile_graph_node_for_coord(graph, coord, node_out) != 0) return -1;
+    if (coord->tile == tile) coord->graph_index = *node_out;
+    return 0;
+}
+
+static int tile_graph_add_segment(RoutePackTile *tile, RoutePackWalkCoord *left, RoutePackWalkCoord *right) {
+    RoutePackTileGraph *graph;
+    unsigned int left_index;
+    unsigned int right_index;
+    unsigned int meters;
+
+    if (tile->graph == 0) {
+        tile->graph = rt_malloc(sizeof(RoutePackTileGraph));
+        if (tile->graph == 0) return -1;
+        rt_memset(tile->graph, 0, sizeof(RoutePackTileGraph));
+    }
+    graph = (RoutePackTileGraph *)tile->graph;
+    if (tile_graph_node_for_coord_cached(tile, graph, left, &left_index) != 0 || tile_graph_node_for_coord_cached(tile, graph, right, &right_index) != 0) return -1;
+    meters = distance_e7_m(left->lat_e7, left->lon_e7, right->lat_e7, right->lon_e7);
+    if (tile_graph_add_directed(graph, left_index, right_index, meters) != 0 || tile_graph_add_directed(graph, right_index, left_index, meters) != 0) return -1;
+    return 0;
+}
+
+static int on_walk_way_refs(void *user, const PbfWay *way) {
+    RoutePackWalkCollectContext *context = (RoutePackWalkCollectContext *)user;
+    unsigned int index;
+
+    if (context->failed) return -1;
+    if (!way_walkable(way->tags, way->tag_count)) return 0;
+    context->walkable_way_count += 1ULL;
+    context->ref_count += way->ref_count;
+    for (index = 0U; index < way->ref_count; ++index) {
+        if (walk_coord_find_or_add(context->coords, way->refs[index]) != 0) { context->failed = 1; return -1; }
+    }
+    return 0;
+}
+
+static int materialize_walk_segment(RoutePackWalkMaterializeContext *context, RoutePackWalkCoord *left, RoutePackWalkCoord *right) {
+    unsigned int left_coord_index;
+    unsigned int right_coord_index;
+
+    if (left == 0 || right == 0 || !left->found || !right->found) return 0;
+    left_coord_index = (unsigned int)(left - context->coords->items);
+    right_coord_index = (unsigned int)(right - context->coords->items);
+    if (left->tile != 0) {
+        unsigned int tile_index = (unsigned int)(left->tile - context->tiles->tiles);
+        if (tile_segment_add_to_tile(context->segments, left->tile, tile_index, left_coord_index, right_coord_index) != 0) return -1;
+        context->inserted_segment_count += 1ULL;
+    }
+    if (right->tile != 0 && right->tile != left->tile) {
+        unsigned int tile_index = (unsigned int)(right->tile - context->tiles->tiles);
+        if (tile_segment_add_to_tile(context->segments, right->tile, tile_index, left_coord_index, right_coord_index) != 0) return -1;
+        context->inserted_segment_count += 1ULL;
+    }
+    return 0;
+}
+
+static int count_walk_segment(RoutePackWalkCountContext *context, const RoutePackWalkCoord *left, const RoutePackWalkCoord *right) {
+    if (left == 0 || right == 0 || !left->found || !right->found) return 0;
+    if (left->tile != 0 && left->tile->graph_segment_count != 0xffffffffU) {
+        left->tile->graph_segment_count += 1U;
+        context->tile_segment_count += 1ULL;
+    }
+    if (right->tile != 0 && right->tile != left->tile && right->tile->graph_segment_count != 0xffffffffU) {
+        right->tile->graph_segment_count += 1U;
+        context->tile_segment_count += 1ULL;
+    }
+    context->segment_count += 1ULL;
+    return 0;
+}
+
+static int on_walk_way_count_segments(void *user, const PbfWay *way) {
+    RoutePackWalkCountContext *context = (RoutePackWalkCountContext *)user;
+    unsigned int index;
+
+    if (context->failed) return -1;
+    if (!way_walkable(way->tags, way->tag_count)) return 0;
+    for (index = 1U; index < way->ref_count; ++index) {
+        RoutePackWalkCoord *left = walk_coord_find(context->coords, way->refs[index - 1U]);
+        RoutePackWalkCoord *right = walk_coord_find(context->coords, way->refs[index]);
+        if (count_walk_segment(context, left, right) != 0) { context->failed = 1; return -1; }
+    }
+    return 0;
+}
+
+static int on_walk_way_graph(void *user, const PbfWay *way) {
+    RoutePackWalkMaterializeContext *context = (RoutePackWalkMaterializeContext *)user;
+    unsigned int index;
+
+    if (context->failed) return -1;
+    if (!way_walkable(way->tags, way->tag_count)) return 0;
+    context->walkable_way_count += 1ULL;
+    if (way->ref_count > 1U) context->segment_count += (unsigned long long)(way->ref_count - 1U);
+    if (context->segment_count >= context->next_progress_segment_count) {
+        rt_write_cstr(1, "walking_materialized_segments: ");
+        rt_write_uint(1, context->segment_count);
+        rt_write_char(1, '\n');
+        context->next_progress_segment_count += 500000ULL;
+    }
+    for (index = 1U; index < way->ref_count; ++index) {
+        RoutePackWalkCoord *left = walk_coord_find(context->coords, way->refs[index - 1U]);
+        RoutePackWalkCoord *right = walk_coord_find(context->coords, way->refs[index]);
+        if (materialize_walk_segment(context, left, right) != 0) { context->failed = 1; return -1; }
+    }
+    return 0;
+}
+
+static int build_tile_graphs_from_segments(RoutePackTileStore *tiles, const RoutePackWalkCoordStore *coords, RoutePackTileSegmentStore *segments) {
+    RoutePackTileGraph *graph_pool;
+    RoutePackTileGraphNode *node_pool;
+    RoutePackTileGraphNodeSlot *slot_pool;
+    RoutePackTileGraphEdge *edge_pool;
+    unsigned long long total_node_capacity = 0ULL;
+    unsigned long long total_slot_capacity = 0ULL;
+    unsigned long long total_edge_capacity = 0ULL;
+    unsigned int node_cursor = 0U;
+    unsigned int slot_cursor = 0U;
+    unsigned int edge_cursor = 0U;
+    unsigned int tile_index;
+
+    if (segments->count == 0U) return 0;
+    for (tile_index = 0U; tile_index < tiles->count; ++tile_index) {
+        unsigned int group_count = tiles->tiles[tile_index].graph_segment_count;
+        unsigned int node_capacity;
+        unsigned int slot_capacity;
+        if (group_count == 0U) continue;
+        node_capacity = group_count > 0x7fffffffU ? 0xffffffffU : group_count * 2U;
+        slot_capacity = next_power_of_two_u32(node_capacity > 0x3fffffffU ? 0xffffffffU : node_capacity * 4U);
+        total_node_capacity += node_capacity;
+        total_edge_capacity += (unsigned long long)group_count * 2ULL;
+        total_slot_capacity += slot_capacity;
+    }
+    if (total_node_capacity > 0xffffffffULL || total_edge_capacity > 0xffffffffULL || total_slot_capacity > 0xffffffffULL) return -1;
+    graph_pool = (RoutePackTileGraph *)rt_malloc(sizeof(*graph_pool) * tiles->count);
+    node_pool = (RoutePackTileGraphNode *)rt_malloc(sizeof(*node_pool) * (unsigned int)total_node_capacity);
+    slot_pool = (RoutePackTileGraphNodeSlot *)rt_malloc(sizeof(*slot_pool) * (unsigned int)total_slot_capacity);
+    edge_pool = (RoutePackTileGraphEdge *)rt_malloc(sizeof(*edge_pool) * (unsigned int)total_edge_capacity);
+    if (graph_pool == 0 || node_pool == 0 || slot_pool == 0 || edge_pool == 0) return -1;
+    rt_memset(graph_pool, 0, sizeof(*graph_pool) * tiles->count);
+    for (tile_index = 0U; tile_index < tiles->count; ++tile_index) {
+        unsigned int group_begin = tiles->tiles[tile_index].graph_segment_offset;
+        unsigned int group_count;
+        unsigned int group_end;
+        RoutePackTileGraph *graph;
+        unsigned int node_capacity;
+        unsigned int slot_capacity;
+        unsigned int index;
+
+        group_count = tiles->tiles[tile_index].graph_segment_count;
+        group_end = group_begin + group_count;
+        if (group_count == 0U) continue;
+        if (group_end > segments->count) return -1;
+        node_capacity = group_count > 0x7fffffffU ? 0xffffffffU : group_count * 2U;
+        slot_capacity = next_power_of_two_u32(node_capacity > 0x3fffffffU ? 0xffffffffU : node_capacity * 4U);
+        graph = graph_pool + tile_index;
+        tiles->tiles[tile_index].graph = graph;
+        graph->nodes = node_pool + node_cursor;
+        graph->node_capacity = node_capacity;
+        graph->slots = slot_pool + slot_cursor;
+        graph->slot_capacity = slot_capacity;
+        graph->edges = edge_pool + edge_cursor;
+        graph->edge_capacity = group_count * 2U;
+        rt_memset(graph->slots, 0, sizeof(*graph->slots) * slot_capacity);
+        node_cursor += node_capacity;
+        slot_cursor += slot_capacity;
+        edge_cursor += group_count * 2U;
+        graph->node_count = 0U;
+        graph->edge_count = 0U;
+        for (index = group_begin; index < group_end; ++index) {
+            RoutePackWalkCoord *left = coords->items + segments->items[index].left_coord_index;
+            RoutePackWalkCoord *right = coords->items + segments->items[index].right_coord_index;
+            if (tile_graph_add_segment(tiles->tiles + tile_index, left, right) != 0) return -1;
+        }
+    }
+    return 0;
+}
+
+static int on_walk_node_coord(void *user, const PbfNode *node) {
+    RoutePackWalkCoordStore *coords = (RoutePackWalkCoordStore *)user;
+    RoutePackWalkCoord *coord = walk_coord_find(coords, node->id);
+
+    if (coord == 0) return 0;
+    if (int32_from_nano_e7(node->lat_nano, &coord->lat_e7) != 0 || int32_from_nano_e7(node->lon_nano, &coord->lon_e7) != 0) return 0;
+    coord->found = 1;
+    return 0;
+}
+
+static int collect_walking_graph(const char *pbf_path, RoutePackTileStore *tiles, const RoutePackBounds *bounds, unsigned int tile_size_m, char *error, size_t error_capacity) {
+    RoutePackWalkCoordStore coords;
+    RoutePackTileSegmentStore tile_segments;
+    RoutePackWalkCollectContext context;
+    RoutePackWalkCountContext count_context;
+    RoutePackWalkMaterializeContext materialize_context;
+    PbfStreamCallbacks callbacks;
+    int origin_lat_e7 = 0;
+    int origin_lon_e7 = 0;
+    unsigned int meters_per_degree_lon;
+    unsigned int coord_index;
+
+    rt_memset(&coords, 0, sizeof(coords));
+    rt_memset(&tile_segments, 0, sizeof(tile_segments));
+    rt_memset(&context, 0, sizeof(context));
+    context.coords = &coords;
+    rt_memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_RELATION_ROLES;
+    callbacks.way = on_walk_way_refs;
+    rt_write_cstr(1, "walking_graph_phase: collect_refs\n");
+    if (pbf_stream_entities(pbf_path, &callbacks, &context, error, error_capacity) != 0 || context.failed) return -1;
+    rt_write_cstr(1, "walking_ref_nodes: ");
+    rt_write_uint(1, coords.count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "walking_ref_total: ");
+    rt_write_uint(1, context.ref_count);
+    rt_write_char(1, '\n');
+
+    rt_memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_WAY_TAGS | PBF_STREAM_SKIP_RELATION_ROLES;
+    callbacks.node = on_walk_node_coord;
+    rt_write_cstr(1, "walking_graph_phase: resolve_coords\n");
+    if (pbf_stream_entities(pbf_path, &callbacks, &coords, error, error_capacity) != 0) return -1;
+
+    if (bounds->have_bounds) {
+        (void)int32_from_nano_e7((bounds->min_lat_nano + bounds->max_lat_nano) / 2LL, &origin_lat_e7);
+        (void)int32_from_nano_e7((bounds->min_lon_nano + bounds->max_lon_nano) / 2LL, &origin_lon_e7);
+    }
+    meters_per_degree_lon = meters_per_degree_lon_from_lat_e7(origin_lat_e7);
+    for (coord_index = 0U; coord_index < coords.count; ++coord_index) {
+        RoutePackWalkCoord *coord = coords.items + coord_index;
+        unsigned long long tile_id;
+        if (!coord->found) continue;
+        (void)route_pack_coord_to_tile(coord->lat_e7, coord->lon_e7, origin_lat_e7, origin_lon_e7, meters_per_degree_lon, tile_size_m, &coord->tile_x, &coord->tile_y, &tile_id);
+        coord->tile = tile_store_find_by_xy(tiles, coord->tile_x, coord->tile_y);
+    }
+    rt_memset(&count_context, 0, sizeof(count_context));
+    count_context.coords = &coords;
+    count_context.tiles = tiles;
+    rt_memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_RELATION_ROLES;
+    callbacks.way = on_walk_way_count_segments;
+    rt_write_cstr(1, "walking_graph_phase: count_tile_segments\n");
+    if (pbf_stream_entities(pbf_path, &callbacks, &count_context, error, error_capacity) != 0 || count_context.failed) return -1;
+    rt_write_cstr(1, "walking_count_segments: ");
+    rt_write_uint(1, count_context.segment_count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "walking_count_tile_segments: ");
+    rt_write_uint(1, count_context.tile_segment_count);
+    rt_write_char(1, '\n');
+    if (count_context.tile_segment_count > 0xffffffffULL) return -1;
+    if (tile_segment_reserve(&tile_segments, (unsigned int)count_context.tile_segment_count) != 0) return -1;
+    {
+        unsigned int tile_index;
+        unsigned int offset = 0U;
+        for (tile_index = 0U; tile_index < tiles->count; ++tile_index) {
+            tiles->tiles[tile_index].graph_segment_offset = offset;
+            tiles->tiles[tile_index].graph_segment_cursor = offset;
+            offset += tiles->tiles[tile_index].graph_segment_count;
+        }
+    }
+    rt_memset(&materialize_context, 0, sizeof(materialize_context));
+    materialize_context.coords = &coords;
+    materialize_context.tiles = tiles;
+    materialize_context.segments = &tile_segments;
+    materialize_context.origin_lat_e7 = origin_lat_e7;
+    materialize_context.origin_lon_e7 = origin_lon_e7;
+    materialize_context.meters_per_degree_lon = meters_per_degree_lon;
+    materialize_context.tile_size_m = tile_size_m;
+    materialize_context.next_progress_segment_count = 500000ULL;
+    rt_memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_RELATION_ROLES;
+    callbacks.way = on_walk_way_graph;
+    rt_write_cstr(1, "walking_graph_phase: collect_tile_segments\n");
+    if (pbf_stream_entities(pbf_path, &callbacks, &materialize_context, error, error_capacity) != 0 || materialize_context.failed) return -1;
+    rt_write_cstr(1, "walking_way_count: ");
+    rt_write_uint(1, materialize_context.walkable_way_count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "walking_segments: ");
+    rt_write_uint(1, materialize_context.segment_count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "walking_tile_segments: ");
+    rt_write_uint(1, materialize_context.inserted_segment_count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "walking_graph_phase: build_tile_graphs\n");
+    if (build_tile_graphs_from_segments(tiles, &coords, &tile_segments) != 0) return -1;
+    rt_free(coords.items);
+    rt_free(coords.slots);
+    rt_free(tile_segments.items);
+    return 0;
+}
+
 static int on_node_address(void *user, const PbfNode *node) {
     RoutePackAddressCollectContext *context = (RoutePackAddressCollectContext *)user;
     RoutePackAddressFields fields;
@@ -506,22 +1308,31 @@ static int on_node_address(void *user, const PbfNode *node) {
     (void)route_pack_coord_to_tile(lat_e7, lon_e7, context->origin_lat_e7, context->origin_lon_e7, context->meters_per_degree_lon, context->tile_size_m, &tile_x, &tile_y, &tile_id);
     tile = tile_store_find_by_xy(context->tiles, tile_x, tile_y);
     if (tile != 0 && tile->address_count != 0xffffffffU) tile->address_count += 1U;
-    if (address_store_add(context->addresses, 1U, node->id, 1, lat_e7, lon_e7, tile_id, &fields) != 0) {
+    if (address_store_add(context->addresses, 1U, node->id, 1, lat_e7, lon_e7, tile_id, &fields, 0) != 0) {
         context->failed = 1;
         return -1;
     }
     return 0;
 }
 
-static int on_way_address(void *user, long long id, const PbfTag *tags, unsigned int tag_count) {
+static int on_way_address(void *user, const PbfWay *way) {
     RoutePackAddressCollectContext *context = (RoutePackAddressCollectContext *)user;
     RoutePackAddressFields fields;
+    unsigned int address_index = 0U;
+    unsigned int ref_index;
 
     if (context->failed) return -1;
-    find_address_fields(tags, tag_count, &fields);
-    if (address_store_add(context->addresses, 2U, id, 0, 0, 0, 0ULL, &fields) != 0) {
+    find_address_fields(way->tags, way->tag_count, &fields);
+    if (!address_fields_complete(&fields)) return 0;
+    if (address_store_add(context->addresses, 2U, way->id, 0, 0, 0, 0ULL, &fields, &address_index) != 0) {
         context->failed = 1;
         return -1;
+    }
+    for (ref_index = 0U; ref_index < way->ref_count; ++ref_index) {
+        if (address_store_add_node_ref(context->addresses, way->refs[ref_index], address_index) != 0) {
+            context->failed = 1;
+            return -1;
+        }
     }
     return 0;
 }
@@ -532,18 +1343,60 @@ static int on_relation_address(void *user, long long id, const PbfTag *tags, uns
 
     if (context->failed) return -1;
     find_address_fields(tags, tag_count, &fields);
-    if (address_store_add(context->addresses, 3U, id, 0, 0, 0, 0ULL, &fields) != 0) {
+    if (address_store_add(context->addresses, 3U, id, 0, 0, 0, 0ULL, &fields, 0) != 0) {
         context->failed = 1;
         return -1;
     }
     return 0;
 }
 
+static int compare_address_node_ref_by_id(const void *left_ptr, const void *right_ptr) {
+    const RoutePackAddressNodeRef *left = (const RoutePackAddressNodeRef *)left_ptr;
+    const RoutePackAddressNodeRef *right = (const RoutePackAddressNodeRef *)right_ptr;
+
+    if (left->node_id < right->node_id) return -1;
+    if (left->node_id > right->node_id) return 1;
+    if (left->address_index < right->address_index) return -1;
+    if (left->address_index > right->address_index) return 1;
+    return 0;
+}
+
+static unsigned int lower_bound_address_node_ref(const RoutePackAddressStore *store, long long node_id) {
+    unsigned int low = 0U;
+    unsigned int high = store->node_ref_count;
+
+    while (low < high) {
+        unsigned int mid = low + (high - low) / 2U;
+        if (store->node_refs[mid].node_id < node_id) low = mid + 1U;
+        else high = mid;
+    }
+    return low;
+}
+
+static int on_node_address_coord(void *user, const PbfNode *node) {
+    RoutePackAddressResolveContext *context = (RoutePackAddressResolveContext *)user;
+    RoutePackAddressStore *store = context->addresses;
+    unsigned int ref_index;
+
+    if (context->failed) return -1;
+    ref_index = lower_bound_address_node_ref(store, node->id);
+    while (ref_index < store->node_ref_count && store->node_refs[ref_index].node_id == node->id) {
+        RoutePackAddressRecord *record = store->records + store->node_refs[ref_index].address_index;
+        record->lat_nano_sum += node->lat_nano;
+        record->lon_nano_sum += node->lon_nano;
+        if (record->coord_ref_count != 0xffffffffU) record->coord_ref_count += 1U;
+        ref_index += 1U;
+    }
+    return 0;
+}
+
 static int collect_addresses(const char *pbf_path, RoutePackAddressStore *addresses, RoutePackTileStore *tiles, const RoutePackBounds *bounds, unsigned int tile_size_m, char *error, size_t error_capacity) {
     RoutePackAddressCollectContext context;
+    RoutePackAddressResolveContext resolve_context;
     PbfStreamCallbacks callbacks;
     int origin_lat_e7 = 0;
     int origin_lon_e7 = 0;
+    unsigned int address_index;
 
     rt_memset(addresses, 0, sizeof(*addresses));
     if (bounds->have_bounds) {
@@ -560,10 +1413,43 @@ static int collect_addresses(const char *pbf_path, RoutePackAddressStore *addres
     rt_memset(&callbacks, 0, sizeof(callbacks));
     callbacks.flags = PBF_STREAM_SKIP_RELATION_ROLES;
     callbacks.node = on_node_address;
-    callbacks.way_tags = on_way_address;
+    callbacks.way = on_way_address;
     callbacks.relation_tags = on_relation_address;
     if (pbf_stream_entities(pbf_path, &callbacks, &context, error, error_capacity) != 0) return -1;
-    return context.failed ? -1 : 0;
+    if (context.failed) return -1;
+
+    if (addresses->node_ref_count != 0U) {
+        rt_sort(addresses->node_refs, addresses->node_ref_count, sizeof(*addresses->node_refs), compare_address_node_ref_by_id);
+        rt_memset(&resolve_context, 0, sizeof(resolve_context));
+        resolve_context.addresses = addresses;
+        rt_memset(&callbacks, 0, sizeof(callbacks));
+        callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_WAY_TAGS | PBF_STREAM_SKIP_RELATION_ROLES;
+        callbacks.node = on_node_address_coord;
+        if (pbf_stream_entities(pbf_path, &callbacks, &resolve_context, error, error_capacity) != 0) return -1;
+        if (resolve_context.failed) return -1;
+    }
+
+    for (address_index = 0U; address_index < addresses->count; ++address_index) {
+        RoutePackAddressRecord *record = addresses->records + address_index;
+        if ((record->flags & 1U) == 0U && record->coord_ref_count != 0U) {
+            int lat_e7;
+            int lon_e7;
+            int tile_x;
+            int tile_y;
+            RoutePackTile *tile;
+            long long lat_nano = record->lat_nano_sum / (long long)record->coord_ref_count;
+            long long lon_nano = record->lon_nano_sum / (long long)record->coord_ref_count;
+            if (int32_from_nano_e7(lat_nano, &lat_e7) == 0 && int32_from_nano_e7(lon_nano, &lon_e7) == 0) {
+                record->lat_e7 = lat_e7;
+                record->lon_e7 = lon_e7;
+                record->flags |= 1U;
+                (void)route_pack_coord_to_tile(lat_e7, lon_e7, origin_lat_e7, origin_lon_e7, meters_per_degree_lon_from_lat_e7(origin_lat_e7), tile_size_m, &tile_x, &tile_y, &record->tile_id);
+                tile = tile_store_find_by_xy(tiles, tile_x, tile_y);
+                if (tile != 0 && tile->address_count != 0xffffffffU) tile->address_count += 1U;
+            }
+        }
+    }
+    return 0;
 }
 
 static void write_section_record(
@@ -607,21 +1493,132 @@ static void write_tile_payload_directory_record(unsigned char *out, unsigned int
     write_u32_le(out + 28U, record_size);
 }
 
-static void build_empty_tile_payload(unsigned char out[OSMRTE_EMPTY_TILE_PAYLOAD_SIZE], unsigned long long tile_id) {
-    unsigned long long directory_offset = OSMRTE_TILE_PAYLOAD_HEADER_SIZE;
-    unsigned long long edge_offsets_offset = OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 4ULL * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE;
-    unsigned long long snap_grid_offset = 256ULL;
+static unsigned int tile_graph_node_count(const RoutePackTile *tile) {
+    RoutePackTileGraph *graph = (RoutePackTileGraph *)tile->graph;
+    return graph == 0 ? 0U : graph->node_count;
+}
 
-    rt_memset(out, 0, OSMRTE_EMPTY_TILE_PAYLOAD_SIZE);
-    write_u64_le(out + 0U, tile_id);
-    write_u32_le(out + 8U, 1U);
-    write_u32_le(out + 16U, 4U);
-    write_u32_le(out + 20U, OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE);
-    write_u64_le(out + 24U, directory_offset);
-    write_tile_payload_directory_record(out + OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 0U * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE, OSMRTE_TILE_TYPE_WALKING_NODES, 0ULL, 0ULL, 0U, 16U);
-    write_tile_payload_directory_record(out + OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 1U * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE, OSMRTE_TILE_TYPE_WALKING_OFFSETS, edge_offsets_offset, 4ULL, 1U, 4U);
-    write_tile_payload_directory_record(out + OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 2U * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE, OSMRTE_TILE_TYPE_WALKING_EDGES, 0ULL, 0ULL, 0U, 20U);
-    write_tile_payload_directory_record(out + OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 3U * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE, OSMRTE_TILE_TYPE_SNAP_GRID, snap_grid_offset, 64ULL, 1U, 64U);
+static unsigned int tile_graph_edge_count(const RoutePackTile *tile) {
+    RoutePackTileGraph *graph = (RoutePackTileGraph *)tile->graph;
+    return graph == 0 ? 0U : graph->edge_count;
+}
+
+static unsigned long long tile_payload_size_for_counts(unsigned int node_count, unsigned int edge_count) {
+    unsigned long long offset = OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 4ULL * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE;
+    offset += (unsigned long long)node_count * 16ULL;
+    offset = align_u64(offset, 8ULL);
+    offset += (unsigned long long)(node_count + 1U) * 4ULL;
+    offset = align_u64(offset, 8ULL);
+    offset += (unsigned long long)edge_count * 20ULL;
+    offset = align_u64(offset, 8ULL);
+    offset += 64ULL;
+    return align_u64(offset, 64ULL);
+}
+
+static int write_tile_payload(int fd, const RoutePackTile *tile) {
+    RoutePackTileGraph *graph = (RoutePackTileGraph *)tile->graph;
+    unsigned int node_count = graph == 0 ? 0U : graph->node_count;
+    unsigned int edge_count = graph == 0 ? 0U : graph->edge_count;
+    unsigned long long nodes_offset = OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 4ULL * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE;
+    unsigned long long nodes_size = (unsigned long long)node_count * 16ULL;
+    unsigned long long offsets_offset = align_u64(nodes_offset + nodes_size, 8ULL);
+    unsigned long long offsets_size = (unsigned long long)(node_count + 1U) * 4ULL;
+    unsigned long long edges_offset = align_u64(offsets_offset + offsets_size, 8ULL);
+    unsigned long long edges_size = (unsigned long long)edge_count * 20ULL;
+    unsigned long long snap_offset = align_u64(edges_offset + edges_size, 8ULL);
+    unsigned long long payload_size = tile_payload_size_for_counts(node_count, edge_count);
+    unsigned char header[OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 4U * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE];
+    unsigned char node_record[16];
+    unsigned char edge_record[20];
+    unsigned char snap_header[64];
+    unsigned int *counts = 0;
+    unsigned int *offsets = 0;
+    unsigned int *cursor = 0;
+    RoutePackTileGraphEdge *ordered_edges = 0;
+    unsigned int index;
+    unsigned long long current_offset;
+
+    rt_memset(header, 0, sizeof(header));
+    write_u64_le(header + 0U, tile->tile_id);
+    write_u32_le(header + 8U, 1U);
+    write_u32_le(header + 16U, 4U);
+    write_u32_le(header + 20U, OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE);
+    write_u64_le(header + 24U, OSMRTE_TILE_PAYLOAD_HEADER_SIZE);
+    write_tile_payload_directory_record(header + OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 0U * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE, OSMRTE_TILE_TYPE_WALKING_NODES, nodes_offset, nodes_size, node_count, 16U);
+    write_tile_payload_directory_record(header + OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 1U * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE, OSMRTE_TILE_TYPE_WALKING_OFFSETS, offsets_offset, offsets_size, node_count + 1U, 4U);
+    write_tile_payload_directory_record(header + OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 2U * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE, OSMRTE_TILE_TYPE_WALKING_EDGES, edges_offset, edges_size, edge_count, 20U);
+    write_tile_payload_directory_record(header + OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 3U * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE, OSMRTE_TILE_TYPE_SNAP_GRID, snap_offset, 64ULL, 1U, 64U);
+    if (rt_write_all(fd, header, sizeof(header)) != 0) return -1;
+    current_offset = sizeof(header);
+
+    if (node_count != 0U) {
+        counts = (unsigned int *)rt_malloc(sizeof(unsigned int) * (node_count + 1U));
+        offsets = (unsigned int *)rt_malloc(sizeof(unsigned int) * (node_count + 1U));
+        cursor = (unsigned int *)rt_malloc(sizeof(unsigned int) * (node_count + 1U));
+        ordered_edges = (RoutePackTileGraphEdge *)rt_malloc(sizeof(*ordered_edges) * edge_count);
+        if (counts == 0 || offsets == 0 || cursor == 0 || (edge_count != 0U && ordered_edges == 0)) return -1;
+        rt_memset(counts, 0, sizeof(unsigned int) * (node_count + 1U));
+        for (index = 0U; index < edge_count; ++index) if (graph->edges[index].from < node_count) counts[graph->edges[index].from] += 1U;
+        offsets[0] = 0U;
+        for (index = 0U; index < node_count; ++index) offsets[index + 1U] = offsets[index] + counts[index];
+        memcpy(cursor, offsets, sizeof(unsigned int) * (node_count + 1U));
+        for (index = 0U; index < edge_count; ++index) {
+            unsigned int from = graph->edges[index].from;
+            if (from < node_count) ordered_edges[cursor[from]++] = graph->edges[index];
+        }
+    }
+
+    for (index = 0U; index < node_count; ++index) {
+        rt_memset(node_record, 0, sizeof(node_record));
+        write_i32_le(node_record + 0U, graph->nodes[index].lat_e7);
+        write_i32_le(node_record + 4U, graph->nodes[index].lon_e7);
+        write_u32_le(node_record + 8U, 0xffffffffU);
+        if (rt_write_all(fd, node_record, sizeof(node_record)) != 0) return -1;
+    }
+    current_offset += nodes_size;
+    if (current_offset < offsets_offset && write_zero_padding(fd, offsets_offset - current_offset) != 0) return -1;
+    current_offset = offsets_offset;
+    if (node_count == 0U) {
+        unsigned char zero_offset[4];
+        rt_memset(zero_offset, 0, sizeof(zero_offset));
+        if (rt_write_all(fd, zero_offset, sizeof(zero_offset)) != 0) return -1;
+    } else {
+        for (index = 0U; index <= node_count; ++index) {
+            unsigned char offset_record[4];
+            write_u32_le(offset_record, offsets[index]);
+            if (rt_write_all(fd, offset_record, sizeof(offset_record)) != 0) return -1;
+        }
+    }
+    current_offset += offsets_size;
+    if (current_offset < edges_offset && write_zero_padding(fd, edges_offset - current_offset) != 0) return -1;
+    current_offset = edges_offset;
+    for (index = 0U; index < edge_count; ++index) {
+        rt_memset(edge_record, 0, sizeof(edge_record));
+        write_u32_le(edge_record + 0U, ordered_edges[index].to);
+        write_u32_le(edge_record + 4U, ordered_edges[index].meters);
+        write_u32_le(edge_record + 8U, ordered_edges[index].meters);
+        write_u32_le(edge_record + 12U, 0U);
+        write_u32_le(edge_record + 16U, 0U);
+        if (rt_write_all(fd, edge_record, sizeof(edge_record)) != 0) return -1;
+    }
+    current_offset += edges_size;
+    if (current_offset < snap_offset && write_zero_padding(fd, snap_offset - current_offset) != 0) return -1;
+    current_offset = snap_offset;
+    rt_memset(snap_header, 0, sizeof(snap_header));
+    write_u32_le(snap_header + 0U, 1U);
+    write_u32_le(snap_header + 4U, 0U);
+    write_u32_le(snap_header + 8U, 1U);
+    write_u32_le(snap_header + 12U, 1U);
+    write_u32_le(snap_header + 16U, 0U);
+    write_u32_le(snap_header + 20U, 0U);
+    if (rt_write_all(fd, snap_header, sizeof(snap_header)) != 0) return -1;
+    current_offset += sizeof(snap_header);
+    if (current_offset < payload_size && write_zero_padding(fd, payload_size - current_offset) != 0) return -1;
+    rt_free(counts);
+    rt_free(offsets);
+    rt_free(cursor);
+    rt_free(ordered_edges);
+    return 0;
 }
 
 static void write_tile_record(unsigned char out[OSMRTE_TILE_RECORD_SIZE], const RoutePackTile *tile) {
@@ -630,9 +1627,9 @@ static void write_tile_record(unsigned char out[OSMRTE_TILE_RECORD_SIZE], const 
     write_u32_le(out + 8U, 0U);
     write_i32_le(out + 12U, tile->x);
     write_i32_le(out + 16U, tile->y);
-    write_u32_le(out + 20U, 0U);
-    write_u32_le(out + 24U, 0U);
-    write_u32_le(out + 28U, 0U);
+    write_u32_le(out + 20U, tile_graph_node_count(tile));
+    write_u32_le(out + 24U, tile_graph_edge_count(tile));
+    write_u32_le(out + 28U, 1U);
     write_u32_le(out + 32U, 0U);
     write_u32_le(out + 36U, 0U);
     write_u32_le(out + 40U, tile->address_count);
@@ -642,7 +1639,7 @@ static void write_tile_record(unsigned char out[OSMRTE_TILE_RECORD_SIZE], const 
     write_i32_le(out + 56U, tile->max_lon_e7);
     write_i32_le(out + 60U, tile->max_lat_e7);
     write_u64_le(out + 64U, tile->payload_offset);
-    write_u64_le(out + 72U, OSMRTE_EMPTY_TILE_PAYLOAD_SIZE);
+    write_u64_le(out + 72U, tile->payload_size);
     write_u64_le(out + 80U, tile->payload_offset + OSMRTE_TILE_PAYLOAD_HEADER_SIZE);
     write_u32_le(out + 88U, 4U);
     write_u32_le(out + 92U, OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE);
@@ -809,7 +1806,6 @@ static int write_route_pack(
     unsigned char header[OSMRTE_HEADER_SIZE];
     unsigned char section_records[OSMRTE_SECTION_RECORD_SIZE * 3U];
     unsigned char tile_record[OSMRTE_TILE_RECORD_SIZE];
-    unsigned char tile_payload[OSMRTE_EMPTY_TILE_PAYLOAD_SIZE];
     unsigned char address_header[OSMRTE_ADDRESS_SECTION_HEADER_SIZE];
     unsigned char address_record[OSMRTE_ADDRESS_RECORD_SIZE];
     unsigned char empty_string = 0;
@@ -820,21 +1816,26 @@ static int write_route_pack(
     unsigned long long tile_directory_offset = align_u64(after_section_directory, 64ULL);
     unsigned long long tile_directory_size = (unsigned long long)tile_store->count * OSMRTE_TILE_RECORD_SIZE;
     unsigned long long tile_payload_offset = align_u64(tile_directory_offset + tile_directory_size, 64ULL);
-    unsigned long long address_section_offset = align_u64(tile_payload_offset + (unsigned long long)tile_store->count * OSMRTE_EMPTY_TILE_PAYLOAD_SIZE, 64ULL);
+    unsigned long long address_section_offset;
     unsigned long long address_records_size = (unsigned long long)address_store->count * OSMRTE_ADDRESS_RECORD_SIZE;
     unsigned long long address_section_size = have_addresses ? OSMRTE_ADDRESS_SECTION_HEADER_SIZE + address_records_size + (unsigned long long)address_store->string_size : 0ULL;
-    unsigned long long string_table_offset = align_u64(address_section_offset + address_section_size, 64ULL);
+    unsigned long long string_table_offset;
     unsigned long long string_table_size = 1ULL;
-    unsigned long long file_size = string_table_offset + string_table_size;
+    unsigned long long file_size;
     unsigned long long current_offset;
     int output_fd;
     unsigned int tile_index;
     unsigned int address_index;
 
     for (tile_index = 0U; tile_index < tile_store->count; ++tile_index) {
-        tile_store->tiles[tile_index].payload_offset = tile_payload_offset + (unsigned long long)tile_index * OSMRTE_EMPTY_TILE_PAYLOAD_SIZE;
+        tile_store->tiles[tile_index].payload_size = tile_payload_size_for_counts(tile_graph_node_count(tile_store->tiles + tile_index), tile_graph_edge_count(tile_store->tiles + tile_index));
+        tile_store->tiles[tile_index].payload_offset = tile_payload_offset;
+        tile_payload_offset += tile_store->tiles[tile_index].payload_size;
         tile_store->tiles[tile_index].neighbor_mask = compute_neighbor_mask(tile_store, tile_store->tiles + tile_index);
     }
+    address_section_offset = align_u64(tile_payload_offset, 64ULL);
+    string_table_offset = align_u64(address_section_offset + address_section_size, 64ULL);
+    file_size = string_table_offset + string_table_size;
     build_header(
         header,
         summary,
@@ -894,13 +1895,12 @@ static int write_route_pack(
         }
     }
     for (tile_index = 0U; tile_index < tile_store->count; ++tile_index) {
-        build_empty_tile_payload(tile_payload, tile_store->tiles[tile_index].tile_id);
-        if (rt_write_all(output_fd, tile_payload, sizeof(tile_payload)) != 0) {
+        if (write_tile_payload(output_fd, tile_store->tiles + tile_index) != 0) {
             (void)platform_close(output_fd);
             return -1;
         }
     }
-    current_offset = tile_payload_offset + (unsigned long long)tile_store->count * OSMRTE_EMPTY_TILE_PAYLOAD_SIZE;
+    current_offset = tile_payload_offset;
     if (have_addresses) {
         rt_memset(address_header, 0, sizeof(address_header));
         memcpy(address_header, "ADDRIDX1", 8U);
@@ -1004,6 +2004,13 @@ int main(int argc, char **argv) {
         return 1;
     }
     error[0] = '\0';
+    if (collect_walking_graph(pbf_path, &tile_store, &bounds, tile_size_m, error, sizeof(error)) != 0) {
+        rt_write_cstr(2, "osmroutepack: ");
+        rt_write_cstr(2, error[0] == '\0' ? "failed to collect walking graph" : error);
+        rt_write_char(2, '\n');
+        return 1;
+    }
+    error[0] = '\0';
     if (collect_addresses(pbf_path, &address_store, &tile_store, &bounds, tile_size_m, error, sizeof(error)) != 0) {
         rt_write_cstr(2, "osmroutepack: ");
         rt_write_cstr(2, error[0] == '\0' ? "failed to collect addresses" : error);
@@ -1016,7 +2023,7 @@ int main(int argc, char **argv) {
     }
 
     rt_write_cstr(1, "format: OSMRTE01\n");
-    rt_write_cstr(1, "mode: tiled-empty-walking-payloads-addresses\n");
+    rt_write_cstr(1, "mode: tiled-walking-graph-addresses\n");
     rt_write_cstr(1, "output: ");
     rt_write_cstr(1, output_path);
     rt_write_char(1, '\n');
@@ -1038,6 +2045,21 @@ int main(int argc, char **argv) {
     rt_write_cstr(1, "addresses: ");
     rt_write_uint(1, address_store.count);
     rt_write_char(1, '\n');
+    {
+        unsigned int tile_index;
+        unsigned long long graph_nodes = 0ULL;
+        unsigned long long graph_edges = 0ULL;
+        for (tile_index = 0U; tile_index < tile_store.count; ++tile_index) {
+            graph_nodes += tile_graph_node_count(tile_store.tiles + tile_index);
+            graph_edges += tile_graph_edge_count(tile_store.tiles + tile_index);
+        }
+        rt_write_cstr(1, "walking_nodes: ");
+        rt_write_uint(1, graph_nodes);
+        rt_write_char(1, '\n');
+        rt_write_cstr(1, "walking_directed_edges: ");
+        rt_write_uint(1, graph_edges);
+        rt_write_char(1, '\n');
+    }
     rt_write_cstr(1, "tile_size_m: ");
     rt_write_uint(1, tile_size_m);
     rt_write_char(1, '\n');

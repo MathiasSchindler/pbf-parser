@@ -497,6 +497,8 @@ The graph stores directed edges. A bidirectional OSM way segment becomes two dir
 
 Normal directed walking edges are tile-local: `to_local_node` always names a node in the same tile payload. Cross-tile movement is represented by portal records, not by direct adjacency into another tile payload. Query engines that search multiple tiles insert portal records as additional edges in their temporary search state.
 
+Implementation note: the first `osmroutepack` walking-graph writer keeps `to_local_node` tile-local, but represents cross-tile OSM way segments by duplicating that segment into both endpoint tile payloads. `rtewalkroute` then merges duplicate coordinates while loading a small tile neighborhood. This is an interim compatibility path until explicit portal payloads and overlay routing are written.
+
 ## Snapping Index
 
 Anywhere-to-anywhere routing depends on fast snapping to graph edges, not only graph nodes.

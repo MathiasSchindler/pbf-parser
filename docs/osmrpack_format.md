@@ -36,10 +36,12 @@ Inspect a pack header:
 Render from a pack:
 
 ```sh
-./build/freestanding-linux-x86_64/osmrender-rpack OUT.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--exclave-insets] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]
+./build/freestanding-linux-x86_64/osmrender-rpack OUT.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--route-polyline FILE] [--exclave-insets] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]
 ```
 
 If only `--width` or only `--height` is supplied, the renderer derives the missing dimension from the resolved bbox aspect ratio. Supplying both dimensions keeps the exact requested image size.
+
+`--route-polyline FILE` draws a route overlay after the normal map and optional GTFS layers. The file is a plain text polyline with one `lon,lat` WGS84 decimal-degree point per line. The overlay is rendered as a single red route stroke.
 
 For city renders with far-away boundary components, the renderer uses the primary boundary component as the default viewport. `--exclave-insets` renders those distant components in a corner inset without changing the `.rpack` format.
 
@@ -376,7 +378,7 @@ All three runs produced matching high-level pack counts: `places_written=2912`, 
 7. de-duplicates copied features from overlapping tile payloads
 8. collects features intersecting the render bbox
 9. loads the matched place boundary payload, or falls back to sidecar indexes for older packs
-10. draws the configured layers and writes PNG output
+10. draws the configured layers, optional GTFS stops, optional route polyline overlay, and writes PNG output
 
 For `--city`, the renderer draws the selected place boundary as style `11` and can fade pixels outside that boundary without reading the source PBF or sidecar indexes. If a pack predates embedded boundary payloads, node, way, and relation index paths can still be supplied or inferred to resolve the same overlay from sidecar indexes.
 

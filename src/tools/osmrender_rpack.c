@@ -210,6 +210,9 @@ typedef struct {
     unsigned long long gtfs_subway_stops;
     unsigned long long gtfs_ferry_stops;
     unsigned long long gtfs_other_stops;
+    const char *route_polyline_path;
+    unsigned long long route_points_seen;
+    unsigned long long route_segments_drawn;
     unsigned long long features_seen;
     unsigned long long features_skipped;
     unsigned long long features_collected;
@@ -324,7 +327,7 @@ static const RenderLayer render_layers[] = {
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " PACK.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--gtfs DIR] [--exclave-insets] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]\n");
+    rt_write_cstr(2, " PACK.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--gtfs DIR] [--route-polyline FILE] [--exclave-insets] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]\n");
 }
 
 static void write_profile_ms(const char *label, unsigned long long elapsed_ms) {
@@ -2616,6 +2619,92 @@ static void draw_line(RenderContext *context, int x0, int y0, int x1, int y1, co
     }
 }
 
+static int parse_route_polyline_point(const char *line, size_t size, long long *lon_out, long long *lat_out) {
+    size_t comma = size;
+    size_t index;
+
+    while (size > 0U && (line[size - 1U] == '\r' || line[size - 1U] == ' ' || line[size - 1U] == '\t')) size -= 1U;
+    while (size > 0U && (line[0] == ' ' || line[0] == '\t')) { line += 1; size -= 1U; }
+    if (size == 0U) return 0;
+    for (index = 0U; index < size; ++index) {
+        if (line[index] == ',') { comma = index; break; }
+    }
+    if (comma == 0U || comma + 1U >= size) return -1;
+    if (parse_coord_part(line, comma, lon_out) != 0 || parse_coord_part(line + comma + 1U, size - comma - 1U, lat_out) != 0) return -1;
+    return 1;
+}
+
+static void draw_route_overlay_segment(RenderContext *context, long long lon0, long long lat0, long long lon1, long long lat1, const RenderStyle *line_style) {
+    long long x0;
+    long long y0;
+    long long x1;
+    long long y1;
+
+    if (project_point(context, lon0, lat0, &x0, &y0) != 0 || project_point(context, lon1, lat1, &x1, &y1) != 0) return;
+    if (clip_segment(context, &x0, &y0, &x1, &y1)) {
+        draw_line(context, (int)x0, (int)y0, (int)x1, (int)y1, line_style);
+        context->route_segments_drawn += 1ULL;
+    }
+}
+
+static int render_route_polyline_overlay(RenderContext *context) {
+    RenderStyle line_style;
+    char line[160];
+    unsigned char buffer[4096];
+    size_t line_size = 0U;
+    long long prev_lon = 0LL;
+    long long prev_lat = 0LL;
+    int have_prev = 0;
+    int fd;
+
+    if (context->route_polyline_path == 0) return 0;
+    fd = platform_open_read(context->route_polyline_path);
+    if (fd < 0) return -1;
+    rt_memset(&line_style, 0, sizeof(line_style));
+    line_style.red = 220U;
+    line_style.green = 35U;
+    line_style.blue = 45U;
+    line_style.alpha = 255U;
+    line_style.width = 3U;
+    line_style.flags = STYLE_FLAG_LINE;
+    for (;;) {
+        long bytes = platform_read(fd, buffer, sizeof(buffer));
+        size_t index;
+        if (bytes < 0) { (void)platform_close(fd); return -1; }
+        if (bytes == 0) break;
+        for (index = 0U; index < (size_t)bytes; ++index) {
+            if (buffer[index] == '\n') {
+                long long lon;
+                long long lat;
+                int parsed = parse_route_polyline_point(line, line_size, &lon, &lat);
+                if (parsed < 0) { (void)platform_close(fd); return -1; }
+                if (parsed > 0) {
+                    context->route_points_seen += 1ULL;
+                    if (have_prev) draw_route_overlay_segment(context, prev_lon, prev_lat, lon, lat, &line_style);
+                    prev_lon = lon;
+                    prev_lat = lat;
+                    have_prev = 1;
+                }
+                line_size = 0U;
+            } else {
+                if (line_size + 1U >= sizeof(line)) { (void)platform_close(fd); return -1; }
+                line[line_size++] = (char)buffer[index];
+            }
+        }
+    }
+    if (line_size != 0U) {
+        long long lon;
+        long long lat;
+        int parsed = parse_route_polyline_point(line, line_size, &lon, &lat);
+        if (parsed < 0) { (void)platform_close(fd); return -1; }
+        if (parsed > 0) {
+            context->route_points_seen += 1ULL;
+            if (have_prev) draw_route_overlay_segment(context, prev_lon, prev_lat, lon, lat, &line_style);
+        }
+    }
+    return platform_close(fd);
+}
+
 static void sort_intersections(int *values, unsigned int count) {
     unsigned int value_index;
 
@@ -3511,6 +3600,17 @@ static void write_render_summary(const char *out_path, const RenderContext *cont
         rt_write_uint(1, context->gtfs_other_stops);
         rt_write_char(1, '\n');
     }
+    if (context->route_polyline_path != 0) {
+        rt_write_cstr(1, "route_overlay: ");
+        rt_write_cstr(1, context->route_polyline_path);
+        rt_write_char(1, '\n');
+        rt_write_cstr(1, "route_overlay_points: ");
+        rt_write_uint(1, context->route_points_seen);
+        rt_write_char(1, '\n');
+        rt_write_cstr(1, "route_overlay_segments_drawn: ");
+        rt_write_uint(1, context->route_segments_drawn);
+        rt_write_char(1, '\n');
+    }
     rt_write_cstr(1, "render_elapsed_ms: ");
     rt_write_uint(1, elapsed_ms);
     rt_write_char(1, '\n');
@@ -3645,6 +3745,14 @@ int main(int argc, char **argv) {
             }
             context.gtfs_path = argv[argi];
             argi += 1;
+        } else if (rt_strcmp(argv[argi], "--route-polyline") == 0) {
+            argi += 1;
+            if (argi >= argc) {
+                write_usage(program);
+                return 1;
+            }
+            context.route_polyline_path = argv[argi];
+            argi += 1;
         } else if (rt_strcmp(argv[argi], "--no-boundary-fade") == 0) {
             context.boundary_fade = 0;
             argi += 1;
@@ -3767,6 +3875,14 @@ int main(int argc, char **argv) {
             rt_write_cstr(2, "osmrender-rpack: failed while rendering GTFS overlay\n");
             return 1;
         }
+        if (render_route_polyline_overlay(&context) != 0) {
+            rt_free(context.features);
+            rt_free(context.points);
+            rt_free(context.pixels);
+            (void)platform_close(fd);
+            rt_write_cstr(2, "osmrender-rpack: failed while rendering route overlay\n");
+            return 1;
+        }
         draw_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
         elapsed_ms = collect_elapsed_ms + boundary_elapsed_ms + draw_elapsed_ms;
         (void)platform_close(fd);
@@ -3848,6 +3964,14 @@ int main(int argc, char **argv) {
         rt_free(context.pixels);
         (void)platform_close(fd);
         rt_write_cstr(2, "osmrender-rpack: failed while rendering GTFS overlay\n");
+        return 1;
+    }
+    if (render_route_polyline_overlay(&context) != 0) {
+        rt_free(context.features);
+        rt_free(context.points);
+        rt_free(context.pixels);
+        (void)platform_close(fd);
+        rt_write_cstr(2, "osmrender-rpack: failed while rendering route overlay\n");
         return 1;
     }
     draw_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;

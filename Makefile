@@ -75,6 +75,10 @@ MACOS_OSMRTEINFO_SRCS := \
     $(MACOS_RUNTIME_SRCS) \
     src/tools/osmrteinfo.c
 
+MACOS_RTEWALKROUTE_SRCS := \
+    $(MACOS_RUNTIME_SRCS) \
+    src/tools/rtewalkroute.c
+
 MACOS_THREADTEST_SRCS := \
     $(MACOS_RUNTIME_SRCS) \
     src/tools/threadtest.c
@@ -198,6 +202,10 @@ OSMRTEINFO_SRCS := \
     $(RUNTIME_SRCS) \
     src/tools/osmrteinfo.c
 
+RTEWALKROUTE_SRCS := \
+    $(RUNTIME_SRCS) \
+    src/tools/rtewalkroute.c
+
 THREADTEST_SRCS := \
     $(RUNTIME_SRCS) \
     src/platform/linux/thread.c \
@@ -211,11 +219,11 @@ FONTTEST_SRCS := \
 
 .PHONY: all clean threadtest macos-rpack-tools macos-threadtest
 
-all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmwayindex $(BUILD_DIR)/osmindex $(BUILD_DIR)/osmrelindex $(BUILD_DIR)/osmspindex $(BUILD_DIR)/osmaddresses $(BUILD_DIR)/osmrender $(BUILD_DIR)/osmrenderpackv2 $(BUILD_DIR)/osmrpackinfo $(BUILD_DIR)/osmrender-rpack $(BUILD_DIR)/osmwalkroute $(BUILD_DIR)/osmroutepack $(BUILD_DIR)/osmrteinfo $(BUILD_DIR)/threadtest $(BUILD_DIR)/fonttest
+all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmwayindex $(BUILD_DIR)/osmindex $(BUILD_DIR)/osmrelindex $(BUILD_DIR)/osmspindex $(BUILD_DIR)/osmaddresses $(BUILD_DIR)/osmrender $(BUILD_DIR)/osmrenderpackv2 $(BUILD_DIR)/osmrpackinfo $(BUILD_DIR)/osmrender-rpack $(BUILD_DIR)/osmwalkroute $(BUILD_DIR)/osmroutepack $(BUILD_DIR)/osmrteinfo $(BUILD_DIR)/rtewalkroute $(BUILD_DIR)/threadtest $(BUILD_DIR)/fonttest
 
 threadtest: $(BUILD_DIR)/threadtest
 
-macos-rpack-tools: $(MACOS_BUILD_DIR)/osmrenderpackv2 $(MACOS_BUILD_DIR)/osmrpackinfo $(MACOS_BUILD_DIR)/osmrender-rpack $(MACOS_BUILD_DIR)/osmwalkroute $(MACOS_BUILD_DIR)/osmroutepack $(MACOS_BUILD_DIR)/osmrteinfo
+macos-rpack-tools: $(MACOS_BUILD_DIR)/osmrenderpackv2 $(MACOS_BUILD_DIR)/osmrpackinfo $(MACOS_BUILD_DIR)/osmrender-rpack $(MACOS_BUILD_DIR)/osmwalkroute $(MACOS_BUILD_DIR)/osmroutepack $(MACOS_BUILD_DIR)/osmrteinfo $(MACOS_BUILD_DIR)/rtewalkroute
 
 macos-threadtest: $(MACOS_BUILD_DIR)/threadtest
 
@@ -270,6 +278,9 @@ $(BUILD_DIR)/osmroutepack: $(OSMROUTEPACK_SRCS) | $(BUILD_DIR)
 $(BUILD_DIR)/osmrteinfo: $(OSMRTEINFO_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMRTEINFO_SRCS) $(LDFLAGS) -o $@
 
+$(BUILD_DIR)/rtewalkroute: $(RTEWALKROUTE_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(RTEWALKROUTE_SRCS) $(LDFLAGS) -o $@
+
 $(BUILD_DIR)/threadtest: $(THREADTEST_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(THREADTEST_SRCS) $(LDFLAGS) -o $@
 
@@ -293,6 +304,9 @@ $(MACOS_BUILD_DIR)/osmroutepack: $(MACOS_OSMROUTEPACK_SRCS) | $(MACOS_BUILD_DIR)
 
 $(MACOS_BUILD_DIR)/osmrteinfo: $(MACOS_OSMRTEINFO_SRCS) | $(MACOS_BUILD_DIR)
 	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_OSMRTEINFO_SRCS) $(MACOS_LDFLAGS) -o $@
+
+$(MACOS_BUILD_DIR)/rtewalkroute: $(MACOS_RTEWALKROUTE_SRCS) | $(MACOS_BUILD_DIR)
+	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_RTEWALKROUTE_SRCS) $(MACOS_LDFLAGS) -o $@
 
 $(MACOS_BUILD_DIR)/threadtest: $(MACOS_THREADTEST_SRCS) | $(MACOS_BUILD_DIR)
 	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_THREADTEST_SRCS) $(MACOS_LDFLAGS) -o $@
