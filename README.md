@@ -22,6 +22,7 @@ The repository currently provides:
 - `osmrender-rpack`, which renders PNGs from `.rpack` files using `--city` or `--bbox` without scanning the source PBF.
 - `osmwalkroute`, which finds a walking route between two street addresses and can compare that result against a first-pass single-leg GTFS transit option for a departure time.
 - `osmroutepack`, an initial `OSMRTE01` route-pack converter that writes the binary container, source counts, metric tile metadata, bounds, sorted tile directory records, empty per-tile walking payload scaffolds, and a string-table section. It is not routeable yet; tiled walking graph and transit payload generation are the next phases.
+- `osmrteinfo`, which inspects `OSMRTE01` route-pack files, prints header and section metadata, checks whether address and GTFS sections are present, and can look up the route tile for a latitude/longitude pair.
 - `threadtest`, a small validation tool for the Linux nolibc threading layer.
 - `fonttest`, a small smoke tool for the vendored TrueType renderer used by future map labels.
 
@@ -156,7 +157,22 @@ build/freestanding-macos-arm64/osmroutepack --tile-size-m 4000 --threads 2 \
 	data/brandenburg-260525.osm.pbf build/brandenburg.rte
 ```
 
-This first milestone writes an `OSMRTE01` file with real metric route tiles and empty walking payload scaffolds. It validates the binary header, section layout, tile directory, and tile payload layout before the heavier builder work fills tiled walking CSR arrays, snap grids, address dictionaries, GTFS route-pattern arrays, and service-day bitsets. The target format is documented in `docs/OSMRTE01.md`.
+This milestone writes an `OSMRTE01` file with real metric route tiles, empty walking payload scaffolds, and a first global address section for exact street/house lookup. It validates the binary header, section layout, tile directory, tile payload layout, and address-record access before the heavier builder work fills tiled walking CSR arrays, snap grids, optimized address dictionaries, GTFS route-pattern arrays, and service-day bitsets. The target format is documented in `docs/OSMRTE01.md`.
+
+Inspect a generated route pack before routing payloads are added:
+
+```sh
+make -B build/freestanding-macos-arm64/osmrteinfo
+build/freestanding-macos-arm64/osmrteinfo build/brandenburg-tiles.rte --sections
+build/freestanding-macos-arm64/osmrteinfo build/brandenburg-tiles.rte \
+	--address "Friedrich-Engels-Strasse 22"
+build/freestanding-macos-arm64/osmrteinfo build/brandenburg-tiles.rte \
+	--address "Hermann-Mattern-Promenade 25, Potsdam"
+build/freestanding-macos-arm64/osmrteinfo build/brandenburg-tiles.rte \
+	--tile 52.3906,13.0645
+```
+
+The current tiled milestone should report `addresses_present: yes` and `gtfs_present: no`. Address lookup does not require a tile coordinate; `--tile` is only a low-level tile-directory probe. Address queries use `street house` and may add `, city/suburb/postcode` to disambiguate. The inspector folds `Straße` and `Strasse` together for lookup. GTFS data still comes from the separate `data/GTFS` directory in the experimental `osmwalkroute` path; it is not embedded in `build/brandenburg-tiles.rte` yet.
 
 ## Fonts
 

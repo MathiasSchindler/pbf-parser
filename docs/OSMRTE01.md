@@ -572,6 +572,8 @@ Records should be sorted by `(city_string_id, street_string_id, house_string_id)
 
 For address routing, the query engine resolves the address record, then snaps the stored coordinate to the nearest edge or uses `nearest_edge_ref` as a strong hint.
 
+Current converter milestone: section `0x0400` may contain a temporary global address scan payload before the optimized tile-local dictionary above is implemented. The payload begins with a 64-byte `ADDRIDX1` header, followed by 80-byte records and a local UTF-8 string blob. Records store source entity type, source ID, optional node coordinate, tile ID, and offsets/sizes for state, city, suburb, street, house number, and postcode. This is intended for verifying address availability and reader plumbing; it is not the final hot-path address index.
+
 ## Portals And Cross-Tile Walking
 
 Portal records link local walking graphs across tile boundaries and feed optional overlay routing.

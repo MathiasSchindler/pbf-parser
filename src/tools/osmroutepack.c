@@ -10,10 +10,13 @@
 #define OSMRTE_EMPTY_TILE_PAYLOAD_SIZE 320U
 #define OSMRTE_SECTION_STRING_TABLE 0x0100U
 #define OSMRTE_SECTION_TILE_DIRECTORY 0x0200U
+#define OSMRTE_SECTION_ADDRESS_DICTIONARIES 0x0400U
 #define OSMRTE_SECTION_FLAG_REQUIRED 1U
 #define OSMRTE_SECTION_FLAG_HOT_QUERY_PATH 4U
 #define OSMRTE_SECTION_FLAG_GLOBAL_PAYLOAD 16U
 #define OSMRTE_DEFAULT_TILE_SIZE_M 4000U
+#define OSMRTE_ADDRESS_SECTION_HEADER_SIZE 64U
+#define OSMRTE_ADDRESS_RECORD_SIZE 80U
 #define OSMRTE_TILE_TYPE_WALKING_NODES 0x1000U
 #define OSMRTE_TILE_TYPE_WALKING_OFFSETS 0x1001U
 #define OSMRTE_TILE_TYPE_WALKING_EDGES 0x1002U
@@ -37,6 +40,7 @@ typedef struct {
     int max_lat_e7;
     int max_lon_e7;
     unsigned int source_node_count;
+    unsigned int address_count;
     unsigned long long payload_offset;
     unsigned long long neighbor_mask;
 } RoutePackTile;
@@ -63,6 +67,61 @@ typedef struct {
     unsigned int meters_per_degree_lon;
     int failed;
 } RoutePackTileCollectContext;
+
+typedef struct {
+    PbfText state;
+    PbfText city;
+    PbfText suburb;
+    PbfText street;
+    PbfText housenumber;
+    PbfText postcode;
+    int has_state;
+    int has_city;
+    int has_suburb;
+    int has_street;
+    int has_housenumber;
+    int has_postcode;
+} RoutePackAddressFields;
+
+typedef struct {
+    unsigned int entity_type;
+    unsigned int flags;
+    long long id;
+    int lat_e7;
+    int lon_e7;
+    unsigned long long tile_id;
+    unsigned int state_offset;
+    unsigned int state_size;
+    unsigned int city_offset;
+    unsigned int city_size;
+    unsigned int suburb_offset;
+    unsigned int suburb_size;
+    unsigned int street_offset;
+    unsigned int street_size;
+    unsigned int housenumber_offset;
+    unsigned int housenumber_size;
+    unsigned int postcode_offset;
+    unsigned int postcode_size;
+} RoutePackAddressRecord;
+
+typedef struct {
+    RoutePackAddressRecord *records;
+    unsigned int count;
+    unsigned int capacity;
+    char *strings;
+    unsigned int string_size;
+    unsigned int string_capacity;
+} RoutePackAddressStore;
+
+typedef struct {
+    RoutePackAddressStore *addresses;
+    RoutePackTileStore *tiles;
+    int origin_lat_e7;
+    int origin_lon_e7;
+    unsigned int tile_size_m;
+    unsigned int meters_per_degree_lon;
+    int failed;
+} RoutePackAddressCollectContext;
 
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
@@ -273,6 +332,104 @@ static int tile_store_add_node(RoutePackTileStore *store, int x, int y, int lat_
     return 0;
 }
 
+static RoutePackTile *tile_store_find_by_xy(RoutePackTileStore *store, int x, int y) {
+    unsigned long long tile_id = route_tile_id(x, y);
+    unsigned int slot_index;
+
+    if (store->slot_capacity == 0U) return 0;
+    slot_index = (unsigned int)(hash_tile_id(tile_id) & (unsigned long long)(store->slot_capacity - 1U));
+    while (store->slots[slot_index].used) {
+        if (store->slots[slot_index].tile_id == tile_id) return store->tiles + store->slots[slot_index].index;
+        slot_index = (slot_index + 1U) & (store->slot_capacity - 1U);
+    }
+    return 0;
+}
+
+static int text_equals_cstr(PbfText text, const char *value) {
+    size_t value_size = rt_strlen(value);
+
+    return text.size == value_size && memcmp(text.data, value, value_size) == 0;
+}
+
+static void find_address_fields(const PbfTag *tags, unsigned int tag_count, RoutePackAddressFields *fields) {
+    unsigned int index;
+
+    rt_memset(fields, 0, sizeof(*fields));
+    for (index = 0U; index < tag_count; ++index) {
+        if (!fields->has_state && text_equals_cstr(tags[index].key, "addr:state")) { fields->state = tags[index].value; fields->has_state = 1; }
+        else if (!fields->has_city && text_equals_cstr(tags[index].key, "addr:city")) { fields->city = tags[index].value; fields->has_city = 1; }
+        else if (!fields->has_suburb && text_equals_cstr(tags[index].key, "addr:suburb")) { fields->suburb = tags[index].value; fields->has_suburb = 1; }
+        else if (!fields->has_street && text_equals_cstr(tags[index].key, "addr:street")) { fields->street = tags[index].value; fields->has_street = 1; }
+        else if (!fields->has_housenumber && text_equals_cstr(tags[index].key, "addr:housenumber")) { fields->housenumber = tags[index].value; fields->has_housenumber = 1; }
+        else if (!fields->has_postcode && text_equals_cstr(tags[index].key, "addr:postcode")) { fields->postcode = tags[index].value; fields->has_postcode = 1; }
+    }
+}
+
+static int address_fields_complete(const RoutePackAddressFields *fields) {
+    return fields->has_street && fields->has_housenumber && fields->has_postcode;
+}
+
+static int address_store_reserve_records(RoutePackAddressStore *store, unsigned int needed_count) {
+    unsigned int new_capacity;
+    RoutePackAddressRecord *new_records;
+
+    if (needed_count <= store->capacity) return 0;
+    new_capacity = store->capacity == 0U ? 65536U : store->capacity * 2U;
+    while (new_capacity < needed_count) new_capacity *= 2U;
+    new_records = (RoutePackAddressRecord *)rt_realloc(store->records, sizeof(*new_records) * new_capacity);
+    if (new_records == 0) return -1;
+    store->records = new_records;
+    store->capacity = new_capacity;
+    return 0;
+}
+
+static int address_store_reserve_strings(RoutePackAddressStore *store, unsigned int needed_size) {
+    unsigned int new_capacity;
+    char *new_strings;
+
+    if (needed_size <= store->string_capacity) return 0;
+    new_capacity = store->string_capacity == 0U ? 1048576U : store->string_capacity * 2U;
+    while (new_capacity < needed_size) new_capacity *= 2U;
+    new_strings = (char *)rt_realloc(store->strings, new_capacity);
+    if (new_strings == 0) return -1;
+    store->strings = new_strings;
+    store->string_capacity = new_capacity;
+    return 0;
+}
+
+static int address_store_add_text(RoutePackAddressStore *store, PbfText text, unsigned int *offset_out, unsigned int *size_out) {
+    if (text.size > 0xffffffffU || store->string_size > 0xffffffffU - (unsigned int)text.size) return -1;
+    if (address_store_reserve_strings(store, store->string_size + (unsigned int)text.size) != 0) return -1;
+    *offset_out = store->string_size;
+    *size_out = (unsigned int)text.size;
+    if (text.size != 0U) memcpy(store->strings + store->string_size, text.data, text.size);
+    store->string_size += (unsigned int)text.size;
+    return 0;
+}
+
+static int address_store_add(RoutePackAddressStore *store, unsigned int entity_type, long long id, int has_coord, int lat_e7, int lon_e7, unsigned long long tile_id, const RoutePackAddressFields *fields) {
+    RoutePackAddressRecord *record;
+
+    if (!address_fields_complete(fields)) return 0;
+    if (address_store_reserve_records(store, store->count + 1U) != 0) return -1;
+    record = store->records + store->count;
+    rt_memset(record, 0, sizeof(*record));
+    record->entity_type = entity_type;
+    record->flags = has_coord ? 1U : 0U;
+    record->id = id;
+    record->lat_e7 = has_coord ? lat_e7 : 0;
+    record->lon_e7 = has_coord ? lon_e7 : 0;
+    record->tile_id = tile_id;
+    if (address_store_add_text(store, fields->state, &record->state_offset, &record->state_size) != 0) return -1;
+    if (address_store_add_text(store, fields->city, &record->city_offset, &record->city_size) != 0) return -1;
+    if (address_store_add_text(store, fields->suburb, &record->suburb_offset, &record->suburb_size) != 0) return -1;
+    if (address_store_add_text(store, fields->street, &record->street_offset, &record->street_size) != 0) return -1;
+    if (address_store_add_text(store, fields->housenumber, &record->housenumber_offset, &record->housenumber_size) != 0) return -1;
+    if (address_store_add_text(store, fields->postcode, &record->postcode_offset, &record->postcode_size) != 0) return -1;
+    store->count += 1U;
+    return 0;
+}
+
 static int on_node_tile(void *user, const PbfNode *node) {
     RoutePackTileCollectContext *context = (RoutePackTileCollectContext *)user;
     int lat_e7;
@@ -320,6 +477,95 @@ static int collect_tiles(const char *pbf_path, RoutePackTileStore *store, const 
     return tile_store_rehash(store, store->slot_capacity == 0U ? 1024U : store->slot_capacity);
 }
 
+static int route_pack_coord_to_tile(int lat_e7, int lon_e7, int origin_lat_e7, int origin_lon_e7, unsigned int meters_per_degree_lon, unsigned int tile_size_m, int *tile_x_out, int *tile_y_out, unsigned long long *tile_id_out) {
+    long long metric_x_m = ((long long)(lon_e7 - origin_lon_e7) * (long long)meters_per_degree_lon) / 10000000LL;
+    long long metric_y_m = ((long long)(lat_e7 - origin_lat_e7) * 111320LL) / 10000000LL;
+    int tile_x = floor_div_ll(metric_x_m, (long long)tile_size_m);
+    int tile_y = floor_div_ll(metric_y_m, (long long)tile_size_m);
+
+    *tile_x_out = tile_x;
+    *tile_y_out = tile_y;
+    *tile_id_out = route_tile_id(tile_x, tile_y);
+    return 0;
+}
+
+static int on_node_address(void *user, const PbfNode *node) {
+    RoutePackAddressCollectContext *context = (RoutePackAddressCollectContext *)user;
+    RoutePackAddressFields fields;
+    RoutePackTile *tile;
+    int lat_e7;
+    int lon_e7;
+    int tile_x;
+    int tile_y;
+    unsigned long long tile_id;
+
+    if (context->failed) return -1;
+    find_address_fields(node->tags, node->tag_count, &fields);
+    if (!address_fields_complete(&fields)) return 0;
+    if (int32_from_nano_e7(node->lat_nano, &lat_e7) != 0 || int32_from_nano_e7(node->lon_nano, &lon_e7) != 0) return 0;
+    (void)route_pack_coord_to_tile(lat_e7, lon_e7, context->origin_lat_e7, context->origin_lon_e7, context->meters_per_degree_lon, context->tile_size_m, &tile_x, &tile_y, &tile_id);
+    tile = tile_store_find_by_xy(context->tiles, tile_x, tile_y);
+    if (tile != 0 && tile->address_count != 0xffffffffU) tile->address_count += 1U;
+    if (address_store_add(context->addresses, 1U, node->id, 1, lat_e7, lon_e7, tile_id, &fields) != 0) {
+        context->failed = 1;
+        return -1;
+    }
+    return 0;
+}
+
+static int on_way_address(void *user, long long id, const PbfTag *tags, unsigned int tag_count) {
+    RoutePackAddressCollectContext *context = (RoutePackAddressCollectContext *)user;
+    RoutePackAddressFields fields;
+
+    if (context->failed) return -1;
+    find_address_fields(tags, tag_count, &fields);
+    if (address_store_add(context->addresses, 2U, id, 0, 0, 0, 0ULL, &fields) != 0) {
+        context->failed = 1;
+        return -1;
+    }
+    return 0;
+}
+
+static int on_relation_address(void *user, long long id, const PbfTag *tags, unsigned int tag_count) {
+    RoutePackAddressCollectContext *context = (RoutePackAddressCollectContext *)user;
+    RoutePackAddressFields fields;
+
+    if (context->failed) return -1;
+    find_address_fields(tags, tag_count, &fields);
+    if (address_store_add(context->addresses, 3U, id, 0, 0, 0, 0ULL, &fields) != 0) {
+        context->failed = 1;
+        return -1;
+    }
+    return 0;
+}
+
+static int collect_addresses(const char *pbf_path, RoutePackAddressStore *addresses, RoutePackTileStore *tiles, const RoutePackBounds *bounds, unsigned int tile_size_m, char *error, size_t error_capacity) {
+    RoutePackAddressCollectContext context;
+    PbfStreamCallbacks callbacks;
+    int origin_lat_e7 = 0;
+    int origin_lon_e7 = 0;
+
+    rt_memset(addresses, 0, sizeof(*addresses));
+    if (bounds->have_bounds) {
+        (void)int32_from_nano_e7((bounds->min_lat_nano + bounds->max_lat_nano) / 2LL, &origin_lat_e7);
+        (void)int32_from_nano_e7((bounds->min_lon_nano + bounds->max_lon_nano) / 2LL, &origin_lon_e7);
+    }
+    rt_memset(&context, 0, sizeof(context));
+    context.addresses = addresses;
+    context.tiles = tiles;
+    context.origin_lat_e7 = origin_lat_e7;
+    context.origin_lon_e7 = origin_lon_e7;
+    context.tile_size_m = tile_size_m;
+    context.meters_per_degree_lon = meters_per_degree_lon_from_lat_e7(origin_lat_e7);
+    rt_memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.flags = PBF_STREAM_SKIP_RELATION_ROLES;
+    callbacks.node = on_node_address;
+    callbacks.way_tags = on_way_address;
+    callbacks.relation_tags = on_relation_address;
+    if (pbf_stream_entities(pbf_path, &callbacks, &context, error, error_capacity) != 0) return -1;
+    return context.failed ? -1 : 0;
+}
+
 static void write_section_record(
     unsigned char *out,
     unsigned int type,
@@ -337,6 +583,18 @@ static void write_section_record(
     write_u64_le(out + 24U, size);
     write_u64_le(out + 32U, record_count);
     write_u32_le(out + 40U, record_size);
+}
+
+static int write_zero_padding(int fd, unsigned long long size) {
+    unsigned char zeros[64];
+
+    rt_memset(zeros, 0, sizeof(zeros));
+    while (size != 0ULL) {
+        size_t chunk = size > sizeof(zeros) ? sizeof(zeros) : (size_t)size;
+        if (rt_write_all(fd, zeros, chunk) != 0) return -1;
+        size -= (unsigned long long)chunk;
+    }
+    return 0;
 }
 
 static void write_tile_payload_directory_record(unsigned char *out, unsigned int type, unsigned long long relative_offset, unsigned long long size, unsigned int record_count, unsigned int record_size) {
@@ -377,7 +635,7 @@ static void write_tile_record(unsigned char out[OSMRTE_TILE_RECORD_SIZE], const 
     write_u32_le(out + 28U, 0U);
     write_u32_le(out + 32U, 0U);
     write_u32_le(out + 36U, 0U);
-    write_u32_le(out + 40U, 0U);
+    write_u32_le(out + 40U, tile->address_count);
     write_u32_le(out + 44U, 0U);
     write_i32_le(out + 48U, tile->min_lon_e7);
     write_i32_le(out + 52U, tile->min_lat_e7);
@@ -389,6 +647,28 @@ static void write_tile_record(unsigned char out[OSMRTE_TILE_RECORD_SIZE], const 
     write_u32_le(out + 88U, 4U);
     write_u32_le(out + 92U, OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE);
     write_u64_le(out + 96U, tile->neighbor_mask);
+}
+
+static void write_address_record(unsigned char out[OSMRTE_ADDRESS_RECORD_SIZE], const RoutePackAddressRecord *record) {
+    rt_memset(out, 0, OSMRTE_ADDRESS_RECORD_SIZE);
+    write_u32_le(out + 0U, record->entity_type);
+    write_u32_le(out + 4U, record->flags);
+    write_i64_le(out + 8U, record->id);
+    write_i32_le(out + 16U, record->lat_e7);
+    write_i32_le(out + 20U, record->lon_e7);
+    write_u64_le(out + 24U, record->tile_id);
+    write_u32_le(out + 32U, record->state_offset);
+    write_u32_le(out + 36U, record->state_size);
+    write_u32_le(out + 40U, record->city_offset);
+    write_u32_le(out + 44U, record->city_size);
+    write_u32_le(out + 48U, record->suburb_offset);
+    write_u32_le(out + 52U, record->suburb_size);
+    write_u32_le(out + 56U, record->street_offset);
+    write_u32_le(out + 60U, record->street_size);
+    write_u32_le(out + 64U, record->housenumber_offset);
+    write_u32_le(out + 68U, record->housenumber_size);
+    write_u32_le(out + 72U, record->postcode_offset);
+    write_u32_le(out + 76U, record->postcode_size);
 }
 
 static int tile_store_has_xy(const RoutePackTileStore *store, int x, int y) {
@@ -523,24 +803,33 @@ static int write_route_pack(
     const PbfSummary *summary,
     const RoutePackBounds *bounds,
     RoutePackTileStore *tile_store,
+    const RoutePackAddressStore *address_store,
     unsigned int tile_size_m
 ) {
     unsigned char header[OSMRTE_HEADER_SIZE];
-    unsigned char section_records[OSMRTE_SECTION_RECORD_SIZE * 2U];
+    unsigned char section_records[OSMRTE_SECTION_RECORD_SIZE * 3U];
     unsigned char tile_record[OSMRTE_TILE_RECORD_SIZE];
     unsigned char tile_payload[OSMRTE_EMPTY_TILE_PAYLOAD_SIZE];
+    unsigned char address_header[OSMRTE_ADDRESS_SECTION_HEADER_SIZE];
+    unsigned char address_record[OSMRTE_ADDRESS_RECORD_SIZE];
     unsigned char empty_string = 0;
     unsigned long long section_directory_offset = OSMRTE_HEADER_SIZE;
-    unsigned int section_count = 2U;
+    unsigned int have_addresses = address_store->count != 0U ? 1U : 0U;
+    unsigned int section_count = have_addresses ? 3U : 2U;
     unsigned long long after_section_directory = section_directory_offset + (unsigned long long)section_count * OSMRTE_SECTION_RECORD_SIZE;
     unsigned long long tile_directory_offset = align_u64(after_section_directory, 64ULL);
     unsigned long long tile_directory_size = (unsigned long long)tile_store->count * OSMRTE_TILE_RECORD_SIZE;
     unsigned long long tile_payload_offset = align_u64(tile_directory_offset + tile_directory_size, 64ULL);
-    unsigned long long string_table_offset = align_u64(tile_payload_offset + (unsigned long long)tile_store->count * OSMRTE_EMPTY_TILE_PAYLOAD_SIZE, 64ULL);
+    unsigned long long address_section_offset = align_u64(tile_payload_offset + (unsigned long long)tile_store->count * OSMRTE_EMPTY_TILE_PAYLOAD_SIZE, 64ULL);
+    unsigned long long address_records_size = (unsigned long long)address_store->count * OSMRTE_ADDRESS_RECORD_SIZE;
+    unsigned long long address_section_size = have_addresses ? OSMRTE_ADDRESS_SECTION_HEADER_SIZE + address_records_size + (unsigned long long)address_store->string_size : 0ULL;
+    unsigned long long string_table_offset = align_u64(address_section_offset + address_section_size, 64ULL);
     unsigned long long string_table_size = 1ULL;
     unsigned long long file_size = string_table_offset + string_table_size;
+    unsigned long long current_offset;
     int output_fd;
     unsigned int tile_index;
+    unsigned int address_index;
 
     for (tile_index = 0U; tile_index < tile_store->count; ++tile_index) {
         tile_store->tiles[tile_index].payload_offset = tile_payload_offset + (unsigned long long)tile_index * OSMRTE_EMPTY_TILE_PAYLOAD_SIZE;
@@ -578,11 +867,22 @@ static int write_route_pack(
         0ULL,
         OSMRTE_TILE_RECORD_SIZE
     );
+    if (have_addresses) {
+        write_section_record(
+            section_records + 2U * OSMRTE_SECTION_RECORD_SIZE,
+            OSMRTE_SECTION_ADDRESS_DICTIONARIES,
+            OSMRTE_SECTION_FLAG_GLOBAL_PAYLOAD,
+            address_section_offset,
+            address_section_size,
+            address_store->count,
+            OSMRTE_ADDRESS_RECORD_SIZE
+        );
+    }
 
     output_fd = platform_open_write(output_path, 0644U);
     if (output_fd < 0) return -1;
     if (rt_write_all(output_fd, header, sizeof(header)) != 0 ||
-        rt_write_all(output_fd, section_records, sizeof(section_records)) != 0) {
+        rt_write_all(output_fd, section_records, (size_t)section_count * OSMRTE_SECTION_RECORD_SIZE) != 0) {
         (void)platform_close(output_fd);
         return -1;
     }
@@ -600,6 +900,37 @@ static int write_route_pack(
             return -1;
         }
     }
+    current_offset = tile_payload_offset + (unsigned long long)tile_store->count * OSMRTE_EMPTY_TILE_PAYLOAD_SIZE;
+    if (have_addresses) {
+        rt_memset(address_header, 0, sizeof(address_header));
+        memcpy(address_header, "ADDRIDX1", 8U);
+        write_u32_le(address_header + 8U, 1U);
+        write_u32_le(address_header + 12U, OSMRTE_ADDRESS_SECTION_HEADER_SIZE);
+        write_u64_le(address_header + 16U, address_store->count);
+        write_u32_le(address_header + 24U, OSMRTE_ADDRESS_RECORD_SIZE);
+        write_u32_le(address_header + 28U, address_store->string_size);
+        write_u64_le(address_header + 32U, OSMRTE_ADDRESS_SECTION_HEADER_SIZE + address_records_size);
+        if (rt_write_all(output_fd, address_header, sizeof(address_header)) != 0) {
+            (void)platform_close(output_fd);
+            return -1;
+        }
+        for (address_index = 0U; address_index < address_store->count; ++address_index) {
+            write_address_record(address_record, address_store->records + address_index);
+            if (rt_write_all(output_fd, address_record, sizeof(address_record)) != 0) {
+                (void)platform_close(output_fd);
+                return -1;
+            }
+        }
+        if (address_store->string_size != 0U && rt_write_all(output_fd, address_store->strings, address_store->string_size) != 0) {
+            (void)platform_close(output_fd);
+            return -1;
+        }
+        current_offset = address_section_offset + address_section_size;
+    }
+    if (current_offset < string_table_offset && write_zero_padding(output_fd, string_table_offset - current_offset) != 0) {
+        (void)platform_close(output_fd);
+        return -1;
+    }
     if (rt_write_all(output_fd, &empty_string, sizeof(empty_string)) != 0) {
         (void)platform_close(output_fd);
         return -1;
@@ -615,6 +946,7 @@ int main(int argc, char **argv) {
     PbfSummary summary;
     RoutePackBounds bounds;
     RoutePackTileStore tile_store;
+    RoutePackAddressStore address_store;
     char error[PBF_ERROR_CAPACITY];
     unsigned int tile_size_m = OSMRTE_DEFAULT_TILE_SIZE_M;
     unsigned int threads = 1U;
@@ -671,13 +1003,20 @@ int main(int argc, char **argv) {
         rt_write_char(2, '\n');
         return 1;
     }
-    if (write_route_pack(output_path, &summary, &bounds, &tile_store, tile_size_m) != 0) {
+    error[0] = '\0';
+    if (collect_addresses(pbf_path, &address_store, &tile_store, &bounds, tile_size_m, error, sizeof(error)) != 0) {
+        rt_write_cstr(2, "osmroutepack: ");
+        rt_write_cstr(2, error[0] == '\0' ? "failed to collect addresses" : error);
+        rt_write_char(2, '\n');
+        return 1;
+    }
+    if (write_route_pack(output_path, &summary, &bounds, &tile_store, &address_store, tile_size_m) != 0) {
         rt_write_cstr(2, "osmroutepack: failed to write output route pack\n");
         return 1;
     }
 
     rt_write_cstr(1, "format: OSMRTE01\n");
-    rt_write_cstr(1, "mode: tiled-empty-walking-payloads\n");
+    rt_write_cstr(1, "mode: tiled-empty-walking-payloads-addresses\n");
     rt_write_cstr(1, "output: ");
     rt_write_cstr(1, output_path);
     rt_write_char(1, '\n');
@@ -695,6 +1034,9 @@ int main(int argc, char **argv) {
     rt_write_char(1, '\n');
     rt_write_cstr(1, "route_tiles: ");
     rt_write_uint(1, tile_store.count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "addresses: ");
+    rt_write_uint(1, address_store.count);
     rt_write_char(1, '\n');
     rt_write_cstr(1, "tile_size_m: ");
     rt_write_uint(1, tile_size_m);
