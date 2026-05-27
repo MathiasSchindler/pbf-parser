@@ -117,22 +117,134 @@ typedef struct {
 
 typedef struct {
     int use_color;
+    int json;
+    unsigned long long json_seq;
     const char *map_path;
     const char *rpack_path;
     const char *map_width_arg;
     const char *map_height_arg;
 } RteOutput;
 
+static int address_field_valid(unsigned int offset, unsigned int size, unsigned int strings_size);
+
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " FILE.rte FROM_ADDRESS TO_ADDRESS [--color] [--no-color] [--map OUT.png] [--rpack FILE.rpack] [--width N] [--height N]\n");
+    rt_write_cstr(2, " FILE.rte FROM_ADDRESS TO_ADDRESS [--color] [--no-color] [--json] [--map OUT.png] [--rpack FILE.rpack] [--width N] [--height N]\n");
 }
 
 static int parse_dimension_arg(const char *text) {
     unsigned long long value;
 
     return rt_parse_uint(text, &value) == 0 && value != 0ULL && value <= 10000ULL ? 0 : -1;
+}
+
+static char hex_digit(unsigned int value) {
+    value &= 15U;
+    return value < 10U ? (char)('0' + value) : (char)('a' + value - 10U);
+}
+
+static void json_write_escaped(int fd, const char *text, size_t size) {
+    size_t index;
+
+    rt_write_char(fd, '"');
+    for (index = 0U; index < size; ++index) {
+        unsigned char ch = (unsigned char)text[index];
+        if (ch == '"' || ch == '\\') {
+            rt_write_char(fd, '\\');
+            rt_write_char(fd, (char)ch);
+        } else if (ch == '\n') {
+            rt_write_cstr(fd, "\\n");
+        } else if (ch == '\r') {
+            rt_write_cstr(fd, "\\r");
+        } else if (ch == '\t') {
+            rt_write_cstr(fd, "\\t");
+        } else if (ch < 0x20U) {
+            rt_write_cstr(fd, "\\u00");
+            rt_write_char(fd, hex_digit(ch >> 4U));
+            rt_write_char(fd, hex_digit(ch));
+        } else {
+            rt_write_char(fd, (char)ch);
+        }
+    }
+    rt_write_char(fd, '"');
+}
+
+static void json_write_cstr_escaped(int fd, const char *text) {
+    json_write_escaped(fd, text, rt_strlen(text));
+}
+
+static void json_event_begin(RteOutput *output, int fd, const char *event) {
+    output->json_seq += 1ULL;
+    rt_write_cstr(fd, "{\"schema\":\"newos.tool.v1\",\"tool\":\"rtewalkroute\",\"stream\":\"");
+    rt_write_cstr(fd, fd == 2 ? "stderr" : "stdout");
+    rt_write_cstr(fd, "\",\"event\":");
+    json_write_cstr_escaped(fd, event);
+    rt_write_cstr(fd, ",\"seq\":");
+    rt_write_uint(fd, output->json_seq);
+}
+
+static void json_write_coord_e7(int fd, int value) {
+    unsigned int absolute;
+    unsigned int fraction;
+    unsigned int divisor;
+
+    if (value < 0) {
+        rt_write_char(fd, '-');
+        absolute = (unsigned int)(-value);
+    } else {
+        absolute = (unsigned int)value;
+    }
+    rt_write_uint(fd, absolute / 10000000U);
+    rt_write_char(fd, '.');
+    fraction = absolute % 10000000U;
+    for (divisor = 1000000U; divisor != 0U; divisor /= 10U) rt_write_char(fd, (char)('0' + (fraction / divisor) % 10U));
+}
+
+static void json_write_coord_pair(int fd, const char *prefix, int lat_e7, int lon_e7) {
+    rt_write_cstr(fd, ",\"");
+    rt_write_cstr(fd, prefix);
+    rt_write_cstr(fd, "_lat\":");
+    json_write_coord_e7(fd, lat_e7);
+    rt_write_cstr(fd, ",\"");
+    rt_write_cstr(fd, prefix);
+    rt_write_cstr(fd, "_lon\":");
+    json_write_coord_e7(fd, lon_e7);
+}
+
+static void json_write_table_string_or_null(int fd, const char *name, const char *strings, unsigned int strings_size, unsigned int offset, unsigned int size) {
+    rt_write_cstr(fd, ",\"");
+    rt_write_cstr(fd, name);
+    rt_write_cstr(fd, "\":");
+    if (address_field_valid(offset, size, strings_size) && size != 0U) json_write_escaped(fd, strings + offset, size);
+    else rt_write_cstr(fd, "null");
+}
+
+static void json_write_hex_u64_string(int fd, unsigned long long value) {
+    int shift;
+    int started = 0;
+
+    rt_write_cstr(fd, "\"0x");
+    for (shift = 60; shift >= 0; shift -= 4) {
+        unsigned int digit = (unsigned int)((value >> (unsigned int)shift) & 15ULL);
+        if (digit != 0U || started || shift == 0) {
+            rt_write_char(fd, hex_digit(digit));
+            started = 1;
+        }
+    }
+    rt_write_char(fd, '"');
+}
+
+static void json_diagnostic(RteOutput *output, const char *level, const char *message, const char *detail) {
+    json_event_begin(output, 2, "diagnostic");
+    rt_write_cstr(2, ",\"level\":");
+    json_write_cstr_escaped(2, level);
+    rt_write_cstr(2, ",\"message\":");
+    json_write_cstr_escaped(2, message);
+    rt_write_cstr(2, ",\"detail\":");
+    if (detail != 0) json_write_cstr_escaped(2, detail);
+    else rt_write_cstr(2, "null");
+    rt_write_cstr(2, "}\n");
 }
 
 static void write_color(const RteOutput *output, const char *code) {
@@ -309,6 +421,17 @@ static const char *infer_rpack_path(const char *rte_path, char *buffer, size_t c
     for (index = 0U; index < (unsigned int)(sizeof(fallbacks) / sizeof(fallbacks[0])); ++index) {
         if (path_readable(fallbacks[index])) return fallbacks[index];
     }
+    return 0;
+}
+
+static int derive_temp_render_log_path(const char *map_path, char *buffer, size_t capacity) {
+    size_t size = rt_strlen(map_path);
+    const char *suffix = ".render-log.tmp";
+    size_t suffix_size = rt_strlen(suffix);
+
+    if (size + suffix_size + 1U > capacity) return -1;
+    memcpy(buffer, map_path, size);
+    memcpy(buffer + size, suffix, suffix_size + 1U);
     return 0;
 }
 
@@ -655,6 +778,59 @@ static void write_address_summary(const char *label, const RteResolvedAddress *r
         rt_write_cstr(1, label); rt_write_cstr(1, "_lon: "); write_coord_e7(resolved->record.lon_e7); rt_write_char(1, '\n');
         rt_write_cstr(1, label); rt_write_cstr(1, "_tile_id: "); write_hex_u64(resolved->record.tile_id); rt_write_char(1, '\n');
     }
+}
+
+static void json_write_address_event(RteOutput *output, const char *role, const char *query, const RteResolvedAddress *resolved, const char *strings, unsigned int strings_size) {
+    json_event_begin(output, 1, "address");
+    rt_write_cstr(1, ",\"data\":{\"role\":");
+    json_write_cstr_escaped(1, role);
+    rt_write_cstr(1, ",\"query\":");
+    json_write_cstr_escaped(1, query);
+    rt_write_cstr(1, ",\"match_count\":");
+    rt_write_uint(1, resolved->match_count);
+    rt_write_cstr(1, ",\"status\":");
+    json_write_cstr_escaped(1, resolved->found ? "found" : "not_found");
+    if (resolved->found) {
+        rt_write_cstr(1, ",\"entity_type\":");
+        json_write_cstr_escaped(1, entity_type_name(resolved->record.entity_type));
+        rt_write_cstr(1, ",\"id\":");
+        rt_write_int(1, resolved->record.id);
+        json_write_table_string_or_null(1, "city", strings, strings_size, resolved->record.city_offset, resolved->record.city_size);
+        json_write_table_string_or_null(1, "suburb", strings, strings_size, resolved->record.suburb_offset, resolved->record.suburb_size);
+        json_write_table_string_or_null(1, "street", strings, strings_size, resolved->record.street_offset, resolved->record.street_size);
+        json_write_table_string_or_null(1, "housenumber", strings, strings_size, resolved->record.housenumber_offset, resolved->record.housenumber_size);
+        json_write_table_string_or_null(1, "postcode", strings, strings_size, resolved->record.postcode_offset, resolved->record.postcode_size);
+        rt_write_cstr(1, ",\"has_coordinate\":");
+        rt_write_cstr(1, (resolved->record.flags & 1U) != 0U ? "true" : "false");
+        if ((resolved->record.flags & 1U) != 0U) {
+            rt_write_cstr(1, ",\"lat\":");
+            json_write_coord_e7(1, resolved->record.lat_e7);
+            rt_write_cstr(1, ",\"lon\":");
+            json_write_coord_e7(1, resolved->record.lon_e7);
+            rt_write_cstr(1, ",\"tile_id\":");
+            json_write_hex_u64_string(1, resolved->record.tile_id);
+        }
+    }
+    rt_write_cstr(1, "}}\n");
+}
+
+static void json_write_metadata_event(RteOutput *output, const char *from_query, const char *to_query) {
+    json_event_begin(output, 1, "metadata");
+    rt_write_cstr(1, ",\"data\":{\"format\":\"OSMRTE01\",\"profile\":\"walking\",\"from_query\":");
+    json_write_cstr_escaped(1, from_query);
+    rt_write_cstr(1, ",\"to_query\":");
+    json_write_cstr_escaped(1, to_query);
+    rt_write_cstr(1, "}}\n");
+}
+
+static void json_write_route_status_event(RteOutput *output, const char *status, const char *reason) {
+    json_event_begin(output, 1, "route_status");
+    rt_write_cstr(1, ",\"data\":{\"status\":");
+    json_write_cstr_escaped(1, status);
+    rt_write_cstr(1, ",\"reason\":");
+    if (reason != 0) json_write_cstr_escaped(1, reason);
+    else rt_write_cstr(1, "null");
+    rt_write_cstr(1, "}}\n");
 }
 
 static unsigned long long isqrt_u64(unsigned long long value) {
@@ -1127,6 +1303,152 @@ static int write_human_route(
     return 0;
 }
 
+static void json_write_route_summary_event(
+    RteOutput *output,
+    const RteGraph *graph,
+    unsigned int source,
+    unsigned int target,
+    unsigned int tiles_loaded,
+    unsigned int from_snap_m,
+    unsigned int to_snap_m,
+    unsigned long long graph_distance_m,
+    unsigned long long total_distance_m,
+    unsigned int direct_distance
+) {
+    unsigned long long minutes = (total_distance_m * 3ULL + 249ULL) / 250ULL;
+
+    json_event_begin(output, 1, "route");
+    rt_write_cstr(1, ",\"data\":{\"status\":\"found\",\"mode\":\"walking\",\"distance_m\":");
+    rt_write_uint(1, total_distance_m);
+    rt_write_cstr(1, ",\"graph_distance_m\":");
+    rt_write_uint(1, graph_distance_m);
+    rt_write_cstr(1, ",\"direct_distance_m\":");
+    rt_write_uint(1, direct_distance);
+    rt_write_cstr(1, ",\"estimated_minutes\":");
+    rt_write_uint(1, minutes);
+    rt_write_cstr(1, ",\"loaded_tiles\":");
+    rt_write_uint(1, tiles_loaded);
+    rt_write_cstr(1, ",\"loaded_graph_nodes\":");
+    rt_write_uint(1, graph->node_count);
+    rt_write_cstr(1, ",\"loaded_graph_edges\":");
+    rt_write_uint(1, graph->edge_count);
+    rt_write_cstr(1, ",\"from_snap_m\":");
+    rt_write_uint(1, from_snap_m);
+    rt_write_cstr(1, ",\"to_snap_m\":");
+    rt_write_uint(1, to_snap_m);
+    json_write_coord_pair(1, "source", graph->nodes[source].lat_e7, graph->nodes[source].lon_e7);
+    json_write_coord_pair(1, "target", graph->nodes[target].lat_e7, graph->nodes[target].lon_e7);
+    rt_write_cstr(1, "}}\n");
+}
+
+static void json_write_route_point_event(RteOutput *output, unsigned int index, const char *kind, int lat_e7, int lon_e7, unsigned long long cumulative_m) {
+    json_event_begin(output, 1, "route_point");
+    rt_write_cstr(1, ",\"data\":{\"index\":");
+    rt_write_uint(1, index);
+    rt_write_cstr(1, ",\"kind\":");
+    json_write_cstr_escaped(1, kind);
+    rt_write_cstr(1, ",\"lat\":");
+    json_write_coord_e7(1, lat_e7);
+    rt_write_cstr(1, ",\"lon\":");
+    json_write_coord_e7(1, lon_e7);
+    rt_write_cstr(1, ",\"cumulative_m\":");
+    rt_write_uint(1, cumulative_m);
+    rt_write_cstr(1, "}}\n");
+}
+
+static void json_write_step_base(RteOutput *output, unsigned int step, const char *action) {
+    json_event_begin(output, 1, "route_step");
+    rt_write_cstr(1, ",\"data\":{\"step\":");
+    rt_write_uint(1, step);
+    rt_write_cstr(1, ",\"action\":");
+    json_write_cstr_escaped(1, action);
+}
+
+static int json_write_route_geometry_and_steps(
+    RteOutput *output,
+    const RteGraph *graph,
+    unsigned int source,
+    unsigned int target,
+    const RteResolvedAddress *from,
+    const RteResolvedAddress *to,
+    const char *strings,
+    unsigned int strings_size,
+    unsigned int from_snap_m,
+    unsigned int to_snap_m,
+    unsigned long long total_distance_m
+) {
+    unsigned int *path;
+    unsigned int path_count;
+    unsigned int index;
+    unsigned int point_index = 0U;
+    unsigned int step = 1U;
+    unsigned long long cumulative_m = 0ULL;
+
+    if (build_route_path(graph, source, target, &path, &path_count) != 0) return -1;
+    json_write_route_point_event(output, point_index++, "origin", from->record.lat_e7, from->record.lon_e7, 0ULL);
+    cumulative_m = from_snap_m;
+    for (index = 0U; index < path_count; ++index) {
+        if (index != 0U) cumulative_m += graph->nodes[path[index]].previous_edge_meters;
+        json_write_route_point_event(output, point_index++, "graph", graph->nodes[path[index]].lat_e7, graph->nodes[path[index]].lon_e7, cumulative_m);
+    }
+    json_write_route_point_event(output, point_index, "destination", to->record.lat_e7, to->record.lon_e7, total_distance_m);
+
+    json_write_step_base(output, step++, "start");
+    json_write_table_string_or_null(1, "street", strings, strings_size, from->record.street_offset, from->record.street_size);
+    json_write_table_string_or_null(1, "housenumber", strings, strings_size, from->record.housenumber_offset, from->record.housenumber_size);
+    json_write_table_string_or_null(1, "city", strings, strings_size, from->record.city_offset, from->record.city_size);
+    json_write_coord_pair(1, "at", from->record.lat_e7, from->record.lon_e7);
+    rt_write_cstr(1, "}}\n");
+    if (from_snap_m != 0U) {
+        json_write_step_base(output, step++, "join_graph");
+        rt_write_cstr(1, ",\"distance_m\":");
+        rt_write_uint(1, from_snap_m);
+        json_write_coord_pair(1, "from", from->record.lat_e7, from->record.lon_e7);
+        json_write_coord_pair(1, "to", graph->nodes[source].lat_e7, graph->nodes[source].lon_e7);
+        rt_write_cstr(1, "}}\n");
+    }
+    if (path_count > 1U) {
+        unsigned int group_start = 0U;
+        unsigned long long group_meters = 0ULL;
+        for (index = 1U; index < path_count; ++index) {
+            group_meters += graph->nodes[path[index]].previous_edge_meters;
+            if (group_meters >= 450ULL || index + 1U == path_count) {
+                const char *direction = compass_direction(graph->nodes[path[group_start]].lat_e7, graph->nodes[path[group_start]].lon_e7, graph->nodes[path[index]].lat_e7, graph->nodes[path[index]].lon_e7);
+                json_write_step_base(output, step++, "continue");
+                rt_write_cstr(1, ",\"direction\":");
+                json_write_cstr_escaped(1, direction);
+                rt_write_cstr(1, ",\"distance_m\":");
+                rt_write_uint(1, group_meters);
+                rt_write_cstr(1, ",\"path_start_index\":");
+                rt_write_uint(1, group_start);
+                rt_write_cstr(1, ",\"path_end_index\":");
+                rt_write_uint(1, index);
+                json_write_coord_pair(1, "from", graph->nodes[path[group_start]].lat_e7, graph->nodes[path[group_start]].lon_e7);
+                json_write_coord_pair(1, "to", graph->nodes[path[index]].lat_e7, graph->nodes[path[index]].lon_e7);
+                rt_write_cstr(1, "}}\n");
+                group_start = index;
+                group_meters = 0ULL;
+            }
+        }
+    }
+    if (to_snap_m != 0U) {
+        json_write_step_base(output, step++, "leave_graph");
+        rt_write_cstr(1, ",\"distance_m\":");
+        rt_write_uint(1, to_snap_m);
+        json_write_coord_pair(1, "from", graph->nodes[target].lat_e7, graph->nodes[target].lon_e7);
+        json_write_coord_pair(1, "to", to->record.lat_e7, to->record.lon_e7);
+        rt_write_cstr(1, "}}\n");
+    }
+    json_write_step_base(output, step, "arrive");
+    json_write_table_string_or_null(1, "street", strings, strings_size, to->record.street_offset, to->record.street_size);
+    json_write_table_string_or_null(1, "housenumber", strings, strings_size, to->record.housenumber_offset, to->record.housenumber_size);
+    json_write_table_string_or_null(1, "city", strings, strings_size, to->record.city_offset, to->record.city_size);
+    json_write_coord_pair(1, "at", to->record.lat_e7, to->record.lon_e7);
+    rt_write_cstr(1, "}}\n");
+    rt_free(path);
+    return 0;
+}
+
 static void update_bbox_e7(int lat_e7, int lon_e7, int *min_lat, int *min_lon, int *max_lat, int *max_lon) {
     if (lat_e7 < *min_lat) *min_lat = lat_e7;
     if (lat_e7 > *max_lat) *max_lat = lat_e7;
@@ -1175,7 +1497,7 @@ static int build_bbox_arg(int min_lat, int min_lon, int max_lat, int max_lon, ch
 static int render_route_map(
     const char *program,
     const char *rte_path,
-    const RteOutput *output,
+    RteOutput *output,
     const RteGraph *graph,
     unsigned int source,
     unsigned int target,
@@ -1195,9 +1517,13 @@ static int render_route_map(
     char renderer_path[512];
     char inferred_rpack_path[512];
     char temp_path[512];
+    char render_log_path[512];
     char bbox_arg[160];
     char city_arg[256];
     const char *rpack_path = output->rpack_path;
+    const char *renderer_output_path = 0;
+    const char *render_width_arg = 0;
+    const char *render_height_arg = 0;
     int use_city_view = 0;
     int fd;
     int pid;
@@ -1211,14 +1537,16 @@ static int render_route_map(
     for (index = 0U; index < path_count; ++index) update_bbox_e7(graph->nodes[path[index]].lat_e7, graph->nodes[path[index]].lon_e7, &min_lat, &min_lon, &max_lat, &max_lon);
     if (build_bbox_arg(min_lat, min_lon, max_lat, max_lon, bbox_arg, sizeof(bbox_arg)) != 0 ||
         path_join_sibling_tool(program, "osmrender-rpack", renderer_path, sizeof(renderer_path)) != 0 ||
-        derive_temp_polyline_path(output->map_path, temp_path, sizeof(temp_path)) != 0) {
+        derive_temp_polyline_path(output->map_path, temp_path, sizeof(temp_path)) != 0 ||
+        (output->json && derive_temp_render_log_path(output->map_path, render_log_path, sizeof(render_log_path)) != 0)) {
         rt_free(path);
         return -1;
     }
     if (rpack_path == 0) rpack_path = infer_rpack_path(rte_path, inferred_rpack_path, sizeof(inferred_rpack_path));
     if (rpack_path == 0) {
         rt_free(path);
-        rt_write_cstr(2, "rtewalkroute: --map needs --rpack FILE.rpack; no default render pack was found\n");
+        if (output->json) json_diagnostic(output, "error", "--map needs --rpack FILE.rpack; no default render pack was found", 0);
+        else rt_write_cstr(2, "rtewalkroute: --map needs --rpack FILE.rpack; no default render pack was found\n");
         return -1;
     }
     if (address_fields_equal(strings, strings_size, from->record.city_offset, from->record.city_size, to->record.city_offset, to->record.city_size) &&
@@ -1246,46 +1574,84 @@ static int render_route_map(
     }
     if (output->map_width_arg != 0) {
         argv[argv_index++] = "--width";
-        argv[argv_index++] = (char *)output->map_width_arg;
+        render_width_arg = output->map_width_arg;
+        argv[argv_index++] = (char *)render_width_arg;
     } else if (!use_city_view && output->map_height_arg == 0) {
         argv[argv_index++] = "--width";
-        argv[argv_index++] = "1600";
+        render_width_arg = "1600";
+        argv[argv_index++] = (char *)render_width_arg;
     } else if (use_city_view && output->map_height_arg == 0) {
         argv[argv_index++] = "--width";
-        argv[argv_index++] = "1600";
+        render_width_arg = "1600";
+        argv[argv_index++] = (char *)render_width_arg;
     }
     if (output->map_height_arg != 0) {
         argv[argv_index++] = "--height";
-        argv[argv_index++] = (char *)output->map_height_arg;
+        render_height_arg = output->map_height_arg;
+        argv[argv_index++] = (char *)render_height_arg;
     } else if (use_city_view && output->map_width_arg == 0) {
         argv[argv_index++] = "--height";
-        argv[argv_index++] = "1200";
+        render_height_arg = "1200";
+        argv[argv_index++] = (char *)render_height_arg;
     }
     argv[argv_index++] = "--route-polyline";
     argv[argv_index++] = temp_path;
     argv[argv_index] = 0;
-    if (platform_spawn_process(argv, -1, -1, 0, 0, 0, &pid) != 0 || platform_wait_process(pid, &exit_status) != 0 || exit_status != 0) {
+    if (output->json) renderer_output_path = render_log_path;
+    if (platform_spawn_process(argv, -1, -1, 0, renderer_output_path, 0, &pid) != 0 || platform_wait_process(pid, &exit_status) != 0 || exit_status != 0) {
         (void)platform_remove_file(temp_path);
-        rt_write_cstr(2, "rtewalkroute: map renderer failed\n");
+        if (output->json) {
+            (void)platform_remove_file(render_log_path);
+            json_diagnostic(output, "error", "map renderer failed", output->map_path);
+            json_event_begin(output, 1, "map");
+            rt_write_cstr(1, ",\"data\":{\"status\":\"failed\",\"output\":");
+            json_write_cstr_escaped(1, output->map_path);
+            rt_write_cstr(1, "}}\n");
+        } else {
+            rt_write_cstr(2, "rtewalkroute: map renderer failed\n");
+        }
         return -1;
     }
     (void)platform_remove_file(temp_path);
-    rt_write_cstr(1, "map_output: ");
-    rt_write_cstr(1, output->map_path);
-    rt_write_char(1, '\n');
-    rt_write_cstr(1, "map_rpack: ");
-    rt_write_cstr(1, rpack_path);
-    rt_write_char(1, '\n');
-    rt_write_cstr(1, "map_bbox: ");
-    rt_write_cstr(1, bbox_arg);
-    rt_write_char(1, '\n');
-    if (use_city_view) {
-        rt_write_cstr(1, "map_view: city\n");
-        rt_write_cstr(1, "map_city: ");
-        rt_write_cstr(1, city_arg);
-        rt_write_char(1, '\n');
+    if (output->json) {
+        (void)platform_remove_file(render_log_path);
+        json_event_begin(output, 1, "map");
+        rt_write_cstr(1, ",\"data\":{\"status\":\"written\",\"output\":");
+        json_write_cstr_escaped(1, output->map_path);
+        rt_write_cstr(1, ",\"rpack\":");
+        json_write_cstr_escaped(1, rpack_path);
+        rt_write_cstr(1, ",\"bbox\":");
+        json_write_cstr_escaped(1, bbox_arg);
+        rt_write_cstr(1, ",\"view\":");
+        json_write_cstr_escaped(1, use_city_view ? "city" : "bbox");
+        rt_write_cstr(1, ",\"city\":");
+        if (use_city_view) json_write_cstr_escaped(1, city_arg);
+        else rt_write_cstr(1, "null");
+        rt_write_cstr(1, ",\"width_arg\":");
+        if (render_width_arg != 0) json_write_cstr_escaped(1, render_width_arg);
+        else rt_write_cstr(1, "null");
+        rt_write_cstr(1, ",\"height_arg\":");
+        if (render_height_arg != 0) json_write_cstr_escaped(1, render_height_arg);
+        else rt_write_cstr(1, "null");
+        rt_write_cstr(1, "}}\n");
     } else {
-        rt_write_cstr(1, "map_view: bbox\n");
+        rt_write_cstr(1, "map_output: ");
+        rt_write_cstr(1, output->map_path);
+        rt_write_char(1, '\n');
+        rt_write_cstr(1, "map_rpack: ");
+        rt_write_cstr(1, rpack_path);
+        rt_write_char(1, '\n');
+        rt_write_cstr(1, "map_bbox: ");
+        rt_write_cstr(1, bbox_arg);
+        rt_write_char(1, '\n');
+        if (use_city_view) {
+            rt_write_cstr(1, "map_view: city\n");
+            rt_write_cstr(1, "map_city: ");
+            rt_write_cstr(1, city_arg);
+            rt_write_char(1, '\n');
+        } else {
+            rt_write_cstr(1, "map_view: bbox\n");
+        }
     }
     return 0;
 #else
@@ -1330,56 +1696,69 @@ int main(int argc, char **argv) {
     for (argi = 4; argi < argc; ++argi) {
         if (rt_strcmp(argv[argi], "--no-color") == 0) output.use_color = 0;
         else if (rt_strcmp(argv[argi], "--color") == 0) output.use_color = 1;
+        else if (rt_strcmp(argv[argi], "--json") == 0) output.json = 1;
         else if (rt_strcmp(argv[argi], "--map") == 0) {
             argi += 1;
-            if (argi >= argc) { write_usage(program); return 1; }
+            if (argi >= argc) { if (output.json) json_diagnostic(&output, "error", "missing value for --map", 0); else write_usage(program); return 1; }
             output.map_path = argv[argi];
         } else if (rt_strcmp(argv[argi], "--rpack") == 0) {
             argi += 1;
-            if (argi >= argc) { write_usage(program); return 1; }
+            if (argi >= argc) { if (output.json) json_diagnostic(&output, "error", "missing value for --rpack", 0); else write_usage(program); return 1; }
             output.rpack_path = argv[argi];
         } else if (rt_strcmp(argv[argi], "--width") == 0) {
             argi += 1;
-            if (argi >= argc || parse_dimension_arg(argv[argi]) != 0) { write_usage(program); return 1; }
+            if (argi >= argc || parse_dimension_arg(argv[argi]) != 0) { if (output.json) json_diagnostic(&output, "error", "invalid or missing --width value", 0); else write_usage(program); return 1; }
             output.map_width_arg = argv[argi];
         } else if (rt_strcmp(argv[argi], "--height") == 0) {
             argi += 1;
-            if (argi >= argc || parse_dimension_arg(argv[argi]) != 0) { write_usage(program); return 1; }
+            if (argi >= argc || parse_dimension_arg(argv[argi]) != 0) { if (output.json) json_diagnostic(&output, "error", "invalid or missing --height value", 0); else write_usage(program); return 1; }
             output.map_height_arg = argv[argi];
         }
-        else { write_usage(program); return 1; }
+        else { if (output.json) json_diagnostic(&output, "error", "unknown option", argv[argi]); else write_usage(program); return 1; }
     }
+    if (output.json) output.use_color = 0;
 
     fd = platform_open_read(path);
-    if (fd < 0) { rt_write_cstr(2, "rtewalkroute: could not open route pack\n"); return 1; }
+    if (fd < 0) { if (output.json) json_diagnostic(&output, "error", "could not open route pack", path); else rt_write_cstr(2, "rtewalkroute: could not open route pack\n"); return 1; }
     if (read_exact(fd, header_bytes, sizeof(header_bytes)) != 0 || parse_header(header_bytes, &header) != 0 || read_sections(fd, &header, &address_section) != 0) {
         (void)platform_close(fd);
-        rt_write_cstr(2, "rtewalkroute: invalid or unsupported route pack\n");
+        if (output.json) json_diagnostic(&output, "error", "invalid or unsupported route pack", path);
+        else rt_write_cstr(2, "rtewalkroute: invalid or unsupported route pack\n");
         return 1;
     }
     if (!address_section.present || read_address_strings(fd, &address_section, &strings, &strings_size) != 0) {
         (void)platform_close(fd);
-        rt_write_cstr(2, "rtewalkroute: route pack has no readable address section\n");
+        if (output.json) json_diagnostic(&output, "error", "route pack has no readable address section", path);
+        else rt_write_cstr(2, "rtewalkroute: route pack has no readable address section\n");
         return 1;
     }
     if (resolve_address(fd, &address_section, from_query, strings, strings_size, &from) != 0 || resolve_address(fd, &address_section, to_query, strings, strings_size, &to) != 0) {
         rt_free(strings);
         (void)platform_close(fd);
-        rt_write_cstr(2, "rtewalkroute: address lookup failed\n");
+        if (output.json) json_diagnostic(&output, "error", "address lookup failed", 0);
+        else rt_write_cstr(2, "rtewalkroute: address lookup failed\n");
         return 1;
     }
 
-    rt_write_cstr(1, "format: OSMRTE01\n");
-    rt_write_cstr(1, "profile: walking\n");
-    rt_write_cstr(1, "from_query: "); rt_write_cstr(1, from_query); rt_write_char(1, '\n');
-    write_address_summary("from", &from, strings, strings_size);
-    rt_write_cstr(1, "to_query: "); rt_write_cstr(1, to_query); rt_write_char(1, '\n');
-    write_address_summary("to", &to, strings, strings_size);
+    if (output.json) {
+        json_write_metadata_event(&output, from_query, to_query);
+        json_write_address_event(&output, "from", from_query, &from, strings, strings_size);
+        json_write_address_event(&output, "to", to_query, &to, strings, strings_size);
+    } else {
+        rt_write_cstr(1, "format: OSMRTE01\n");
+        rt_write_cstr(1, "profile: walking\n");
+        rt_write_cstr(1, "from_query: "); rt_write_cstr(1, from_query); rt_write_char(1, '\n');
+        write_address_summary("from", &from, strings, strings_size);
+        rt_write_cstr(1, "to_query: "); rt_write_cstr(1, to_query); rt_write_char(1, '\n');
+        write_address_summary("to", &to, strings, strings_size);
+    }
 
     if (!from.found || !to.found) {
-        rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: address_not_found\n");
+        if (output.json) json_write_route_status_event(&output, "unavailable", "address_not_found");
+        else rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: address_not_found\n");
     } else if ((from.record.flags & 1U) == 0U || (to.record.flags & 1U) == 0U) {
-        rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: address record has no coordinate yet; way/relation address centroids are not embedded in this route pack\n");
+        if (output.json) json_write_route_status_event(&output, "unavailable", "address record has no coordinate yet; way/relation address centroids are not embedded in this route pack");
+        else rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: address record has no coordinate yet; way/relation address centroids are not embedded in this route pack\n");
     } else {
         RteTileRecord from_tile;
         RteTileRecord to_tile;
@@ -1391,19 +1770,37 @@ int main(int argc, char **argv) {
         unsigned long long to_tile_id;
         int from_tile_found;
         int to_tile_found;
+        unsigned int straight_distance;
         lat_lon_to_tile(&header, from.record.lat_e7, from.record.lon_e7, &from_tile_x, &from_tile_y, &from_tile_id);
         lat_lon_to_tile(&header, to.record.lat_e7, to.record.lon_e7, &to_tile_x, &to_tile_y, &to_tile_id);
         from_tile_found = find_tile_by_id(fd, &header, from_tile_id, &from_tile);
         to_tile_found = find_tile_by_id(fd, &header, to_tile_id, &to_tile);
-        rt_write_cstr(1, "from_tile_x: "); rt_write_int(1, from_tile_x); rt_write_char(1, '\n');
-        rt_write_cstr(1, "from_tile_y: "); rt_write_int(1, from_tile_y); rt_write_char(1, '\n');
-        rt_write_cstr(1, "to_tile_x: "); rt_write_int(1, to_tile_x); rt_write_char(1, '\n');
-        rt_write_cstr(1, "to_tile_y: "); rt_write_int(1, to_tile_y); rt_write_char(1, '\n');
-        rt_write_cstr(1, "direct_distance_m: "); rt_write_uint(1, direct_distance_m(from.record.lat_e7, from.record.lon_e7, to.record.lat_e7, to.record.lon_e7)); rt_write_char(1, '\n');
+        straight_distance = direct_distance_m(from.record.lat_e7, from.record.lon_e7, to.record.lat_e7, to.record.lon_e7);
+        if (output.json) {
+            json_event_begin(&output, 1, "tile_context");
+            rt_write_cstr(1, ",\"data\":{\"from_tile_x\":"); rt_write_int(1, from_tile_x);
+            rt_write_cstr(1, ",\"from_tile_y\":"); rt_write_int(1, from_tile_y);
+            rt_write_cstr(1, ",\"from_tile_id\":"); json_write_hex_u64_string(1, from_tile_id);
+            rt_write_cstr(1, ",\"to_tile_x\":"); rt_write_int(1, to_tile_x);
+            rt_write_cstr(1, ",\"to_tile_y\":"); rt_write_int(1, to_tile_y);
+            rt_write_cstr(1, ",\"to_tile_id\":"); json_write_hex_u64_string(1, to_tile_id);
+            rt_write_cstr(1, ",\"from_tile_found\":"); rt_write_cstr(1, from_tile_found > 0 ? "true" : "false");
+            rt_write_cstr(1, ",\"to_tile_found\":"); rt_write_cstr(1, to_tile_found > 0 ? "true" : "false");
+            rt_write_cstr(1, ",\"direct_distance_m\":"); rt_write_uint(1, straight_distance);
+            rt_write_cstr(1, "}}\n");
+        } else {
+            rt_write_cstr(1, "from_tile_x: "); rt_write_int(1, from_tile_x); rt_write_char(1, '\n');
+            rt_write_cstr(1, "from_tile_y: "); rt_write_int(1, from_tile_y); rt_write_char(1, '\n');
+            rt_write_cstr(1, "to_tile_x: "); rt_write_int(1, to_tile_x); rt_write_char(1, '\n');
+            rt_write_cstr(1, "to_tile_y: "); rt_write_int(1, to_tile_y); rt_write_char(1, '\n');
+            rt_write_cstr(1, "direct_distance_m: "); rt_write_uint(1, straight_distance); rt_write_char(1, '\n');
+        }
         if (from_tile_found <= 0 || to_tile_found <= 0) {
-            rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: endpoint tile not found\n");
+            if (output.json) json_write_route_status_event(&output, "unavailable", "endpoint tile not found");
+            else rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: endpoint tile not found\n");
         } else if (from_tile.local_node_count == 0U || to_tile.local_node_count == 0U || from_tile.local_directed_edge_count == 0U || to_tile.local_directed_edge_count == 0U) {
-            rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: walking graph payloads are empty in this route pack\n");
+            if (output.json) json_write_route_status_event(&output, "unavailable", "walking graph payloads are empty in this route pack");
+            else rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: walking graph payloads are empty in this route pack\n");
         } else {
             RteGraph graph;
             unsigned int tiles_loaded;
@@ -1415,30 +1812,54 @@ int main(int argc, char **argv) {
             int route_status;
             rt_memset(&graph, 0, sizeof(graph));
             if (load_neighborhood_graph(fd, &header, from_tile_x, from_tile_y, to_tile_x, to_tile_y, &graph, &tiles_loaded) != 0) {
-                rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: failed to load walking graph payloads\n");
+                if (output.json) json_write_route_status_event(&output, "unavailable", "failed to load walking graph payloads");
+                else rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: failed to load walking graph payloads\n");
             } else if (graph.node_count == 0U || graph.edge_count == 0U) {
-                rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: loaded walking graph is empty\n");
+                if (output.json) json_write_route_status_event(&output, "unavailable", "loaded walking graph is empty");
+                else rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: loaded walking graph is empty\n");
             } else {
                 source = nearest_graph_node(&graph, from.record.lat_e7, from.record.lon_e7, &from_snap_m);
                 target = nearest_graph_node(&graph, to.record.lat_e7, to.record.lon_e7, &to_snap_m);
-                rt_write_cstr(1, "loaded_tiles: "); rt_write_uint(1, tiles_loaded); rt_write_char(1, '\n');
-                rt_write_cstr(1, "loaded_graph_nodes: "); rt_write_uint(1, graph.node_count); rt_write_char(1, '\n');
-                rt_write_cstr(1, "loaded_graph_edges: "); rt_write_uint(1, graph.edge_count); rt_write_char(1, '\n');
-                rt_write_cstr(1, "from_snap_m: "); rt_write_uint(1, from_snap_m); rt_write_char(1, '\n');
-                rt_write_cstr(1, "to_snap_m: "); rt_write_uint(1, to_snap_m); rt_write_char(1, '\n');
+                if (output.json) {
+                    json_event_begin(&output, 1, "graph_loaded");
+                    rt_write_cstr(1, ",\"data\":{\"loaded_tiles\":"); rt_write_uint(1, tiles_loaded);
+                    rt_write_cstr(1, ",\"nodes\":"); rt_write_uint(1, graph.node_count);
+                    rt_write_cstr(1, ",\"directed_edges\":"); rt_write_uint(1, graph.edge_count);
+                    rt_write_cstr(1, ",\"source_node_index\":"); rt_write_uint(1, source);
+                    rt_write_cstr(1, ",\"target_node_index\":"); rt_write_uint(1, target);
+                    rt_write_cstr(1, ",\"from_snap_m\":"); rt_write_uint(1, from_snap_m);
+                    rt_write_cstr(1, ",\"to_snap_m\":"); rt_write_uint(1, to_snap_m);
+                    json_write_coord_pair(1, "source", graph.nodes[source].lat_e7, graph.nodes[source].lon_e7);
+                    json_write_coord_pair(1, "target", graph.nodes[target].lat_e7, graph.nodes[target].lon_e7);
+                    rt_write_cstr(1, "}}\n");
+                } else {
+                    rt_write_cstr(1, "loaded_tiles: "); rt_write_uint(1, tiles_loaded); rt_write_char(1, '\n');
+                    rt_write_cstr(1, "loaded_graph_nodes: "); rt_write_uint(1, graph.node_count); rt_write_char(1, '\n');
+                    rt_write_cstr(1, "loaded_graph_edges: "); rt_write_uint(1, graph.edge_count); rt_write_char(1, '\n');
+                    rt_write_cstr(1, "from_snap_m: "); rt_write_uint(1, from_snap_m); rt_write_char(1, '\n');
+                    rt_write_cstr(1, "to_snap_m: "); rt_write_uint(1, to_snap_m); rt_write_char(1, '\n');
+                }
                 route_status = dijkstra(&graph, source, target, &route_distance);
                 if (route_status < 0) {
-                    rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: dijkstra_failed\n");
+                    if (output.json) json_write_route_status_event(&output, "unavailable", "dijkstra_failed");
+                    else rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: dijkstra_failed\n");
                 } else if (route_status == 0) {
-                    rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: no path found in loaded tile neighborhood\n");
+                    if (output.json) json_write_route_status_event(&output, "unavailable", "no path found in loaded tile neighborhood");
+                    else rt_write_cstr(1, "route_status: unavailable\nroute_status_reason: no path found in loaded tile neighborhood\n");
                 } else {
                     unsigned long long total_distance = route_distance + (unsigned long long)from_snap_m + (unsigned long long)to_snap_m;
-                    rt_write_cstr(1, "route_status: found\n");
-                    rt_write_cstr(1, "route_distance_m: "); rt_write_uint(1, total_distance); rt_write_char(1, '\n');
-                    rt_write_cstr(1, "graph_distance_m: "); rt_write_uint(1, route_distance); rt_write_char(1, '\n');
-                    (void)write_human_route(&output, &graph, source, target, &from, &to, strings, strings_size, from_snap_m, to_snap_m, route_distance, total_distance, tiles_loaded);
+                    if (output.json) {
+                        json_write_route_status_event(&output, "found", 0);
+                        json_write_route_summary_event(&output, &graph, source, target, tiles_loaded, from_snap_m, to_snap_m, route_distance, total_distance, straight_distance);
+                        if (json_write_route_geometry_and_steps(&output, &graph, source, target, &from, &to, strings, strings_size, from_snap_m, to_snap_m, total_distance) != 0) json_diagnostic(&output, "error", "failed to emit route geometry", 0);
+                    } else {
+                        rt_write_cstr(1, "route_status: found\n");
+                        rt_write_cstr(1, "route_distance_m: "); rt_write_uint(1, total_distance); rt_write_char(1, '\n');
+                        rt_write_cstr(1, "graph_distance_m: "); rt_write_uint(1, route_distance); rt_write_char(1, '\n');
+                        (void)write_human_route(&output, &graph, source, target, &from, &to, strings, strings_size, from_snap_m, to_snap_m, route_distance, total_distance, tiles_loaded);
+                    }
                     if (output.map_path != 0 && render_route_map(program, path, &output, &graph, source, target, &from, &to, strings, strings_size) != 0) {
-                        rt_write_cstr(1, "map_status: failed\n");
+                        if (!output.json) rt_write_cstr(1, "map_status: failed\n");
                     }
                 }
             }

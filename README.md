@@ -186,6 +186,15 @@ build/freestanding-macos-arm64/rtewalkroute data/brandenburg.rte \
 
 For the Potsdam sample above, the current route pack resolves node and building-way addresses, loads a small tile neighborhood, and reports `route_status: found`. `rtewalkroute` keeps the machine-readable key/value fields and also prints a human-readable walking summary with ANSI colors by default. Use `--no-color` when capturing output for scripts or logs.
 
+Use `--json` to emit newline-delimited JSON events instead of the human/key-value text output. JSON mode disables terminal color and follows the `newos.tool.v1` envelope documented in `docs/json-output.md`. Successful walking routes stream `metadata`, `address`, `tile_context`, `graph_loaded`, `route_status`, `route`, `route_point`, and `route_step` events; each route point includes latitude/longitude and cumulative distance, while each step includes action, distance, direction where available, and start/end coordinates. Diagnostics are written as JSON events on stderr.
+
+```sh
+build/freestanding-macos-arm64/rtewalkroute data/brandenburg.rte \
+	"Friedrich-Engels-Straße 22, Potsdam" \
+	"Hermann-Mattern-Promenade 25, Potsdam" \
+	--json
+```
+
 The macOS route CLI can also render a PNG map for a successful route:
 
 ```sh
