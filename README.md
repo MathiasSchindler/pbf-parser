@@ -158,7 +158,15 @@ build/freestanding-macos-arm64/osmroutepack --tile-size-m 4000 --threads 2 \
 	data/brandenburg-260525.osm.pbf build/brandenburg.rte
 ```
 
-This milestone writes an `OSMRTE01` file with real metric route tiles, tiled walking nodes, edge-offset arrays, directed walking edges, minimal snap-grid records, and a first global address section for exact street/house lookup. GTFS route-pattern arrays, service-day bitsets, and optimized address dictionaries are still future work. The target format is documented in `docs/OSMRTE01.md`.
+Add `--gtfs DIR` to embed public-transport stops, routes, service calendars, trips, and stop-time events into the same `OSMRTE01` file:
+
+```sh
+build/freestanding-macos-arm64/osmroutepack --tile-size-m 4000 --threads 2 \
+	--gtfs data/GTFS \
+	data/brandenburg-260525.osm.pbf build/brandenburg-gtfs.rte
+```
+
+This milestone writes an `OSMRTE01` file with real metric route tiles, tiled walking nodes, edge-offset arrays, directed walking edges, minimal snap-grid records, a first global address section for exact street/house lookup, and an optional embedded GTFS single-leg transit payload. Full route-pattern transfer routing and optimized address dictionaries are still future work. The target format is documented in `docs/OSMRTE01.md`.
 
 Inspect a generated route pack:
 
@@ -173,7 +181,7 @@ build/freestanding-macos-arm64/osmrteinfo build/brandenburg-tiles.rte \
 	--tile 52.3906,13.0645
 ```
 
-The current tiled milestone should report `addresses_present: yes` and `gtfs_present: no`. Address lookup does not require a tile coordinate; `--tile` is only a low-level tile-directory probe. Address queries use `street house` and may add `, city/suburb/postcode` to disambiguate. The inspector folds `Straße` and `Strasse` together for lookup. GTFS data still comes from the separate `data/GTFS` directory in the experimental `osmwalkroute` path; it is not embedded in `build/brandenburg-tiles.rte` yet.
+Packs built with `--gtfs` should report `addresses_present: yes` and `gtfs_present: yes`. Address lookup does not require a tile coordinate; `--tile` is only a low-level tile-directory probe. Address queries use `street house` and may add `, city/suburb/postcode` to disambiguate. The inspector folds `Straße` and `Strasse` together for lookup.
 
 The first route-pack walking CLI resolves endpoints from `.rte` data:
 
@@ -184,9 +192,20 @@ build/freestanding-macos-arm64/rtewalkroute data/brandenburg.rte \
 	"Hermann-Mattern-Promenade 25, Potsdam"
 ```
 
+When the pack was built with GTFS, `rtewalkroute` also asks for a single public-transport leg with walking access at both ends. If neither `--depart` nor `--arrive` is provided, the query uses the current time as `--depart now`:
+
+```sh
+build/freestanding-macos-arm64/rtewalkroute build/brandenburg-gtfs.rte \
+	"Friedrich-Engels-Straße 22, Potsdam" \
+	"Hermann-Mattern-Promenade 25, Potsdam" \
+	--depart 2026-05-27T11:00
+```
+
+The transit suggestion reports the access walk, boarding stop, vehicle mode and line, alighting stop, final walk, and total time. The first embedded planner intentionally evaluates one GTFS vehicle leg plus walking at both ends; multi-transfer routing and stop-to-walk edge snapping are next milestones.
+
 For the Potsdam sample above, the current route pack resolves node and building-way addresses, loads a small tile neighborhood, and reports `route_status: found`. `rtewalkroute` keeps the machine-readable key/value fields and also prints a human-readable walking summary with ANSI colors by default. Use `--no-color` when capturing output for scripts or logs.
 
-Use `--json` to emit newline-delimited JSON events instead of the human/key-value text output. JSON mode disables terminal color and follows the `newos.tool.v1` envelope documented in `docs/json-output.md`. Successful walking routes stream `metadata`, `address`, `tile_context`, `graph_loaded`, `route_status`, `route`, `route_point`, and `route_step` events; each route point includes latitude/longitude and cumulative distance, while each step includes action, distance, direction where available, and start/end coordinates. Diagnostics are written as JSON events on stderr.
+Use `--json` to emit newline-delimited JSON events instead of the human/key-value text output. JSON mode disables terminal color and follows the `newos.tool.v1` envelope documented in `docs/json-output.md`. Successful walking routes stream `metadata`, `address`, `tile_context`, `graph_loaded`, `route_status`, `route`, `route_point`, and `route_step` events; GTFS-enabled packs also emit a `transit_plan` event, using the current departure time unless `--depart` or `--arrive` is supplied. Each route point includes latitude/longitude and cumulative distance, while each step includes action, distance, direction where available, and start/end coordinates. Diagnostics are written as JSON events on stderr.
 
 ```sh
 build/freestanding-macos-arm64/rtewalkroute data/brandenburg.rte \

@@ -8,6 +8,14 @@
 #define RTE_ADDRESS_RECORD_SIZE 80U
 #define RTE_ADDRESS_SCAN_BATCH_RECORDS 4096U
 #define RTE_SECTION_ADDRESS_DICTIONARIES 0x0400U
+#define RTE_SECTION_TRANSIT_STOPS 0x0500U
+#define RTE_TRANSIT_SECTION_HEADER_SIZE 128U
+#define RTE_TRANSIT_STOP_RECORD_SIZE 40U
+#define RTE_TRANSIT_ROUTE_RECORD_SIZE 24U
+#define RTE_TRANSIT_SERVICE_RECORD_SIZE 32U
+#define RTE_TRANSIT_EXCEPTION_RECORD_SIZE 16U
+#define RTE_TRANSIT_TRIP_RECORD_SIZE 12U
+#define RTE_TRANSIT_EVENT_RECORD_SIZE 20U
 #define RTE_TILE_PAYLOAD_HEADER_SIZE 64U
 #define RTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE 32U
 #define RTE_TILE_TYPE_WALKING_NODES 0x1000U
@@ -21,6 +29,14 @@ typedef struct {
     unsigned int record_size;
     int present;
 } RteAddressSection;
+
+typedef struct {
+    unsigned long long offset;
+    unsigned long long size;
+    unsigned long long record_count;
+    unsigned int record_size;
+    int present;
+} RteTransitSection;
 
 typedef struct {
     unsigned long long section_directory_offset;
@@ -116,6 +132,92 @@ typedef struct {
 } RteHeap;
 
 typedef struct {
+    unsigned int id_offset;
+    unsigned int id_size;
+    unsigned int name_offset;
+    unsigned int name_size;
+    int lat_e7;
+    int lon_e7;
+    unsigned long long tile_id;
+    unsigned int mode_mask;
+} RteTransitStop;
+
+typedef struct {
+    unsigned int short_name_offset;
+    unsigned int short_name_size;
+    unsigned int long_name_offset;
+    unsigned int long_name_size;
+    unsigned int mode;
+    unsigned int route_type;
+} RteTransitRoute;
+
+typedef struct {
+    unsigned int id_offset;
+    unsigned int id_size;
+    unsigned int start_date;
+    unsigned int end_date;
+    unsigned int dow_mask;
+    unsigned int exception_offset;
+    unsigned int exception_count;
+} RteTransitService;
+
+typedef struct {
+    unsigned int service_index;
+    unsigned int date;
+    unsigned int exception_type;
+} RteTransitException;
+
+typedef struct {
+    unsigned int route_index;
+    unsigned int service_index;
+    unsigned int mode;
+} RteTransitTrip;
+
+typedef struct {
+    unsigned int trip_index;
+    unsigned int stop_index;
+    unsigned int arrival_sec;
+    unsigned int departure_sec;
+    unsigned int sequence;
+} RteTransitEvent;
+
+typedef struct {
+    RteTransitStop *stops;
+    RteTransitRoute *routes;
+    RteTransitService *services;
+    RteTransitException *exceptions;
+    RteTransitTrip *trips;
+    RteTransitEvent *events;
+    char *strings;
+    unsigned int stop_count;
+    unsigned int route_count;
+    unsigned int service_count;
+    unsigned int exception_count;
+    unsigned int trip_count;
+    unsigned int event_count;
+    unsigned int string_size;
+} RteTransitStore;
+
+typedef struct {
+    int found;
+    unsigned int mode;
+    unsigned int route_index;
+    unsigned int board_stop_index;
+    unsigned int alight_stop_index;
+    unsigned int board_departure_sec;
+    unsigned int alight_arrival_sec;
+    unsigned int walk_to_stop_m;
+    unsigned int walk_from_stop_m;
+    unsigned int total_sec;
+    unsigned int origin_departure_sec;
+    unsigned int active_trips;
+    unsigned int candidate_origin_stops;
+    unsigned int candidate_destination_stops;
+    unsigned long long events_scanned;
+    unsigned long long board_candidates;
+} RteTransitPlan;
+
+typedef struct {
     int use_color;
     int json;
     unsigned long long json_seq;
@@ -123,20 +225,174 @@ typedef struct {
     const char *rpack_path;
     const char *map_width_arg;
     const char *map_height_arg;
+    int have_depart;
+    int have_arrive;
+    unsigned int depart_date;
+    unsigned int depart_seconds;
+    unsigned int arrive_date;
+    unsigned int arrive_seconds;
 } RteOutput;
 
 static int address_field_valid(unsigned int offset, unsigned int size, unsigned int strings_size);
+static void write_distance_human(unsigned long long meters);
 
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " FILE.rte FROM_ADDRESS TO_ADDRESS [--color] [--no-color] [--json] [--map OUT.png] [--rpack FILE.rpack] [--width N] [--height N]\n");
+    rt_write_cstr(2, " FILE.rte FROM_ADDRESS TO_ADDRESS [--color] [--no-color] [--json] [--depart YYYY-MM-DDTHH:MM[:SS]] [--arrive YYYY-MM-DDTHH:MM[:SS]] [--map OUT.png] [--rpack FILE.rpack] [--width N] [--height N]\n");
 }
 
 static int parse_dimension_arg(const char *text) {
     unsigned long long value;
 
     return rt_parse_uint(text, &value) == 0 && value != 0ULL && value <= 10000ULL ? 0 : -1;
+}
+
+static const char *skip_spaces(const char *text) {
+    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') text += 1;
+    return text;
+}
+
+static int parse_coord_component_e7(const char **cursor_io, int max_abs_e7, int *value_out) {
+    const char *cursor = skip_spaces(*cursor_io);
+    int sign = 1;
+    unsigned int whole = 0U;
+    unsigned int fraction = 0U;
+    unsigned int fraction_digits = 0U;
+    unsigned int digit_count = 0U;
+    unsigned int value;
+
+    if (*cursor == '-') { sign = -1; cursor += 1; }
+    else if (*cursor == '+') cursor += 1;
+
+    while (*cursor >= '0' && *cursor <= '9') {
+        if (whole > 1000U) return -1;
+        whole = whole * 10U + (unsigned int)(*cursor - '0');
+        cursor += 1;
+        digit_count += 1U;
+    }
+    if (digit_count == 0U) return -1;
+    if (*cursor == '.') {
+        cursor += 1;
+        while (*cursor >= '0' && *cursor <= '9') {
+            if (fraction_digits < 7U) {
+                fraction = fraction * 10U + (unsigned int)(*cursor - '0');
+                fraction_digits += 1U;
+            }
+            cursor += 1;
+        }
+    }
+    while (fraction_digits < 7U) { fraction *= 10U; fraction_digits += 1U; }
+    if (whole > (unsigned int)(max_abs_e7 / 10000000)) return -1;
+    value = whole * 10000000U + fraction;
+    if (value > (unsigned int)max_abs_e7) return -1;
+    *value_out = sign < 0 ? -(int)value : (int)value;
+    *cursor_io = skip_spaces(cursor);
+    return 0;
+}
+
+static int parse_coordinate_query(const char *query, int *lat_e7_out, int *lon_e7_out) {
+    const char *cursor = query;
+    int lat_e7;
+    int lon_e7;
+    if (parse_coord_component_e7(&cursor, 900000000, &lat_e7) != 0) return -1;
+    if (*cursor != ',') return -1;
+    cursor += 1;
+    if (parse_coord_component_e7(&cursor, 1800000000, &lon_e7) != 0) return -1;
+    if (*cursor != '\0') return -1;
+    *lat_e7_out = lat_e7;
+    *lon_e7_out = lon_e7;
+    return 0;
+}
+
+static int parse_two_digits(const char *text, unsigned int *value_out) {
+    if (text[0] < '0' || text[0] > '9' || text[1] < '0' || text[1] > '9') return -1;
+    *value_out = (unsigned int)(text[0] - '0') * 10U + (unsigned int)(text[1] - '0');
+    return 0;
+}
+
+static int parse_four_digits(const char *text, unsigned int *value_out) {
+    unsigned int value = 0U;
+    unsigned int index;
+    for (index = 0U; index < 4U; ++index) {
+        if (text[index] < '0' || text[index] > '9') return -1;
+        value = value * 10U + (unsigned int)(text[index] - '0');
+    }
+    *value_out = value;
+    return 0;
+}
+
+static int parse_datetime_arg(const char *text, unsigned int *date_out, unsigned int *seconds_out) {
+    size_t length = rt_strlen(text);
+    unsigned int year;
+    unsigned int month;
+    unsigned int day;
+    unsigned int hour;
+    unsigned int minute;
+    unsigned int second = 0U;
+    if (!(length == 16U || length == 19U)) return -1;
+    if (text[4] != '-' || text[7] != '-' || text[10] != 'T' || text[13] != ':') return -1;
+    if (length == 19U && text[16] != ':') return -1;
+    if (parse_four_digits(text, &year) != 0 || parse_two_digits(text + 5U, &month) != 0 || parse_two_digits(text + 8U, &day) != 0 ||
+        parse_two_digits(text + 11U, &hour) != 0 || parse_two_digits(text + 14U, &minute) != 0) return -1;
+    if (length == 19U && parse_two_digits(text + 17U, &second) != 0) return -1;
+    if (year < 2000U || year > 2100U || month < 1U || month > 12U || day < 1U || day > 31U || hour > 23U || minute > 59U || second > 59U) return -1;
+    *date_out = year * 10000U + month * 100U + day;
+    *seconds_out = hour * 3600U + minute * 60U + second;
+    return 0;
+}
+
+static void civil_from_days(long long z, int *year_out, unsigned int *month_out, unsigned int *day_out) {
+    long long era;
+    unsigned long long doe;
+    unsigned long long yoe;
+    unsigned long long doy;
+    unsigned long long mp;
+    unsigned int month;
+
+    z += 719468LL;
+    era = (z >= 0LL ? z : z - 146096LL) / 146097LL;
+    doe = (unsigned long long)(z - era * 146097LL);
+    yoe = (doe - doe / 1460ULL + doe / 36524ULL - doe / 146096ULL) / 365ULL;
+    doy = doe - (365ULL * yoe + yoe / 4ULL - yoe / 100ULL);
+    mp = (5ULL * doy + 2ULL) / 153ULL;
+
+    *day_out = (unsigned int)(doy - (153ULL * mp + 2ULL) / 5ULL + 1ULL);
+    month = (unsigned int)(mp < 10ULL ? mp + 3ULL : mp - 9ULL);
+    *month_out = month;
+    *year_out = (int)yoe + (int)(era * 400LL) + (month <= 2U ? 1 : 0);
+}
+
+static int set_depart_now(RteOutput *output) {
+    long long epoch_seconds = platform_get_epoch_time();
+    long long days;
+    unsigned long long seconds_of_day;
+    int year;
+    unsigned int month;
+    unsigned int day;
+
+    if (epoch_seconds < 0) return -1;
+    days = epoch_seconds / 86400LL;
+    seconds_of_day = (unsigned long long)(epoch_seconds % 86400LL);
+    civil_from_days(days, &year, &month, &day);
+    if (year < 2000 || year > 2100) return -1;
+    output->depart_date = (unsigned int)year * 10000U + month * 100U + day;
+    output->depart_seconds = (unsigned int)seconds_of_day;
+    output->have_depart = 1;
+    return 0;
+}
+
+static int day_of_week_monday0(unsigned int yyyymmdd) {
+    static const int table[12] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    unsigned int year = yyyymmdd / 10000U;
+    unsigned int month = (yyyymmdd / 100U) % 100U;
+    unsigned int day = yyyymmdd % 100U;
+    unsigned int year_adj = year;
+    int sunday0;
+    if (month < 1U || month > 12U) return 0;
+    if (month < 3U) year_adj -= 1U;
+    sunday0 = (int)((year_adj + year_adj / 4U - year_adj / 100U + year_adj / 400U + (unsigned int)table[month - 1U] + day) % 7U);
+    return (sunday0 + 6) % 7;
 }
 
 static char hex_digit(unsigned int value) {
@@ -482,11 +738,12 @@ static void parse_address_record(const unsigned char bytes[RTE_ADDRESS_RECORD_SI
     record->postcode_size = read_u32_le(bytes + 76U);
 }
 
-static int read_sections(int fd, const RteHeader *header, RteAddressSection *address_section) {
+static int read_sections(int fd, const RteHeader *header, RteAddressSection *address_section, RteTransitSection *transit_section) {
     unsigned char bytes[RTE_SECTION_RECORD_SIZE];
     unsigned int index;
 
     rt_memset(address_section, 0, sizeof(*address_section));
+    rt_memset(transit_section, 0, sizeof(*transit_section));
     for (index = 0U; index < header->section_count; ++index) {
         unsigned int type;
         if (read_at(fd, header->section_directory_offset + (unsigned long long)index * RTE_SECTION_RECORD_SIZE, bytes, sizeof(bytes)) != 0) return -1;
@@ -497,6 +754,13 @@ static int read_sections(int fd, const RteHeader *header, RteAddressSection *add
             address_section->size = read_u64_le(bytes + 16U);
             address_section->record_count = read_u64_le(bytes + 32U);
             address_section->record_size = read_u32_le(bytes + 40U);
+        }
+        if (type == RTE_SECTION_TRANSIT_STOPS) {
+            transit_section->present = 1;
+            transit_section->offset = read_u64_le(bytes + 8U);
+            transit_section->size = read_u64_le(bytes + 16U);
+            transit_section->record_count = read_u64_le(bytes + 32U);
+            transit_section->record_size = read_u32_le(bytes + 40U);
         }
     }
     return 0;
@@ -704,6 +968,133 @@ static int read_address_strings(int fd, const RteAddressSection *section, char *
     return 0;
 }
 
+static void parse_transit_stop_record(const unsigned char bytes[RTE_TRANSIT_STOP_RECORD_SIZE], RteTransitStop *record) {
+    record->id_offset = read_u32_le(bytes + 0U);
+    record->id_size = read_u32_le(bytes + 4U);
+    record->name_offset = read_u32_le(bytes + 8U);
+    record->name_size = read_u32_le(bytes + 12U);
+    record->lat_e7 = read_i32_le(bytes + 16U);
+    record->lon_e7 = read_i32_le(bytes + 20U);
+    record->tile_id = read_u64_le(bytes + 24U);
+    record->mode_mask = read_u32_le(bytes + 32U);
+}
+
+static void parse_transit_route_record(const unsigned char bytes[RTE_TRANSIT_ROUTE_RECORD_SIZE], RteTransitRoute *record) {
+    record->short_name_offset = read_u32_le(bytes + 0U);
+    record->short_name_size = read_u32_le(bytes + 4U);
+    record->long_name_offset = read_u32_le(bytes + 8U);
+    record->long_name_size = read_u32_le(bytes + 12U);
+    record->mode = read_u32_le(bytes + 16U);
+    record->route_type = read_u32_le(bytes + 20U);
+}
+
+static void parse_transit_service_record(const unsigned char bytes[RTE_TRANSIT_SERVICE_RECORD_SIZE], RteTransitService *record) {
+    record->id_offset = read_u32_le(bytes + 0U);
+    record->id_size = read_u32_le(bytes + 4U);
+    record->start_date = read_u32_le(bytes + 8U);
+    record->end_date = read_u32_le(bytes + 12U);
+    record->dow_mask = read_u32_le(bytes + 16U);
+    record->exception_offset = read_u32_le(bytes + 20U);
+    record->exception_count = read_u32_le(bytes + 24U);
+}
+
+static void parse_transit_exception_record(const unsigned char bytes[RTE_TRANSIT_EXCEPTION_RECORD_SIZE], RteTransitException *record) {
+    record->service_index = read_u32_le(bytes + 0U);
+    record->date = read_u32_le(bytes + 4U);
+    record->exception_type = read_u32_le(bytes + 8U);
+}
+
+static void parse_transit_trip_record(const unsigned char bytes[RTE_TRANSIT_TRIP_RECORD_SIZE], RteTransitTrip *record) {
+    record->route_index = read_u32_le(bytes + 0U);
+    record->service_index = read_u32_le(bytes + 4U);
+    record->mode = read_u32_le(bytes + 8U);
+}
+
+static void parse_transit_event_record(const unsigned char bytes[RTE_TRANSIT_EVENT_RECORD_SIZE], RteTransitEvent *record) {
+    record->trip_index = read_u32_le(bytes + 0U);
+    record->stop_index = read_u32_le(bytes + 4U);
+    record->arrival_sec = read_u32_le(bytes + 8U);
+    record->departure_sec = read_u32_le(bytes + 12U);
+    record->sequence = read_u32_le(bytes + 16U);
+}
+
+static int read_transit_array(int fd, unsigned long long absolute_offset, unsigned int count, unsigned int file_record_size, size_t memory_record_size, void *records, void (*parse_record)(const unsigned char *, void *)) {
+    unsigned char *raw;
+    unsigned int index;
+    unsigned long long size = (unsigned long long)count * file_record_size;
+    if (count == 0U) return 0;
+    raw = (unsigned char *)rt_malloc((size_t)size);
+    if (raw == 0) return -1;
+    if (read_at(fd, absolute_offset, raw, (size_t)size) != 0) { rt_free(raw); return -1; }
+    for (index = 0U; index < count; ++index) parse_record(raw + (unsigned long long)index * file_record_size, (char *)records + (size_t)index * memory_record_size);
+    rt_free(raw);
+    return 0;
+}
+
+static int read_transit_section(int fd, const RteTransitSection *section, RteTransitStore *store) {
+    unsigned char header[RTE_TRANSIT_SECTION_HEADER_SIZE];
+    unsigned long long stops_offset;
+    unsigned long long routes_offset;
+    unsigned long long services_offset;
+    unsigned long long exceptions_offset;
+    unsigned long long trips_offset;
+    unsigned long long events_offset;
+    unsigned long long strings_offset;
+    unsigned int strings_size;
+    unsigned long long stop_count;
+    unsigned long long route_count;
+    unsigned long long service_count;
+    unsigned long long exception_count;
+    unsigned long long trip_count;
+    unsigned long long event_count;
+
+    rt_memset(store, 0, sizeof(*store));
+    if (!section->present) return 0;
+    if (section->record_size != RTE_TRANSIT_STOP_RECORD_SIZE || read_at(fd, section->offset, header, sizeof(header)) != 0 || memcmp(header, "GTFSLEG1", 8U) != 0) return -1;
+    if (read_u32_le(header + 12U) != RTE_TRANSIT_SECTION_HEADER_SIZE) return -1;
+    stop_count = read_u64_le(header + 16U);
+    route_count = read_u64_le(header + 24U);
+    service_count = read_u64_le(header + 32U);
+    exception_count = read_u64_le(header + 40U);
+    trip_count = read_u64_le(header + 48U);
+    event_count = read_u64_le(header + 56U);
+    strings_size = read_u32_le(header + 64U);
+    stops_offset = read_u64_le(header + 72U);
+    routes_offset = read_u64_le(header + 80U);
+    services_offset = read_u64_le(header + 88U);
+    exceptions_offset = read_u64_le(header + 96U);
+    trips_offset = read_u64_le(header + 104U);
+    events_offset = read_u64_le(header + 112U);
+    strings_offset = read_u64_le(header + 120U);
+    if (stop_count > 0xffffffffULL || route_count > 0xffffffffULL || service_count > 0xffffffffULL || exception_count > 0xffffffffULL || trip_count > 0xffffffffULL || event_count > 0xffffffffULL) return -1;
+    if (strings_offset > section->size || (unsigned long long)strings_size > section->size - strings_offset) return -1;
+    store->stop_count = (unsigned int)stop_count;
+    store->route_count = (unsigned int)route_count;
+    store->service_count = (unsigned int)service_count;
+    store->exception_count = (unsigned int)exception_count;
+    store->trip_count = (unsigned int)trip_count;
+    store->event_count = (unsigned int)event_count;
+    store->string_size = strings_size;
+    store->stops = store->stop_count != 0U ? (RteTransitStop *)rt_malloc((size_t)store->stop_count * sizeof(*store->stops)) : 0;
+    store->routes = store->route_count != 0U ? (RteTransitRoute *)rt_malloc((size_t)store->route_count * sizeof(*store->routes)) : 0;
+    store->services = store->service_count != 0U ? (RteTransitService *)rt_malloc((size_t)store->service_count * sizeof(*store->services)) : 0;
+    store->exceptions = store->exception_count != 0U ? (RteTransitException *)rt_malloc((size_t)store->exception_count * sizeof(*store->exceptions)) : 0;
+    store->trips = store->trip_count != 0U ? (RteTransitTrip *)rt_malloc((size_t)store->trip_count * sizeof(*store->trips)) : 0;
+    store->events = store->event_count != 0U ? (RteTransitEvent *)rt_malloc((size_t)store->event_count * sizeof(*store->events)) : 0;
+    store->strings = (char *)rt_malloc((size_t)strings_size + 1U);
+    if ((store->stop_count != 0U && store->stops == 0) || (store->route_count != 0U && store->routes == 0) || (store->service_count != 0U && store->services == 0) ||
+        (store->exception_count != 0U && store->exceptions == 0) || (store->trip_count != 0U && store->trips == 0) || (store->event_count != 0U && store->events == 0) || store->strings == 0) return -1;
+    if (read_transit_array(fd, section->offset + stops_offset, store->stop_count, RTE_TRANSIT_STOP_RECORD_SIZE, sizeof(*store->stops), store->stops, (void (*)(const unsigned char *, void *))parse_transit_stop_record) != 0 ||
+        read_transit_array(fd, section->offset + routes_offset, store->route_count, RTE_TRANSIT_ROUTE_RECORD_SIZE, sizeof(*store->routes), store->routes, (void (*)(const unsigned char *, void *))parse_transit_route_record) != 0 ||
+        read_transit_array(fd, section->offset + services_offset, store->service_count, RTE_TRANSIT_SERVICE_RECORD_SIZE, sizeof(*store->services), store->services, (void (*)(const unsigned char *, void *))parse_transit_service_record) != 0 ||
+        read_transit_array(fd, section->offset + exceptions_offset, store->exception_count, RTE_TRANSIT_EXCEPTION_RECORD_SIZE, sizeof(*store->exceptions), store->exceptions, (void (*)(const unsigned char *, void *))parse_transit_exception_record) != 0 ||
+        read_transit_array(fd, section->offset + trips_offset, store->trip_count, RTE_TRANSIT_TRIP_RECORD_SIZE, sizeof(*store->trips), store->trips, (void (*)(const unsigned char *, void *))parse_transit_trip_record) != 0 ||
+        read_transit_array(fd, section->offset + events_offset, store->event_count, RTE_TRANSIT_EVENT_RECORD_SIZE, sizeof(*store->events), store->events, (void (*)(const unsigned char *, void *))parse_transit_event_record) != 0) return -1;
+    if (strings_size != 0U && read_at(fd, section->offset + strings_offset, store->strings, strings_size) != 0) return -1;
+    store->strings[strings_size] = '\0';
+    return 0;
+}
+
 static int resolve_address(int fd, const RteAddressSection *section, const char *query, const char *strings, unsigned int strings_size, RteResolvedAddress *resolved) {
     char *query_norm;
     unsigned char *record_buffer;
@@ -746,6 +1137,27 @@ static int resolve_address(int fd, const RteAddressSection *section, const char 
     }
     rt_free(query_norm);
     rt_free(record_buffer);
+    return 0;
+}
+
+static int resolve_query(int fd, const RteHeader *header, const RteAddressSection *section, const char *query, const char *strings, unsigned int strings_size, RteResolvedAddress *resolved) {
+    int lat_e7;
+    int lon_e7;
+    int tile_x;
+    int tile_y;
+    unsigned long long tile_id;
+
+    if (parse_coordinate_query(query, &lat_e7, &lon_e7) != 0) return resolve_address(fd, section, query, strings, strings_size, resolved);
+    lat_lon_to_tile(header, lat_e7, lon_e7, &tile_x, &tile_y, &tile_id);
+    (void)tile_x;
+    (void)tile_y;
+    rt_memset(resolved, 0, sizeof(*resolved));
+    resolved->found = 1;
+    resolved->match_count = 1U;
+    resolved->record.flags = 1U;
+    resolved->record.lat_e7 = lat_e7;
+    resolved->record.lon_e7 = lon_e7;
+    resolved->record.tile_id = tile_id;
     return 0;
 }
 
@@ -855,6 +1267,158 @@ static unsigned int direct_distance_m(int from_lat_e7, int from_lon_e7, int to_l
     unsigned long long ay = dy < 0 ? (unsigned long long)(-dy) : (unsigned long long)dy;
     unsigned long long distance = isqrt_u64(ax * ax + ay * ay);
     return distance > 0xffffffffULL ? 0xffffffffU : (unsigned int)distance;
+}
+
+static const char *transit_mode_name(unsigned int mode) {
+    if (mode == 1U) return "tram";
+    if (mode == 2U) return "subway";
+    if (mode == 3U) return "train";
+    if (mode == 4U) return "bus";
+    return "transit";
+}
+
+static int transit_string_valid(const RteTransitStore *store, unsigned int offset, unsigned int size) {
+    return offset <= store->string_size && size <= store->string_size - offset;
+}
+
+static void write_transit_string(const RteTransitStore *store, unsigned int offset, unsigned int size) {
+    if (transit_string_valid(store, offset, size) && size != 0U) (void)rt_write_all(1, store->strings + offset, size);
+}
+
+static void json_write_transit_string_or_null(int fd, const RteTransitStore *store, unsigned int offset, unsigned int size) {
+    if (transit_string_valid(store, offset, size) && size != 0U) json_write_escaped(fd, store->strings + offset, size);
+    else rt_write_cstr(fd, "null");
+}
+
+static void write_hhmm(unsigned int seconds) {
+    unsigned int day = seconds / 86400U;
+    unsigned int in_day = seconds % 86400U;
+    unsigned int hour = in_day / 3600U;
+    unsigned int minute = (in_day / 60U) % 60U;
+    if (hour < 10U) rt_write_char(1, '0');
+    rt_write_uint(1, hour);
+    rt_write_char(1, ':');
+    if (minute < 10U) rt_write_char(1, '0');
+    rt_write_uint(1, minute);
+    if (day > 0U) { rt_write_cstr(1, " (+"); rt_write_uint(1, day); rt_write_cstr(1, "d)"); }
+}
+
+static int transit_service_active(const RteTransitStore *store, unsigned int service_index, unsigned int date) {
+    const RteTransitService *service;
+    unsigned int index;
+    unsigned int weekday;
+    int base_active;
+    if (service_index >= store->service_count) return 0;
+    service = &store->services[service_index];
+    for (index = 0U; index < service->exception_count && service->exception_offset + index < store->exception_count; ++index) {
+        const RteTransitException *exception = &store->exceptions[service->exception_offset + index];
+        if (exception->date == date) return exception->exception_type == 1U;
+    }
+    if (service->start_date == 0U || service->end_date == 0U || date < service->start_date || date > service->end_date) return 0;
+    weekday = (unsigned int)day_of_week_monday0(date);
+    base_active = (service->dow_mask & (1U << weekday)) != 0U;
+    return base_active;
+}
+
+static unsigned int walking_seconds_for_meters(unsigned int meters) {
+    return (unsigned int)(((unsigned long long)meters * 3600ULL + 4799ULL) / 4800ULL);
+}
+
+static int evaluate_transit_plan(const RteTransitStore *store, const RteResolvedAddress *from, const RteResolvedAddress *to, const RteOutput *output, RteTransitPlan *plan) {
+    unsigned int event_index;
+    unsigned int current_trip = 0xffffffffU;
+    int trip_active = 0;
+    int board_found = 0;
+    unsigned int board_departure = 0U;
+    unsigned int board_sequence = 0U;
+    unsigned int board_stop_index = 0U;
+
+    rt_memset(plan, 0, sizeof(*plan));
+    if ((!output->have_depart && !output->have_arrive) || store->stop_count == 0U || store->event_count == 0U) return 0;
+    for (event_index = 0U; event_index < store->event_count; ++event_index) {
+        const RteTransitEvent *event = &store->events[event_index];
+        const RteTransitTrip *trip;
+        const RteTransitStop *stop;
+        unsigned int walk_from_m;
+        unsigned int walk_to_m;
+        unsigned int walk_from_sec;
+        unsigned int walk_to_sec;
+        plan->events_scanned += 1ULL;
+        if (event->trip_index >= store->trip_count || event->stop_index >= store->stop_count) continue;
+        if (event->trip_index != current_trip) {
+            current_trip = event->trip_index;
+            trip = &store->trips[current_trip];
+            trip_active = transit_service_active(store, trip->service_index, output->have_depart ? output->depart_date : output->arrive_date);
+            if (trip_active) plan->active_trips += 1U;
+            board_found = 0;
+            board_departure = 0U;
+            board_sequence = 0U;
+            board_stop_index = 0U;
+        }
+        if (!trip_active) continue;
+        stop = &store->stops[event->stop_index];
+        walk_from_m = direct_distance_m(from->record.lat_e7, from->record.lon_e7, stop->lat_e7, stop->lon_e7);
+        walk_to_m = direct_distance_m(to->record.lat_e7, to->record.lon_e7, stop->lat_e7, stop->lon_e7);
+        walk_from_sec = walking_seconds_for_meters(walk_from_m);
+        walk_to_sec = walking_seconds_for_meters(walk_to_m);
+        if (walk_from_m <= 5000U) plan->candidate_origin_stops += 1U;
+        if (walk_to_m <= 5000U) plan->candidate_destination_stops += 1U;
+        if (output->have_depart) {
+            unsigned int earliest_board = output->depart_seconds + walk_from_sec;
+            if (walk_from_m <= 5000U && event->departure_sec >= earliest_board) {
+                plan->board_candidates += 1ULL;
+                if (!board_found || event->departure_sec < board_departure) {
+                    board_found = 1;
+                    board_departure = event->departure_sec;
+                    board_sequence = event->sequence;
+                    board_stop_index = event->stop_index;
+                }
+            }
+            if (board_found && walk_to_m <= 5000U && event->sequence > board_sequence && event->arrival_sec >= board_departure) {
+                unsigned int total_arrival = event->arrival_sec + walk_to_sec;
+                if (!plan->found || total_arrival < output->depart_seconds + plan->total_sec) {
+                    trip = &store->trips[current_trip];
+                    plan->found = 1;
+                    plan->mode = trip->mode;
+                    plan->route_index = trip->route_index;
+                    plan->board_stop_index = board_stop_index;
+                    plan->alight_stop_index = event->stop_index;
+                    plan->board_departure_sec = board_departure;
+                    plan->alight_arrival_sec = event->arrival_sec;
+                    plan->walk_to_stop_m = direct_distance_m(from->record.lat_e7, from->record.lon_e7, store->stops[board_stop_index].lat_e7, store->stops[board_stop_index].lon_e7);
+                    plan->walk_from_stop_m = walk_to_m;
+                    plan->origin_departure_sec = output->depart_seconds;
+                    plan->total_sec = total_arrival - output->depart_seconds;
+                }
+            }
+        } else if (output->have_arrive) {
+            if (walk_from_m <= 5000U && event->departure_sec >= walk_from_sec) {
+                board_found = 1;
+                board_departure = event->departure_sec;
+                board_sequence = event->sequence;
+                board_stop_index = event->stop_index;
+                plan->board_candidates += 1ULL;
+            }
+            if (board_found && walk_to_m <= 5000U && event->sequence > board_sequence && event->arrival_sec >= board_departure && event->arrival_sec + walk_to_sec <= output->arrive_seconds) {
+                unsigned int origin_departure = board_departure - walking_seconds_for_meters(direct_distance_m(from->record.lat_e7, from->record.lon_e7, store->stops[board_stop_index].lat_e7, store->stops[board_stop_index].lon_e7));
+                if (!plan->found || origin_departure > plan->origin_departure_sec) {
+                    trip = &store->trips[current_trip];
+                    plan->found = 1;
+                    plan->mode = trip->mode;
+                    plan->route_index = trip->route_index;
+                    plan->board_stop_index = board_stop_index;
+                    plan->alight_stop_index = event->stop_index;
+                    plan->board_departure_sec = board_departure;
+                    plan->alight_arrival_sec = event->arrival_sec;
+                    plan->walk_to_stop_m = direct_distance_m(from->record.lat_e7, from->record.lon_e7, store->stops[board_stop_index].lat_e7, store->stops[board_stop_index].lon_e7);
+                    plan->walk_from_stop_m = walk_to_m;
+                    plan->origin_departure_sec = origin_departure;
+                    plan->total_sec = output->arrive_seconds - origin_departure;
+                }
+            }
+        }
+    }
+    return 0;
 }
 
 static unsigned int hash_coord_pair(int lat_e7, int lon_e7) {
@@ -1303,6 +1867,89 @@ static int write_human_route(
     return 0;
 }
 
+static void write_transit_plan_text(const RteOutput *output, const RteTransitStore *store, const RteTransitPlan *plan, unsigned long long walking_total_m) {
+    const RteTransitStop *board_stop;
+    const RteTransitStop *alight_stop;
+    const RteTransitRoute *route;
+    unsigned long long walking_sec = walking_seconds_for_meters((unsigned int)walking_total_m);
+    if (!plan->found || plan->board_stop_index >= store->stop_count || plan->alight_stop_index >= store->stop_count || plan->route_index >= store->route_count) return;
+    board_stop = &store->stops[plan->board_stop_index];
+    alight_stop = &store->stops[plan->alight_stop_index];
+    route = &store->routes[plan->route_index];
+    rt_write_char(1, '\n');
+    write_colored_cstr(output, "\033[1;35m", "Transit option");
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "Walk ");
+    write_distance_human(plan->walk_to_stop_m);
+    rt_write_cstr(1, " to ");
+    write_color(output, "\033[1;36m");
+    write_transit_string(store, board_stop->name_offset, board_stop->name_size);
+    write_color_reset(output);
+    rt_write_cstr(1, ", take the ");
+    write_colored_cstr(output, "\033[1;33m", transit_mode_name(plan->mode));
+    rt_write_char(1, ' ');
+    write_color(output, "\033[1;33m");
+    write_transit_string(store, route->short_name_offset, route->short_name_size);
+    write_color_reset(output);
+    rt_write_cstr(1, " at ");
+    write_hhmm(plan->board_departure_sec);
+    rt_write_cstr(1, ", get off at ");
+    write_color(output, "\033[1;36m");
+    write_transit_string(store, alight_stop->name_offset, alight_stop->name_size);
+    write_color_reset(output);
+    rt_write_cstr(1, " at ");
+    write_hhmm(plan->alight_arrival_sec);
+    rt_write_cstr(1, ", then walk ");
+    write_distance_human(plan->walk_from_stop_m);
+    rt_write_cstr(1, " to the destination. Total: about ");
+    write_colored_uint(output, "\033[1;33m", (plan->total_sec + 59U) / 60U);
+    rt_write_cstr(1, " min.");
+    if (walking_sec > plan->total_sec + 60U) {
+        rt_write_cstr(1, " Faster than walking by about ");
+        rt_write_uint(1, (walking_sec - plan->total_sec + 59ULL) / 60ULL);
+        rt_write_cstr(1, " min.");
+    }
+    rt_write_char(1, '\n');
+}
+
+static void json_write_transit_plan_event(RteOutput *output, const RteTransitStore *store, const RteTransitPlan *plan) {
+    const RteTransitStop *board_stop;
+    const RteTransitStop *alight_stop;
+    const RteTransitRoute *route;
+    json_event_begin(output, 1, "transit_plan");
+    if (!plan->found || plan->board_stop_index >= store->stop_count || plan->alight_stop_index >= store->stop_count || plan->route_index >= store->route_count) {
+        rt_write_cstr(1, ",\"data\":{\"status\":\"unavailable\",\"active_trips\":");
+        rt_write_uint(1, plan->active_trips);
+        rt_write_cstr(1, ",\"events_scanned\":");
+        rt_write_uint(1, plan->events_scanned);
+        rt_write_cstr(1, "}}\n");
+        return;
+    }
+    board_stop = &store->stops[plan->board_stop_index];
+    alight_stop = &store->stops[plan->alight_stop_index];
+    route = &store->routes[plan->route_index];
+    rt_write_cstr(1, ",\"data\":{\"status\":\"found\",\"mode\":");
+    json_write_cstr_escaped(1, transit_mode_name(plan->mode));
+    rt_write_cstr(1, ",\"route_short_name\":");
+    json_write_transit_string_or_null(1, store, route->short_name_offset, route->short_name_size);
+    rt_write_cstr(1, ",\"route_long_name\":");
+    json_write_transit_string_or_null(1, store, route->long_name_offset, route->long_name_size);
+    rt_write_cstr(1, ",\"board_stop\":");
+    json_write_transit_string_or_null(1, store, board_stop->name_offset, board_stop->name_size);
+    rt_write_cstr(1, ",\"alight_stop\":");
+    json_write_transit_string_or_null(1, store, alight_stop->name_offset, alight_stop->name_size);
+    rt_write_cstr(1, ",\"board_departure_sec\":"); rt_write_uint(1, plan->board_departure_sec);
+    rt_write_cstr(1, ",\"alight_arrival_sec\":"); rt_write_uint(1, plan->alight_arrival_sec);
+    rt_write_cstr(1, ",\"walk_to_stop_m\":"); rt_write_uint(1, plan->walk_to_stop_m);
+    rt_write_cstr(1, ",\"walk_from_stop_m\":"); rt_write_uint(1, plan->walk_from_stop_m);
+    rt_write_cstr(1, ",\"total_sec\":"); rt_write_uint(1, plan->total_sec);
+    rt_write_cstr(1, ",\"active_trips\":"); rt_write_uint(1, plan->active_trips);
+    rt_write_cstr(1, ",\"events_scanned\":"); rt_write_uint(1, plan->events_scanned);
+    json_write_coord_pair(1, "board", board_stop->lat_e7, board_stop->lon_e7);
+    json_write_coord_pair(1, "alight", alight_stop->lat_e7, alight_stop->lon_e7);
+    rt_write_cstr(1, "}}\n");
+}
+
 static void json_write_route_summary_event(
     RteOutput *output,
     const RteGraph *graph,
@@ -1678,6 +2325,8 @@ int main(int argc, char **argv) {
     unsigned char header_bytes[RTE_HEADER_SIZE];
     RteHeader header;
     RteAddressSection address_section;
+    RteTransitSection transit_section;
+    RteTransitStore transit_store;
     RteResolvedAddress from;
     RteResolvedAddress to;
     char *strings;
@@ -1689,6 +2338,7 @@ int main(int argc, char **argv) {
     if (argc == 2 && (rt_strcmp(argv[1], "-h") == 0 || rt_strcmp(argv[1], "--help") == 0)) { write_usage(program); return 0; }
     if (argc < 4) { write_usage(program); return 1; }
     rt_memset(&output, 0, sizeof(output));
+    rt_memset(&transit_store, 0, sizeof(transit_store));
     output.use_color = 1;
     path = argv[1];
     from_query = argv[2];
@@ -1697,6 +2347,15 @@ int main(int argc, char **argv) {
         if (rt_strcmp(argv[argi], "--no-color") == 0) output.use_color = 0;
         else if (rt_strcmp(argv[argi], "--color") == 0) output.use_color = 1;
         else if (rt_strcmp(argv[argi], "--json") == 0) output.json = 1;
+        else if (rt_strcmp(argv[argi], "--depart") == 0) {
+            argi += 1;
+            if (argi >= argc || parse_datetime_arg(argv[argi], &output.depart_date, &output.depart_seconds) != 0) { if (output.json) json_diagnostic(&output, "error", "invalid or missing --depart value", 0); else write_usage(program); return 1; }
+            output.have_depart = 1;
+        } else if (rt_strcmp(argv[argi], "--arrive") == 0) {
+            argi += 1;
+            if (argi >= argc || parse_datetime_arg(argv[argi], &output.arrive_date, &output.arrive_seconds) != 0) { if (output.json) json_diagnostic(&output, "error", "invalid or missing --arrive value", 0); else write_usage(program); return 1; }
+            output.have_arrive = 1;
+        }
         else if (rt_strcmp(argv[argi], "--map") == 0) {
             argi += 1;
             if (argi >= argc) { if (output.json) json_diagnostic(&output, "error", "missing value for --map", 0); else write_usage(program); return 1; }
@@ -1716,15 +2375,20 @@ int main(int argc, char **argv) {
         }
         else { if (output.json) json_diagnostic(&output, "error", "unknown option", argv[argi]); else write_usage(program); return 1; }
     }
+    if (output.have_depart && output.have_arrive) { if (output.json) json_diagnostic(&output, "error", "use either --depart or --arrive, not both", 0); else write_usage(program); return 1; }
     if (output.json) output.use_color = 0;
 
     fd = platform_open_read(path);
     if (fd < 0) { if (output.json) json_diagnostic(&output, "error", "could not open route pack", path); else rt_write_cstr(2, "rtewalkroute: could not open route pack\n"); return 1; }
-    if (read_exact(fd, header_bytes, sizeof(header_bytes)) != 0 || parse_header(header_bytes, &header) != 0 || read_sections(fd, &header, &address_section) != 0) {
+    if (read_exact(fd, header_bytes, sizeof(header_bytes)) != 0 || parse_header(header_bytes, &header) != 0 || read_sections(fd, &header, &address_section, &transit_section) != 0) {
         (void)platform_close(fd);
         if (output.json) json_diagnostic(&output, "error", "invalid or unsupported route pack", path);
         else rt_write_cstr(2, "rtewalkroute: invalid or unsupported route pack\n");
         return 1;
+    }
+    if (!output.have_depart && !output.have_arrive && transit_section.present && set_depart_now(&output) != 0) {
+        if (output.json) json_diagnostic(&output, "warning", "could not determine current departure time", 0);
+        else rt_write_cstr(2, "rtewalkroute: could not determine current departure time; transit suggestions unavailable\n");
     }
     if (!address_section.present || read_address_strings(fd, &address_section, &strings, &strings_size) != 0) {
         (void)platform_close(fd);
@@ -1732,7 +2396,11 @@ int main(int argc, char **argv) {
         else rt_write_cstr(2, "rtewalkroute: route pack has no readable address section\n");
         return 1;
     }
-    if (resolve_address(fd, &address_section, from_query, strings, strings_size, &from) != 0 || resolve_address(fd, &address_section, to_query, strings, strings_size, &to) != 0) {
+    if ((output.have_depart || output.have_arrive) && (!transit_section.present || read_transit_section(fd, &transit_section, &transit_store) != 0)) {
+        if (output.json) json_diagnostic(&output, "warning", "route pack has no readable GTFS transit section", path);
+        else rt_write_cstr(2, "rtewalkroute: route pack has no readable GTFS transit section; transit suggestions unavailable\n");
+    }
+    if (resolve_query(fd, &header, &address_section, from_query, strings, strings_size, &from) != 0 || resolve_query(fd, &header, &address_section, to_query, strings, strings_size, &to) != 0) {
         rt_free(strings);
         (void)platform_close(fd);
         if (output.json) json_diagnostic(&output, "error", "address lookup failed", 0);
@@ -1858,6 +2526,21 @@ int main(int argc, char **argv) {
                         rt_write_cstr(1, "graph_distance_m: "); rt_write_uint(1, route_distance); rt_write_char(1, '\n');
                         (void)write_human_route(&output, &graph, source, target, &from, &to, strings, strings_size, from_snap_m, to_snap_m, route_distance, total_distance, tiles_loaded);
                     }
+                    if ((output.have_depart || output.have_arrive) && transit_store.event_count != 0U) {
+                        RteTransitPlan transit_plan;
+                        (void)evaluate_transit_plan(&transit_store, &from, &to, &output, &transit_plan);
+                        if (output.json) json_write_transit_plan_event(&output, &transit_store, &transit_plan);
+                        else if (transit_plan.found) write_transit_plan_text(&output, &transit_store, &transit_plan, total_distance);
+                        else rt_write_cstr(1, "transit_status: unavailable\ntransit_status_reason: no single-leg GTFS option found for this time\n");
+                    } else if (output.have_depart || output.have_arrive) {
+                        if (output.json) {
+                            RteTransitPlan empty_plan;
+                            rt_memset(&empty_plan, 0, sizeof(empty_plan));
+                            json_write_transit_plan_event(&output, &transit_store, &empty_plan);
+                        } else {
+                            rt_write_cstr(1, "transit_status: unavailable\ntransit_status_reason: no GTFS data in route pack\n");
+                        }
+                    }
                     if (output.map_path != 0 && render_route_map(program, path, &output, &graph, source, target, &from, &to, strings, strings_size) != 0) {
                         if (!output.json) rt_write_cstr(1, "map_status: failed\n");
                     }
@@ -1869,6 +2552,13 @@ int main(int argc, char **argv) {
         }
     }
 
+    rt_free(transit_store.stops);
+    rt_free(transit_store.routes);
+    rt_free(transit_store.services);
+    rt_free(transit_store.exceptions);
+    rt_free(transit_store.trips);
+    rt_free(transit_store.events);
+    rt_free(transit_store.strings);
     rt_free(strings);
     (void)platform_close(fd);
     return 0;

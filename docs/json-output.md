@@ -76,6 +76,18 @@ JSON mode is intended for non-interactive command execution. Fully interactive t
 
 Each command that supports `--json` documents its event names and `data` fields in a `JSON Output` section of its manual page.
 
+### rtewalkroute
+
+`rtewalkroute --json` emits route progress as JSON Lines. Successful walking routes include `metadata`, `address`, `tile_context`, `graph_loaded`, `route_status`, `route`, `route_point`, and `route_step` events. When the route pack contains embedded GTFS data, the stream also includes one `transit_plan` event. If the query does not include `--depart` or `--arrive`, the tool treats it as a departure at the current time.
+
+A found transit plan uses this shape:
+
+```json
+{"schema":"newos.tool.v1","tool":"rtewalkroute","stream":"stdout","event":"transit_plan","seq":273,"data":{"status":"found","mode":"tram","route_short_name":"92","route_long_name":"1556_900","board_stop":"S Potsdam Hauptbahnhof","alight_stop":"Potsdam, Hannes-Meyer-Str.","board_departure_sec":40620,"alight_arrival_sec":41520,"walk_to_stop_m":916,"walk_from_stop_m":214,"total_sec":2081,"active_trips":70778,"events_scanned":6175001,"board_lat":52.3910050,"board_lon":13.0652830,"alight_lat":52.4153520,"alight_lon":13.0402590}}
+```
+
+If no embedded GTFS plan is available, `status` is `unavailable` and the event still reports `active_trips` and `events_scanned` for diagnostics.
+
 ## SEE ALSO
 
 output-style, project-layout, testing

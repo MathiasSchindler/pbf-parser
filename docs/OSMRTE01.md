@@ -218,6 +218,121 @@ Version 1 required global section types:
 0x0505 stop-to-pattern index, when public transport profile is present
 ```
 
+Current implementation note: `osmroutepack --gtfs DIR` writes a compact first transit payload in section `0x0500`. The section is named `GTFSLEG1` and is intentionally narrower than the final route-pattern model: it supports one scheduled vehicle leg plus walking access/egress, which lets `rtewalkroute --depart` and `--arrive` suggest bus, tram, subway, or train options without reading GTFS CSV files at query time. Future sections `0x0501..0x0505` can be added alongside it for multi-transfer routing.
+
+### GTFSLEG1 Transit Section
+
+Section type: `0x0500`.
+
+Header size: 128 bytes.
+
+```text
+offset size field
+0      8    magic = "GTFSLEG1"
+8      4    version = 1
+12     4    header_size = 128
+16     8    stop_count
+24     8    route_count
+32     8    service_count
+40     8    exception_count
+48     8    trip_count
+56     8    event_count
+64     4    string_size
+68     4    reserved = 0
+72     8    stops_offset_relative_to_section
+80     8    routes_offset_relative_to_section
+88     8    services_offset_relative_to_section
+96     8    exceptions_offset_relative_to_section
+104    8    trips_offset_relative_to_section
+112    8    events_offset_relative_to_section
+120    8    strings_offset_relative_to_section
+```
+
+String offsets in the records below point into the section-local UTF-8 string blob. Strings are byte spans and are not required to be NUL terminated.
+
+Stop record size: 40 bytes.
+
+```text
+offset size field
+0      4    stop_id_offset
+4      4    stop_id_size
+8      4    stop_name_offset
+12     4    stop_name_size
+16     4    lat_e7
+20     4    lon_e7
+24     8    tile_id
+32     4    mode_mask
+36     4    reserved = 0
+```
+
+Route record size: 24 bytes.
+
+```text
+offset size field
+0      4    route_short_name_offset
+4      4    route_short_name_size
+8      4    route_long_name_offset
+12     4    route_long_name_size
+16     4    mode
+20     4    original_gtfs_route_type
+```
+
+Mode values:
+
+```text
+1 tram
+2 subway
+3 rail/train
+4 bus
+5 other transit
+```
+
+Service record size: 32 bytes.
+
+```text
+offset size field
+0      4    service_id_offset
+4      4    service_id_size
+8      4    start_date YYYYMMDD
+12     4    end_date YYYYMMDD
+16     4    weekday_mask, bit 0 = Monday
+20     4    exception_offset
+24     4    exception_count
+28     4    reserved = 0
+```
+
+Exception record size: 16 bytes.
+
+```text
+offset size field
+0      4    service_index
+4      4    date YYYYMMDD
+8      4    exception_type, GTFS calendar_dates semantics
+12     4    reserved = 0
+```
+
+Trip record size: 12 bytes.
+
+```text
+offset size field
+0      4    route_index
+4      4    service_index
+8      4    mode
+```
+
+Stop-time event record size: 20 bytes.
+
+```text
+offset size field
+0      4    trip_index
+4      4    stop_index
+8      4    arrival_sec, may exceed 86400 for after-midnight trips
+12     4    departure_sec, may exceed 86400 for after-midnight trips
+16     4    stop_sequence
+```
+
+Events are sorted by `(trip_index, stop_sequence)`. The query tool scans active trips, finds candidate boarding stops within the access-walk radius, then finds a later alighting stop within the egress-walk radius.
+
 Per-tile walking payloads are reached from tile directory records rather than by scanning the global section directory.
 
 ## Tile Model
