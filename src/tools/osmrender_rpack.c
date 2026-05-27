@@ -102,6 +102,70 @@ typedef struct {
     unsigned long long blue_sum;
 } PngColorBucket;
 
+#define GTFS_MODE_BUS    (1U << 0)
+#define GTFS_MODE_TRAM   (1U << 1)
+#define GTFS_MODE_RAIL   (1U << 2)
+#define GTFS_MODE_SUBWAY (1U << 3)
+#define GTFS_MODE_FERRY  (1U << 4)
+#define GTFS_MODE_OTHER  (1U << 5)
+
+typedef struct {
+    const char *data;
+    size_t size;
+} CsvField;
+
+typedef struct {
+    char *key;
+    size_t key_size;
+    unsigned int value;
+} GtfsStringMapEntry;
+
+typedef struct {
+    GtfsStringMapEntry *entries;
+    unsigned int capacity;
+    unsigned int count;
+} GtfsStringMap;
+
+typedef struct {
+    unsigned long long key;
+    unsigned int value;
+    int used;
+} GtfsU64MapEntry;
+
+typedef struct {
+    GtfsU64MapEntry *entries;
+    unsigned int capacity;
+    unsigned int count;
+} GtfsU64Map;
+
+typedef struct {
+    char *stop_id;
+    long long lon_nano;
+    long long lat_nano;
+    unsigned int mode_mask;
+} GtfsStop;
+
+typedef struct {
+    char *key;
+    size_t key_size;
+    unsigned int index;
+} GtfsStopMapEntry;
+
+typedef struct {
+    GtfsStop *stops;
+    GtfsStopMapEntry *entries;
+    unsigned int stop_count;
+    unsigned int stop_capacity;
+    unsigned int map_capacity;
+} GtfsStopSet;
+
+typedef struct {
+    int fd;
+    unsigned char buffer[65536];
+    size_t position;
+    size_t used;
+} GtfsLineReader;
+
 typedef struct {
     long long min_lon_nano;
     long long min_lat_nano;
@@ -136,6 +200,16 @@ typedef struct {
     int exclave_insets;
     int have_exclave_bbox;
     int png_palette;
+    const char *gtfs_path;
+    unsigned long long gtfs_stops_loaded;
+    unsigned long long gtfs_stop_times_seen;
+    unsigned long long gtfs_stops_drawn;
+    unsigned long long gtfs_bus_stops;
+    unsigned long long gtfs_tram_stops;
+    unsigned long long gtfs_rail_stops;
+    unsigned long long gtfs_subway_stops;
+    unsigned long long gtfs_ferry_stops;
+    unsigned long long gtfs_other_stops;
     unsigned long long features_seen;
     unsigned long long features_skipped;
     unsigned long long features_collected;
@@ -250,7 +324,7 @@ static const RenderLayer render_layers[] = {
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " PACK.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--exclave-insets] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]\n");
+    rt_write_cstr(2, " PACK.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--gtfs DIR] [--exclave-insets] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]\n");
 }
 
 static void write_profile_ms(const char *label, unsigned long long elapsed_ms) {
@@ -352,6 +426,440 @@ static int parse_coord_part(const char *text, size_t size, long long *value_out)
     *value_out = (long long)(whole * 1000000000ULL + fraction);
     if (negative) *value_out = -*value_out;
     return 0;
+}
+
+static int parse_gtfs_coord_field(CsvField field, long long *value_out) {
+    size_t index = 0U;
+    unsigned long long whole = 0ULL;
+    unsigned long long fraction = 0ULL;
+    unsigned int fraction_digits = 0U;
+    int negative = 0;
+
+    if (field.size == 0U) return -1;
+    if (field.data[index] == '-') {
+        negative = 1;
+        index += 1U;
+    }
+    if (index >= field.size || field.data[index] < '0' || field.data[index] > '9') return -1;
+    while (index < field.size && field.data[index] >= '0' && field.data[index] <= '9') {
+        whole = whole * 10ULL + (unsigned long long)(field.data[index] - '0');
+        if (whole > 180ULL) return -1;
+        index += 1U;
+    }
+    if (index < field.size && field.data[index] == '.') {
+        index += 1U;
+        while (index < field.size && field.data[index] >= '0' && field.data[index] <= '9') {
+            if (fraction_digits < 9U) {
+                fraction = fraction * 10ULL + (unsigned long long)(field.data[index] - '0');
+                fraction_digits += 1U;
+            }
+            index += 1U;
+        }
+    }
+    if (index != field.size) return -1;
+    while (fraction_digits < 9U) {
+        fraction *= 10ULL;
+        fraction_digits += 1U;
+    }
+    *value_out = (long long)(whole * 1000000000ULL + fraction);
+    if (negative) *value_out = -*value_out;
+    return 0;
+}
+
+static unsigned int gtfs_hash_bytes(const char *data, size_t size) {
+    unsigned int hash = 2166136261U;
+    size_t index;
+
+    for (index = 0U; index < size; ++index) {
+        hash ^= (unsigned char)data[index];
+        hash *= 16777619U;
+    }
+    return hash;
+}
+
+static int csv_field_equals_cstr(CsvField field, const char *text) {
+    size_t size = rt_strlen(text);
+
+    return field.size == size && memcmp(field.data, text, size) == 0;
+}
+
+static char *csv_field_copy(CsvField field) {
+    char *copy = (char *)rt_malloc(field.size + 1U);
+
+    if (copy == 0) return 0;
+    memcpy(copy, field.data, field.size);
+    copy[field.size] = '\0';
+    return copy;
+}
+
+static int csv_get_fields(const char *line, const unsigned int *indexes, unsigned int index_count, CsvField *fields) {
+    unsigned int matched = 0U;
+    unsigned int field_index = 0U;
+    size_t offset = 0U;
+
+    while (line[offset] != '\0') {
+        size_t start;
+        size_t end;
+        int quoted = 0;
+
+        if (line[offset] == '"') {
+            quoted = 1;
+            offset += 1U;
+            start = offset;
+            while (line[offset] != '\0') {
+                if (line[offset] == '"') {
+                    if (line[offset + 1U] == '"') {
+                        offset += 2U;
+                    } else {
+                        break;
+                    }
+                } else {
+                    offset += 1U;
+                }
+            }
+            end = offset;
+            if (line[offset] == '"') offset += 1U;
+            while (line[offset] != '\0' && line[offset] != ',') offset += 1U;
+        } else {
+            start = offset;
+            while (line[offset] != '\0' && line[offset] != ',') offset += 1U;
+            end = offset;
+            while (end > start && (line[end - 1U] == '\r' || line[end - 1U] == '\n')) end -= 1U;
+        }
+
+        if (!quoted) {
+            while (end > start && line[end - 1U] == ' ') end -= 1U;
+            while (start < end && line[start] == ' ') start += 1U;
+        }
+        for (matched = 0U; matched < index_count; ++matched) {
+            if (indexes[matched] == field_index) {
+                fields[matched].data = line + start;
+                fields[matched].size = end - start;
+                break;
+            }
+        }
+        if (line[offset] == ',') offset += 1U;
+        field_index += 1U;
+    }
+    return 0;
+}
+
+static int gtfs_open_file(const char *dir_path, const char *name) {
+    char path[1024];
+
+    if (rt_join_path(dir_path, name, path, sizeof(path)) != 0) return -1;
+    return platform_open_read(path);
+}
+
+static void gtfs_line_reader_init(GtfsLineReader *reader, int fd) {
+    reader->fd = fd;
+    reader->position = 0U;
+    reader->used = 0U;
+}
+
+static int gtfs_read_line(GtfsLineReader *reader, char *line, size_t line_capacity, size_t *line_size_out) {
+    size_t line_size = 0U;
+
+    if (line_capacity == 0U) return -1;
+    for (;;) {
+        if (reader->position >= reader->used) {
+            long amount = platform_read(reader->fd, reader->buffer, sizeof(reader->buffer));
+            if (amount < 0) return -1;
+            if (amount == 0) {
+                if (line_size == 0U) return 0;
+                line[line_size] = '\0';
+                if (line_size_out != 0) *line_size_out = line_size;
+                return 1;
+            }
+            reader->position = 0U;
+            reader->used = (size_t)amount;
+        }
+        while (reader->position < reader->used) {
+            char ch = (char)reader->buffer[reader->position++];
+
+            if (line_size + 1U >= line_capacity) return -1;
+            if (ch == '\n') {
+                if (line_size > 0U && line[line_size - 1U] == '\r') line_size -= 1U;
+                line[line_size] = '\0';
+                if (line_size_out != 0) *line_size_out = line_size;
+                return 1;
+            }
+            line[line_size++] = ch;
+        }
+    }
+}
+
+static int gtfs_string_map_grow(GtfsStringMap *map, unsigned int needed) {
+    unsigned int capacity = map->capacity == 0U ? 2048U : map->capacity;
+    GtfsStringMapEntry *entries;
+    unsigned int old_capacity = map->capacity;
+    unsigned int index;
+
+    while (capacity * 7U / 10U < needed) {
+        if (capacity > 0x40000000U) return -1;
+        capacity *= 2U;
+    }
+    if (capacity == map->capacity) return 0;
+    entries = (GtfsStringMapEntry *)rt_malloc(sizeof(*entries) * (size_t)capacity);
+    if (entries == 0) return -1;
+    rt_memset(entries, 0, sizeof(*entries) * (size_t)capacity);
+    for (index = 0U; index < old_capacity; ++index) {
+        if (map->entries[index].key != 0) {
+            unsigned int slot = gtfs_hash_bytes(map->entries[index].key, map->entries[index].key_size) & (capacity - 1U);
+            while (entries[slot].key != 0) slot = (slot + 1U) & (capacity - 1U);
+            entries[slot] = map->entries[index];
+        }
+    }
+    rt_free(map->entries);
+    map->entries = entries;
+    map->capacity = capacity;
+    return 0;
+}
+
+static int gtfs_string_map_put(GtfsStringMap *map, CsvField key, unsigned int value) {
+    unsigned int slot;
+
+    if (key.size == 0U || value == 0U) return 0;
+    if (gtfs_string_map_grow(map, map->count + 1U) != 0) return -1;
+    slot = gtfs_hash_bytes(key.data, key.size) & (map->capacity - 1U);
+    for (;;) {
+        if (map->entries[slot].key == 0) {
+            map->entries[slot].key = csv_field_copy(key);
+            if (map->entries[slot].key == 0) return -1;
+            map->entries[slot].key_size = key.size;
+            map->entries[slot].value = value;
+            map->count += 1U;
+            return 0;
+        }
+        if (map->entries[slot].key_size == key.size && memcmp(map->entries[slot].key, key.data, key.size) == 0) {
+            map->entries[slot].value |= value;
+            return 0;
+        }
+        slot = (slot + 1U) & (map->capacity - 1U);
+    }
+}
+
+static unsigned int gtfs_string_map_get(const GtfsStringMap *map, CsvField key) {
+    unsigned int slot;
+
+    if (map->capacity == 0U || key.size == 0U) return 0U;
+    slot = gtfs_hash_bytes(key.data, key.size) & (map->capacity - 1U);
+    for (;;) {
+        if (map->entries[slot].key == 0) return 0U;
+        if (map->entries[slot].key_size == key.size && memcmp(map->entries[slot].key, key.data, key.size) == 0) return map->entries[slot].value;
+        slot = (slot + 1U) & (map->capacity - 1U);
+    }
+}
+
+static void gtfs_string_map_destroy(GtfsStringMap *map) {
+    unsigned int index;
+
+    for (index = 0U; index < map->capacity; ++index) rt_free(map->entries[index].key);
+    rt_free(map->entries);
+    map->entries = 0;
+    map->capacity = 0U;
+    map->count = 0U;
+}
+
+static unsigned int gtfs_route_type_to_mode(unsigned int route_type) {
+    if (route_type == 0U || (route_type >= 900U && route_type < 1000U)) return GTFS_MODE_TRAM;
+    if (route_type == 1U || (route_type >= 400U && route_type < 500U)) return GTFS_MODE_SUBWAY;
+    if (route_type == 2U || (route_type >= 100U && route_type < 200U)) return GTFS_MODE_RAIL;
+    if (route_type == 3U || (route_type >= 700U && route_type < 800U)) return GTFS_MODE_BUS;
+    if (route_type == 4U || (route_type >= 1000U && route_type < 1100U)) return GTFS_MODE_FERRY;
+    return GTFS_MODE_OTHER;
+}
+
+static int gtfs_parse_uint_field(CsvField field, unsigned int *value_out) {
+    char buffer[32];
+
+    if (field.size == 0U || field.size >= sizeof(buffer)) return -1;
+    memcpy(buffer, field.data, field.size);
+    buffer[field.size] = '\0';
+    {
+        unsigned long long value;
+        if (rt_parse_uint(buffer, &value) != 0 || value > 0xffffffffULL) return -1;
+        *value_out = (unsigned int)value;
+    }
+    return 0;
+}
+
+static int gtfs_parse_u64_bytes(const char *data, size_t size, unsigned long long *value_out) {
+    unsigned long long value = 0ULL;
+    size_t index;
+
+    if (size == 0U) return -1;
+    for (index = 0U; index < size; ++index) {
+        char ch = data[index];
+        if (ch < '0' || ch > '9') return -1;
+        if (value > (0xffffffffffffffffULL - (unsigned long long)(ch - '0')) / 10ULL) return -1;
+        value = value * 10ULL + (unsigned long long)(ch - '0');
+    }
+    *value_out = value;
+    return 0;
+}
+
+static unsigned int gtfs_u64_hash(unsigned long long value) {
+    value ^= value >> 33U;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33U;
+    value *= 0xc4ceb9fe1a85ec53ULL;
+    value ^= value >> 33U;
+    return (unsigned int)value;
+}
+
+static int gtfs_u64_map_grow(GtfsU64Map *map, unsigned int needed) {
+    unsigned int capacity = map->capacity == 0U ? 4096U : map->capacity;
+    GtfsU64MapEntry *entries;
+    unsigned int old_capacity = map->capacity;
+    unsigned int index;
+
+    while (capacity * 7U / 10U < needed) {
+        if (capacity > 0x40000000U) return -1;
+        capacity *= 2U;
+    }
+    if (capacity == map->capacity) return 0;
+    entries = (GtfsU64MapEntry *)rt_malloc(sizeof(*entries) * (size_t)capacity);
+    if (entries == 0) return -1;
+    rt_memset(entries, 0, sizeof(*entries) * (size_t)capacity);
+    for (index = 0U; index < old_capacity; ++index) {
+        if (map->entries[index].used) {
+            unsigned int slot = gtfs_u64_hash(map->entries[index].key) & (capacity - 1U);
+            while (entries[slot].used) slot = (slot + 1U) & (capacity - 1U);
+            entries[slot] = map->entries[index];
+        }
+    }
+    rt_free(map->entries);
+    map->entries = entries;
+    map->capacity = capacity;
+    return 0;
+}
+
+static int gtfs_u64_map_put(GtfsU64Map *map, unsigned long long key, unsigned int value) {
+    unsigned int slot;
+
+    if (value == 0U) return 0;
+    if (gtfs_u64_map_grow(map, map->count + 1U) != 0) return -1;
+    slot = gtfs_u64_hash(key) & (map->capacity - 1U);
+    for (;;) {
+        if (!map->entries[slot].used) {
+            map->entries[slot].key = key;
+            map->entries[slot].value = value;
+            map->entries[slot].used = 1;
+            map->count += 1U;
+            return 0;
+        }
+        if (map->entries[slot].key == key) {
+            map->entries[slot].value |= value;
+            return 0;
+        }
+        slot = (slot + 1U) & (map->capacity - 1U);
+    }
+}
+
+static unsigned int gtfs_u64_map_get(const GtfsU64Map *map, unsigned long long key) {
+    unsigned int slot;
+
+    if (map->capacity == 0U) return 0U;
+    slot = gtfs_u64_hash(key) & (map->capacity - 1U);
+    for (;;) {
+        if (!map->entries[slot].used) return 0U;
+        if (map->entries[slot].key == key) return map->entries[slot].value;
+        slot = (slot + 1U) & (map->capacity - 1U);
+    }
+}
+
+static void gtfs_u64_map_destroy(GtfsU64Map *map) {
+    rt_free(map->entries);
+    map->entries = 0;
+    map->capacity = 0U;
+    map->count = 0U;
+}
+
+static int gtfs_stop_set_grow(GtfsStopSet *set, unsigned int needed) {
+    unsigned int capacity = set->stop_capacity == 0U ? 1024U : set->stop_capacity;
+    GtfsStop *stops;
+
+    while (capacity < needed) {
+        if (capacity > 0x40000000U) return -1;
+        capacity *= 2U;
+    }
+    if (capacity == set->stop_capacity) return 0;
+    stops = (GtfsStop *)rt_realloc(set->stops, sizeof(*stops) * (size_t)capacity);
+    if (stops == 0) return -1;
+    set->stops = stops;
+    set->stop_capacity = capacity;
+    return 0;
+}
+
+static int gtfs_stop_map_grow(GtfsStopSet *set, unsigned int needed) {
+    unsigned int capacity = set->map_capacity == 0U ? 2048U : set->map_capacity;
+    GtfsStopMapEntry *entries;
+    unsigned int old_capacity = set->map_capacity;
+    unsigned int index;
+
+    while (capacity * 7U / 10U < needed) {
+        if (capacity > 0x40000000U) return -1;
+        capacity *= 2U;
+    }
+    if (capacity == set->map_capacity) return 0;
+    entries = (GtfsStopMapEntry *)rt_malloc(sizeof(*entries) * (size_t)capacity);
+    if (entries == 0) return -1;
+    rt_memset(entries, 0, sizeof(*entries) * (size_t)capacity);
+    for (index = 0U; index < old_capacity; ++index) {
+        if (set->entries[index].key != 0) {
+            unsigned int slot = gtfs_hash_bytes(set->entries[index].key, set->entries[index].key_size) & (capacity - 1U);
+            while (entries[slot].key != 0) slot = (slot + 1U) & (capacity - 1U);
+            entries[slot] = set->entries[index];
+        }
+    }
+    rt_free(set->entries);
+    set->entries = entries;
+    set->map_capacity = capacity;
+    return 0;
+}
+
+static int gtfs_stop_set_add(GtfsStopSet *set, CsvField stop_id, long long lon_nano, long long lat_nano) {
+    GtfsStop *stop;
+    unsigned int slot;
+
+    if (stop_id.size == 0U) return 0;
+    if (gtfs_stop_set_grow(set, set->stop_count + 1U) != 0 || gtfs_stop_map_grow(set, set->stop_count + 1U) != 0) return -1;
+    stop = &set->stops[set->stop_count];
+    stop->stop_id = csv_field_copy(stop_id);
+    if (stop->stop_id == 0) return -1;
+    stop->lon_nano = lon_nano;
+    stop->lat_nano = lat_nano;
+    stop->mode_mask = 0U;
+
+    slot = gtfs_hash_bytes(stop_id.data, stop_id.size) & (set->map_capacity - 1U);
+    while (set->entries[slot].key != 0) slot = (slot + 1U) & (set->map_capacity - 1U);
+    set->entries[slot].key = stop->stop_id;
+    set->entries[slot].key_size = stop_id.size;
+    set->entries[slot].index = set->stop_count;
+    set->stop_count += 1U;
+    return 0;
+}
+
+static GtfsStop *gtfs_stop_set_find(GtfsStopSet *set, CsvField stop_id) {
+    unsigned int slot;
+
+    if (set->map_capacity == 0U || stop_id.size == 0U) return 0;
+    slot = gtfs_hash_bytes(stop_id.data, stop_id.size) & (set->map_capacity - 1U);
+    for (;;) {
+        if (set->entries[slot].key == 0) return 0;
+        if (set->entries[slot].key_size == stop_id.size && memcmp(set->entries[slot].key, stop_id.data, stop_id.size) == 0) return &set->stops[set->entries[slot].index];
+        slot = (slot + 1U) & (set->map_capacity - 1U);
+    }
+}
+
+static void gtfs_stop_set_destroy(GtfsStopSet *set) {
+    unsigned int index;
+
+    for (index = 0U; index < set->stop_count; ++index) rt_free(set->stops[index].stop_id);
+    rt_free(set->stops);
+    rt_free(set->entries);
+    rt_memset(set, 0, sizeof(*set));
 }
 
 static int parse_bbox_arg(const char *text, RenderContext *context) {
@@ -1741,6 +2249,345 @@ static void put_brush(RenderContext *context, int pixel_x, int pixel_y, const Re
     }
 }
 
+static void draw_gtfs_circle(RenderContext *context, int pixel_x, int pixel_y, int radius, unsigned char red, unsigned char green, unsigned char blue, unsigned char alpha) {
+    int radius2 = radius * radius;
+    int y;
+
+    for (y = -radius; y <= radius; ++y) {
+        int x;
+        for (x = -radius; x <= radius; ++x) {
+            if (x * x + y * y <= radius2) put_pixel_rgb(context, pixel_x + x, pixel_y + y, red, green, blue, alpha);
+        }
+    }
+}
+
+static unsigned int gtfs_dot_radius(const RenderContext *context, unsigned int mode) {
+    unsigned int min_dimension = context->width < context->height ? context->width : context->height;
+    unsigned int radius = min_dimension / 900U;
+
+    if (radius < 3U) radius = 3U;
+    if (radius > 10U) radius = 10U;
+    if ((mode & (GTFS_MODE_RAIL | GTFS_MODE_SUBWAY)) != 0U && radius < 12U) radius += 2U;
+    return radius;
+}
+
+static void draw_gtfs_mode_dot(RenderContext *context, int pixel_x, int pixel_y, unsigned int mode) {
+    unsigned char red = 96U;
+    unsigned char green = 96U;
+    unsigned char blue = 96U;
+    unsigned int radius = gtfs_dot_radius(context, mode);
+
+    if ((mode & GTFS_MODE_RAIL) != 0U) {
+        red = 205U;
+        green = 38U;
+        blue = 54U;
+    } else if ((mode & GTFS_MODE_SUBWAY) != 0U) {
+        red = 132U;
+        green = 73U;
+        blue = 177U;
+    } else if ((mode & GTFS_MODE_TRAM) != 0U) {
+        red = 226U;
+        green = 116U;
+        blue = 31U;
+    } else if ((mode & GTFS_MODE_FERRY) != 0U) {
+        red = 0U;
+        green = 143U;
+        blue = 156U;
+    } else if ((mode & GTFS_MODE_BUS) != 0U) {
+        red = 24U;
+        green = 112U;
+        blue = 190U;
+    }
+
+    draw_gtfs_circle(context, pixel_x, pixel_y, (int)radius + 2, 255U, 255U, 255U, 215U);
+    draw_gtfs_circle(context, pixel_x, pixel_y, (int)radius + 1, 38U, 45U, 54U, 170U);
+    draw_gtfs_circle(context, pixel_x, pixel_y, (int)radius, red, green, blue, 245U);
+}
+
+static int gtfs_load_visible_stops(RenderContext *context, const char *dir_path, GtfsStopSet *stop_set) {
+    static const unsigned int indexes[4] = {0U, 4U, 5U, 6U};
+    char line[65536];
+    GtfsLineReader reader;
+    int fd = gtfs_open_file(dir_path, "stops.txt");
+    int read_result;
+
+    if (fd < 0) return -1;
+    gtfs_line_reader_init(&reader, fd);
+    read_result = gtfs_read_line(&reader, line, sizeof(line), 0);
+    if (read_result <= 0) {
+        (void)platform_close(fd);
+        return -1;
+    }
+    for (;;) {
+        CsvField fields[4] = {{0, 0U}, {0, 0U}, {0, 0U}, {0, 0U}};
+        long long lat_nano;
+        long long lon_nano;
+
+        read_result = gtfs_read_line(&reader, line, sizeof(line), 0);
+        if (read_result < 0) {
+            (void)platform_close(fd);
+            return -1;
+        }
+        if (read_result == 0) break;
+        (void)csv_get_fields(line, indexes, 4U, fields);
+        if (fields[3].size != 0U && !csv_field_equals_cstr(fields[3], "0")) continue;
+        if (parse_gtfs_coord_field(fields[1], &lat_nano) != 0 || parse_gtfs_coord_field(fields[2], &lon_nano) != 0) continue;
+        if (lon_nano < context->min_lon_nano || lon_nano > context->max_lon_nano || lat_nano < context->min_lat_nano || lat_nano > context->max_lat_nano) continue;
+        if (gtfs_stop_set_add(stop_set, fields[0], lon_nano, lat_nano) != 0) {
+            (void)platform_close(fd);
+            return -1;
+        }
+    }
+    (void)platform_close(fd);
+    context->gtfs_stops_loaded = stop_set->stop_count;
+    return 0;
+}
+
+static int gtfs_load_routes(const char *dir_path, GtfsStringMap *route_modes) {
+    static const unsigned int indexes[2] = {0U, 4U};
+    char line[65536];
+    GtfsLineReader reader;
+    int fd = gtfs_open_file(dir_path, "routes.txt");
+    int read_result;
+
+    if (fd < 0) return -1;
+    gtfs_line_reader_init(&reader, fd);
+    read_result = gtfs_read_line(&reader, line, sizeof(line), 0);
+    if (read_result <= 0) {
+        (void)platform_close(fd);
+        return -1;
+    }
+    for (;;) {
+        CsvField fields[2] = {{0, 0U}, {0, 0U}};
+        unsigned int route_type;
+        unsigned int mode;
+
+        read_result = gtfs_read_line(&reader, line, sizeof(line), 0);
+        if (read_result < 0) {
+            (void)platform_close(fd);
+            return -1;
+        }
+        if (read_result == 0) break;
+        (void)csv_get_fields(line, indexes, 2U, fields);
+        if (gtfs_parse_uint_field(fields[1], &route_type) != 0) continue;
+        mode = gtfs_route_type_to_mode(route_type);
+        if (gtfs_string_map_put(route_modes, fields[0], mode) != 0) {
+            (void)platform_close(fd);
+            return -1;
+        }
+    }
+    (void)platform_close(fd);
+    return 0;
+}
+
+static int gtfs_load_trips(const char *dir_path, const GtfsStringMap *route_modes, GtfsU64Map *trip_modes) {
+    static const unsigned int indexes[2] = {0U, 2U};
+    char line[65536];
+    GtfsLineReader reader;
+    int fd = gtfs_open_file(dir_path, "trips.txt");
+    int read_result;
+
+    if (fd < 0) return -1;
+    gtfs_line_reader_init(&reader, fd);
+    read_result = gtfs_read_line(&reader, line, sizeof(line), 0);
+    if (read_result <= 0) {
+        (void)platform_close(fd);
+        return -1;
+    }
+    for (;;) {
+        CsvField fields[2] = {{0, 0U}, {0, 0U}};
+        unsigned int mode;
+        unsigned long long trip_id;
+
+        read_result = gtfs_read_line(&reader, line, sizeof(line), 0);
+        if (read_result < 0) {
+            (void)platform_close(fd);
+            return -1;
+        }
+        if (read_result == 0) break;
+        (void)csv_get_fields(line, indexes, 2U, fields);
+        mode = gtfs_string_map_get(route_modes, fields[0]);
+        if (mode == 0U) continue;
+        if (gtfs_parse_u64_bytes(fields[1].data, fields[1].size, &trip_id) != 0) continue;
+        if (gtfs_u64_map_put(trip_modes, trip_id, mode) != 0) {
+            (void)platform_close(fd);
+            return -1;
+        }
+    }
+    (void)platform_close(fd);
+    return 0;
+}
+
+static void gtfs_apply_stop_time_record(RenderContext *context, const GtfsU64Map *trip_modes, GtfsStopSet *stop_set,
+                                        const char *trip_data, size_t trip_size, const char *stop_data, size_t stop_size) {
+    CsvField stop_id;
+    GtfsStop *stop;
+    unsigned int mode;
+    unsigned long long trip_id;
+
+    if (trip_size == 0U || stop_size == 0U) return;
+    if (gtfs_parse_u64_bytes(trip_data, trip_size, &trip_id) != 0) return;
+    stop_id.data = stop_data;
+    stop_id.size = stop_size;
+    context->gtfs_stop_times_seen += 1ULL;
+    stop = gtfs_stop_set_find(stop_set, stop_id);
+    if (stop == 0) return;
+    mode = gtfs_u64_map_get(trip_modes, trip_id);
+    if (mode != 0U) stop->mode_mask |= mode;
+}
+
+static int gtfs_apply_stop_times(RenderContext *context, const char *dir_path, const GtfsU64Map *trip_modes, GtfsStopSet *stop_set) {
+    enum { GTFS_ST_HEADER = 0, GTFS_ST_TRIP = 1, GTFS_ST_STOP_START = 2, GTFS_ST_STOP_QUOTED = 3, GTFS_ST_STOP_RAW = 4, GTFS_ST_SKIP = 5 } state = GTFS_ST_HEADER;
+    char trip_buffer[128];
+    char stop_buffer[512];
+    size_t trip_size = 0U;
+    size_t stop_size = 0U;
+    unsigned char *buffer;
+    int fd = gtfs_open_file(dir_path, "stop_times.txt");
+    int result = -1;
+
+    if (fd < 0) return -1;
+    buffer = (unsigned char *)rt_malloc(1024U * 1024U);
+    if (buffer == 0) {
+        (void)platform_close(fd);
+        return -1;
+    }
+    for (;;) {
+        long amount = platform_read(fd, buffer, 1024U * 1024U);
+        size_t index;
+
+        if (amount < 0) goto cleanup;
+        if (amount == 0) break;
+        for (index = 0U; index < (size_t)amount; ++index) {
+            char ch = (char)buffer[index];
+
+            if (state == GTFS_ST_HEADER) {
+                if (ch == '\n') {
+                    state = GTFS_ST_TRIP;
+                    trip_size = 0U;
+                    stop_size = 0U;
+                }
+            } else if (state == GTFS_ST_TRIP) {
+                if (ch == ',') {
+                    state = GTFS_ST_STOP_START;
+                    stop_size = 0U;
+                } else if (ch == '\n') {
+                    trip_size = 0U;
+                } else if (ch != '\r' && trip_size + 1U < sizeof(trip_buffer)) {
+                    trip_buffer[trip_size++] = ch;
+                }
+            } else if (state == GTFS_ST_STOP_START) {
+                if (ch == '"') {
+                    state = GTFS_ST_STOP_QUOTED;
+                    stop_size = 0U;
+                } else if (ch == ',') {
+                    state = GTFS_ST_SKIP;
+                } else if (ch == '\n') {
+                    state = GTFS_ST_TRIP;
+                    trip_size = 0U;
+                    stop_size = 0U;
+                } else if (ch != '\r') {
+                    state = GTFS_ST_STOP_RAW;
+                    stop_size = 0U;
+                    if (stop_size + 1U < sizeof(stop_buffer)) stop_buffer[stop_size++] = ch;
+                }
+            } else if (state == GTFS_ST_STOP_QUOTED) {
+                if (ch == '"') {
+                    gtfs_apply_stop_time_record(context, trip_modes, stop_set, trip_buffer, trip_size, stop_buffer, stop_size);
+                    state = GTFS_ST_SKIP;
+                } else if (stop_size + 1U < sizeof(stop_buffer)) {
+                    stop_buffer[stop_size++] = ch;
+                }
+            } else if (state == GTFS_ST_STOP_RAW) {
+                if (ch == ',' || ch == '\n') {
+                    gtfs_apply_stop_time_record(context, trip_modes, stop_set, trip_buffer, trip_size, stop_buffer, stop_size);
+                    if (ch == '\n') {
+                        state = GTFS_ST_TRIP;
+                        trip_size = 0U;
+                        stop_size = 0U;
+                    } else {
+                        state = GTFS_ST_SKIP;
+                    }
+                } else if (ch != '\r' && stop_size + 1U < sizeof(stop_buffer)) {
+                    stop_buffer[stop_size++] = ch;
+                }
+            } else {
+                if (ch == '\n') {
+                    state = GTFS_ST_TRIP;
+                    trip_size = 0U;
+                    stop_size = 0U;
+                }
+            }
+        }
+    }
+    if (state == GTFS_ST_STOP_RAW) gtfs_apply_stop_time_record(context, trip_modes, stop_set, trip_buffer, trip_size, stop_buffer, stop_size);
+    result = 0;
+
+cleanup:
+    rt_free(buffer);
+    if (platform_close(fd) != 0) result = -1;
+    return result;
+}
+
+static void gtfs_draw_stops(RenderContext *context, GtfsStopSet *stop_set) {
+    unsigned int index;
+
+    for (index = 0U; index < stop_set->stop_count; ++index) {
+        GtfsStop *stop = &stop_set->stops[index];
+        long long pixel_x;
+        long long pixel_y;
+
+        if (stop->mode_mask == 0U) continue;
+        if (project_point(context, stop->lon_nano, stop->lat_nano, &pixel_x, &pixel_y) != 0) continue;
+        draw_gtfs_mode_dot(context, (int)pixel_x, (int)pixel_y, stop->mode_mask);
+        context->gtfs_stops_drawn += 1ULL;
+        if ((stop->mode_mask & GTFS_MODE_BUS) != 0U) context->gtfs_bus_stops += 1ULL;
+        if ((stop->mode_mask & GTFS_MODE_TRAM) != 0U) context->gtfs_tram_stops += 1ULL;
+        if ((stop->mode_mask & GTFS_MODE_RAIL) != 0U) context->gtfs_rail_stops += 1ULL;
+        if ((stop->mode_mask & GTFS_MODE_SUBWAY) != 0U) context->gtfs_subway_stops += 1ULL;
+        if ((stop->mode_mask & GTFS_MODE_FERRY) != 0U) context->gtfs_ferry_stops += 1ULL;
+        if ((stop->mode_mask & GTFS_MODE_OTHER) != 0U) context->gtfs_other_stops += 1ULL;
+    }
+}
+
+static int render_gtfs_overlay(RenderContext *context) {
+    GtfsStopSet stop_set;
+    GtfsStringMap route_modes;
+    GtfsU64Map trip_modes;
+    int result = -1;
+
+    if (context->gtfs_path == 0) return 0;
+    rt_memset(&stop_set, 0, sizeof(stop_set));
+    rt_memset(&route_modes, 0, sizeof(route_modes));
+    rt_memset(&trip_modes, 0, sizeof(trip_modes));
+    context->gtfs_stops_loaded = 0ULL;
+    context->gtfs_stop_times_seen = 0ULL;
+    context->gtfs_stops_drawn = 0ULL;
+    context->gtfs_bus_stops = 0ULL;
+    context->gtfs_tram_stops = 0ULL;
+    context->gtfs_rail_stops = 0ULL;
+    context->gtfs_subway_stops = 0ULL;
+    context->gtfs_ferry_stops = 0ULL;
+    context->gtfs_other_stops = 0ULL;
+
+    if (gtfs_load_visible_stops(context, context->gtfs_path, &stop_set) != 0) goto cleanup;
+    if (stop_set.stop_count == 0U) {
+        result = 0;
+        goto cleanup;
+    }
+    if (gtfs_load_routes(context->gtfs_path, &route_modes) != 0) goto cleanup;
+    if (gtfs_load_trips(context->gtfs_path, &route_modes, &trip_modes) != 0) goto cleanup;
+    if (gtfs_apply_stop_times(context, context->gtfs_path, &trip_modes, &stop_set) != 0) goto cleanup;
+    gtfs_draw_stops(context, &stop_set);
+    result = 0;
+
+cleanup:
+    gtfs_u64_map_destroy(&trip_modes);
+    gtfs_string_map_destroy(&route_modes);
+    gtfs_stop_set_destroy(&stop_set);
+    return result;
+}
+
 static int abs_int(int value) {
     return value < 0 ? -value : value;
 }
@@ -2635,6 +3482,35 @@ static void write_render_summary(const char *out_path, const RenderContext *cont
     rt_write_cstr(1, "exclave_insets: ");
     rt_write_cstr(1, context->exclave_insets && context->have_exclave_bbox ? "yes" : "no");
     rt_write_char(1, '\n');
+    if (context->gtfs_path != 0) {
+        rt_write_cstr(1, "gtfs_visible_stops: ");
+        rt_write_uint(1, context->gtfs_stops_loaded);
+        rt_write_char(1, '\n');
+        rt_write_cstr(1, "gtfs_stop_times_scanned: ");
+        rt_write_uint(1, context->gtfs_stop_times_seen);
+        rt_write_char(1, '\n');
+        rt_write_cstr(1, "gtfs_stops_drawn: ");
+        rt_write_uint(1, context->gtfs_stops_drawn);
+        rt_write_char(1, '\n');
+        rt_write_cstr(1, "gtfs_bus_stops: ");
+        rt_write_uint(1, context->gtfs_bus_stops);
+        rt_write_char(1, '\n');
+        rt_write_cstr(1, "gtfs_tram_stops: ");
+        rt_write_uint(1, context->gtfs_tram_stops);
+        rt_write_char(1, '\n');
+        rt_write_cstr(1, "gtfs_rail_stops: ");
+        rt_write_uint(1, context->gtfs_rail_stops);
+        rt_write_char(1, '\n');
+        rt_write_cstr(1, "gtfs_subway_stops: ");
+        rt_write_uint(1, context->gtfs_subway_stops);
+        rt_write_char(1, '\n');
+        rt_write_cstr(1, "gtfs_ferry_stops: ");
+        rt_write_uint(1, context->gtfs_ferry_stops);
+        rt_write_char(1, '\n');
+        rt_write_cstr(1, "gtfs_other_stops: ");
+        rt_write_uint(1, context->gtfs_other_stops);
+        rt_write_char(1, '\n');
+    }
     rt_write_cstr(1, "render_elapsed_ms: ");
     rt_write_uint(1, elapsed_ms);
     rt_write_char(1, '\n');
@@ -2761,6 +3637,14 @@ int main(int argc, char **argv) {
             }
             context.relation_index_path = argv[argi];
             argi += 1;
+        } else if (rt_strcmp(argv[argi], "--gtfs") == 0) {
+            argi += 1;
+            if (argi >= argc) {
+                write_usage(program);
+                return 1;
+            }
+            context.gtfs_path = argv[argi];
+            argi += 1;
         } else if (rt_strcmp(argv[argi], "--no-boundary-fade") == 0) {
             context.boundary_fade = 0;
             argi += 1;
@@ -2875,6 +3759,14 @@ int main(int argc, char **argv) {
             rt_write_cstr(2, "osmrender-rpack: failed while rendering exclave insets\n");
             return 1;
         }
+        if (render_gtfs_overlay(&context) != 0) {
+            rt_free(context.features);
+            rt_free(context.points);
+            rt_free(context.pixels);
+            (void)platform_close(fd);
+            rt_write_cstr(2, "osmrender-rpack: failed while rendering GTFS overlay\n");
+            return 1;
+        }
         draw_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
         elapsed_ms = collect_elapsed_ms + boundary_elapsed_ms + draw_elapsed_ms;
         (void)platform_close(fd);
@@ -2950,6 +3842,14 @@ int main(int argc, char **argv) {
     boundary_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
     phase_start_ns = platform_get_monotonic_time_ns();
     draw_collected_layers(&context);
+    if (render_gtfs_overlay(&context) != 0) {
+        rt_free(context.features);
+        rt_free(context.points);
+        rt_free(context.pixels);
+        (void)platform_close(fd);
+        rt_write_cstr(2, "osmrender-rpack: failed while rendering GTFS overlay\n");
+        return 1;
+    }
     draw_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
     elapsed_ms = collect_elapsed_ms + boundary_elapsed_ms + draw_elapsed_ms;
     (void)platform_close(fd);

@@ -2,9 +2,15 @@ CC := gcc-16
 OS := linux
 ARCH := x86_64
 BUILD_DIR := build/freestanding-$(OS)-$(ARCH)
+MACOS_CC ?= clang
+MACOS_ARCH := aarch64
+MACOS_BUILD_DIR := build/freestanding-macos-arm64
+MACOS_SDKROOT := $(shell xcrun --sdk macosx --show-sdk-path 2>/dev/null)
 
 CFLAGS := -std=c11 -Os -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fdata-sections -ffunction-sections -fno-asynchronous-unwind-tables -fno-unwind-tables -nostdinc -Isrc/shared -Isrc/shared/fontrender -Isrc/platform/linux -Isrc/platform/common -DNEWOS_DISABLE_STACK_GUARD_INIT -DFR_RASTER_DISABLE_SIMD
 LDFLAGS := -nostdlib -static -no-pie -Wl,--gc-sections
+MACOS_CFLAGS := -target arm64-apple-macos11 -std=c11 -Os -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fdata-sections -ffunction-sections -fno-asynchronous-unwind-tables -fno-unwind-tables -nostdinc -Isrc/shared -Isrc/shared/fontrender -Isrc/platform/macos -Isrc/platform/common -Isrc/arch/aarch64/macos -DNEWOS_DISABLE_STACK_GUARD_INIT -DFR_RASTER_DISABLE_SIMD
+MACOS_LDFLAGS := -nostdlib -Wl,-syslibroot,$(MACOS_SDKROOT) -Wl,-e,_start -Wl,-dead_strip -lSystem
 
 RUNTIME_SRCS := \
     src/arch/x86_64/linux/crt0.S \
@@ -21,6 +27,47 @@ FONTRENDER_SRCS := \
     src/shared/fontrender/fr_raster.c \
     src/shared/fontrender/font_backend_truetype.c \
     src/shared/fontrender_runtime.c
+
+MACOS_RUNTIME_SRCS := \
+    src/arch/aarch64/macos/crt0.S \
+    src/platform/macos/io.c \
+    src/platform/macos/thread.c \
+    src/platform/macos/time.c \
+    src/shared/runtime/io.c \
+    src/shared/runtime/memory.c \
+    src/shared/runtime/parse.c \
+    src/shared/runtime/string.c
+
+MACOS_OSMRENDERPACKV2_SRCS := \
+    $(MACOS_RUNTIME_SRCS) \
+    src/shared/compression/zlib.c \
+    src/shared/pbf.c \
+    src/shared/osmrpack.c \
+    src/tools/osmrenderpackv2.c
+
+MACOS_OSMRPACKINFO_SRCS := \
+    $(MACOS_RUNTIME_SRCS) \
+    src/shared/osmrpack.c \
+    src/tools/osmrpackinfo.c
+
+MACOS_OSMRENDER_RPACK_SRCS := \
+    $(MACOS_RUNTIME_SRCS) \
+    src/shared/compression/crc32.c \
+    src/shared/compression/zlib.c \
+    src/shared/osm_index.c \
+    src/shared/pbf.c \
+    src/shared/osmrpack.c \
+    src/tools/osmrender_rpack.c
+
+MACOS_OSMWALKROUTE_SRCS := \
+    $(MACOS_RUNTIME_SRCS) \
+    src/shared/compression/zlib.c \
+    src/shared/pbf.c \
+    src/tools/osmwalkroute.c
+
+MACOS_THREADTEST_SRCS := \
+    $(MACOS_RUNTIME_SRCS) \
+    src/tools/threadtest.c
 
 PBFINFO_SRCS := \
     $(RUNTIME_SRCS) \
@@ -123,6 +170,12 @@ OSMRENDER_RPACK_SRCS := \
     src/shared/osmrpack.c \
     src/tools/osmrender_rpack.c
 
+OSMWALKROUTE_SRCS := \
+    $(RUNTIME_SRCS) \
+    src/shared/compression/zlib.c \
+    src/shared/pbf.c \
+    src/tools/osmwalkroute.c
+
 THREADTEST_SRCS := \
     $(RUNTIME_SRCS) \
     src/platform/linux/thread.c \
@@ -134,13 +187,20 @@ FONTTEST_SRCS := \
     $(FONTRENDER_SRCS) \
     src/tools/fonttest.c
 
-.PHONY: all clean threadtest
+.PHONY: all clean threadtest macos-rpack-tools macos-threadtest
 
-all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmwayindex $(BUILD_DIR)/osmindex $(BUILD_DIR)/osmrelindex $(BUILD_DIR)/osmspindex $(BUILD_DIR)/osmaddresses $(BUILD_DIR)/osmrender $(BUILD_DIR)/osmrenderpackv2 $(BUILD_DIR)/osmrpackinfo $(BUILD_DIR)/osmrender-rpack $(BUILD_DIR)/threadtest $(BUILD_DIR)/fonttest
+all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmwayindex $(BUILD_DIR)/osmindex $(BUILD_DIR)/osmrelindex $(BUILD_DIR)/osmspindex $(BUILD_DIR)/osmaddresses $(BUILD_DIR)/osmrender $(BUILD_DIR)/osmrenderpackv2 $(BUILD_DIR)/osmrpackinfo $(BUILD_DIR)/osmrender-rpack $(BUILD_DIR)/osmwalkroute $(BUILD_DIR)/threadtest $(BUILD_DIR)/fonttest
 
 threadtest: $(BUILD_DIR)/threadtest
 
+macos-rpack-tools: $(MACOS_BUILD_DIR)/osmrenderpackv2 $(MACOS_BUILD_DIR)/osmrpackinfo $(MACOS_BUILD_DIR)/osmrender-rpack $(MACOS_BUILD_DIR)/osmwalkroute
+
+macos-threadtest: $(MACOS_BUILD_DIR)/threadtest
+
 $(BUILD_DIR):
+	mkdir -p $@
+
+$(MACOS_BUILD_DIR):
 	mkdir -p $@
 
 $(BUILD_DIR)/pbfinfo: $(PBFINFO_SRCS) | $(BUILD_DIR)
@@ -179,11 +239,29 @@ $(BUILD_DIR)/osmrpackinfo: $(OSMRPACKINFO_SRCS) | $(BUILD_DIR)
 $(BUILD_DIR)/osmrender-rpack: $(OSMRENDER_RPACK_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMRENDER_RPACK_SRCS) $(LDFLAGS) -o $@
 
+$(BUILD_DIR)/osmwalkroute: $(OSMWALKROUTE_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(OSMWALKROUTE_SRCS) $(LDFLAGS) -o $@
+
 $(BUILD_DIR)/threadtest: $(THREADTEST_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(THREADTEST_SRCS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/fonttest: $(FONTTEST_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(FONTTEST_SRCS) $(LDFLAGS) -o $@
+
+$(MACOS_BUILD_DIR)/osmrenderpackv2: $(MACOS_OSMRENDERPACKV2_SRCS) | $(MACOS_BUILD_DIR)
+	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_OSMRENDERPACKV2_SRCS) $(MACOS_LDFLAGS) -o $@
+
+$(MACOS_BUILD_DIR)/osmrpackinfo: $(MACOS_OSMRPACKINFO_SRCS) | $(MACOS_BUILD_DIR)
+	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_OSMRPACKINFO_SRCS) $(MACOS_LDFLAGS) -o $@
+
+$(MACOS_BUILD_DIR)/osmrender-rpack: $(MACOS_OSMRENDER_RPACK_SRCS) | $(MACOS_BUILD_DIR)
+	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_OSMRENDER_RPACK_SRCS) $(MACOS_LDFLAGS) -o $@
+
+$(MACOS_BUILD_DIR)/osmwalkroute: $(MACOS_OSMWALKROUTE_SRCS) | $(MACOS_BUILD_DIR)
+	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_OSMWALKROUTE_SRCS) $(MACOS_LDFLAGS) -o $@
+
+$(MACOS_BUILD_DIR)/threadtest: $(MACOS_THREADTEST_SRCS) | $(MACOS_BUILD_DIR)
+	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_THREADTEST_SRCS) $(MACOS_LDFLAGS) -o $@
 
 clean:
 	rm -rf build

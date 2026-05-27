@@ -20,6 +20,7 @@ The repository currently provides:
 - `osmrenderpackv2`, which builds `OSMRPK02` render-pack files from `.osm.pbf` extracts for faster repeated city/bbox rendering.
 - `osmrpackinfo`, which prints render-pack header and directory metadata.
 - `osmrender-rpack`, which renders PNGs from `.rpack` files using `--city` or `--bbox` without scanning the source PBF.
+- `osmwalkroute`, which finds a walking route between two street addresses and can compare that result against a first-pass single-leg GTFS transit option for a departure time.
 - `threadtest`, a small validation tool for the Linux nolibc threading layer.
 - `fonttest`, a small smoke tool for the vendored TrueType renderer used by future map labels.
 
@@ -50,6 +51,12 @@ make all
 ```
 
 The build output and local PBF data files are intentionally ignored by git.
+
+For the freestanding macOS arm64 router build used during Potsdam routing work:
+
+```sh
+make -B build/freestanding-macos-arm64/osmwalkroute
+```
 
 `make clean` removes the whole build directory, including generated OSM indexes. Recreate the binaries with `make`, then recreate any needed `.osm*idx` files before city rendering from a large extract.
 
@@ -88,6 +95,58 @@ For repeated renders from a large extract, build a render pack once and render f
 
 `osmrender-rpack` can render directly from the pack-contained place directory, tile payloads, and embedded per-place boundary payloads. For `--city`, it draws the matching administrative boundary and fades pixels outside it without sidecar indexes; distant exclave components are excluded from the default viewport and can be shown with `--exclave-insets`. `.osmnidx`, `.osmwidx`, and `.osmridx` remain as a fallback for older packs. The pack format is documented in `docs/osmrpack_format.md`.
 
+## Routing
+
+`osmwalkroute` resolves the source and destination addresses from the OSM extract, builds a walkable graph from OSM ways, runs Dijkstra on that graph, and prints route statistics plus plain-language directions. With GTFS input and a faster transit option, the directions become multimodal: walk to the stop, take the selected tram/bus/train leg, then walk from the alighting stop to the destination.
+
+Human-readable output uses ANSI colors by default for successful statuses, stops, lines, times, and direction step numbers. Use `--no-color` when capturing output for scripts or logs; `--color` can be used to re-enable color explicitly.
+
+Walking-only example on macOS arm64:
+
+```sh
+build/freestanding-macos-arm64/osmwalkroute data/brandenburg-260525.osm.pbf \
+	"Friedrich-Engels-Straße 22" "Hermann-Mattern-Promenade 25" \
+	--city Potsdam
+```
+
+GTFS-aware departure-time comparison:
+
+```sh
+build/freestanding-macos-arm64/osmwalkroute data/brandenburg-260525.osm.pbf \
+	"Friedrich-Engels-Straße 22" "Hermann-Mattern-Promenade 25" \
+	--city Potsdam --gtfs data/GTFS --depart 2026-05-27T11:00
+```
+
+Current transit support is intentionally narrow:
+
+- `--depart` is implemented.
+- `--arrive` is parsed but not planned yet.
+- The transit search currently evaluates a single transit leg plus walking at both ends.
+
+The router also accepts `--threads N`. The node pass stays serial because it builds the shared coordinate index. When `N > 1`, the way pass is split into two phases: workers scan OSM ways in parallel and collect compact walkable segments, then the main thread materializes those segments into the route graph. This keeps graph mutation deterministic while moving way decoding and reference lookup off the single-threaded path.
+
+Measured on macOS arm64 with:
+
+```sh
+build/freestanding-macos-arm64/osmwalkroute data/brandenburg-260525.osm.pbf \
+	"Friedrich-Engels-Straße 22" "Hermann-Mattern-Promenade 25" \
+	--city Potsdam [--gtfs data/GTFS --depart 2026-05-27T11:00] --threads N
+```
+
+Walking-only results after the way/graph restructuring:
+
+- `--threads 1`: real 13.71s, user 13.10s, sys 0.28s
+- `--threads 2`: real 13.41s, user 27.16s, sys 5.20s
+- `--threads 4`: real 18.46s, user 68.72s, sys 7.89s
+- `--threads 8`: real 24.25s, user 174.80s, sys 11.31s
+
+GTFS comparison results:
+
+- `--threads 1`: real 72.51s, user 71.64s, sys 0.66s
+- `--threads 2`: real 72.41s, user 85.45s, sys 5.80s
+
+The best observed walking-only run is currently `--threads 2`, but the improvement is small. GTFS queries remain dominated by the full `stop_times.txt` scan, so threading the way pass does not improve the end-to-end transit comparison yet.
+
 ## Fonts
 
 The project vendors the freestanding TrueType backend from `~/fontrender` under `src/shared/fontrender`. The core remains dependency-free and is connected to this runtime by `fontrender_runtime_install()`. `osmrender` uses it for the diagnostic footer; full map labels are still future work.
@@ -109,6 +168,7 @@ Additional notes are in:
 - `docs/osm_rendering.md`
 - `docs/osmrender_footer.md`
 - `docs/osmrpack_format.md`
+- `docs/OSMRTE01.md`
 - `docs/berlin_green_data.md`
 
 ## Generation And License
