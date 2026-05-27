@@ -227,6 +227,11 @@ typedef struct {
     unsigned long long features_drawn;
     unsigned long long segments_drawn;
     unsigned long long polygons_drawn;
+    long long view_min_lon_nano;
+    long long view_min_lat_nano;
+    long long view_max_lon_nano;
+    long long view_max_lat_nano;
+    int view_frozen;
 } RenderContext;
 
 typedef struct {
@@ -336,6 +341,37 @@ static void write_profile_ms(const char *label, unsigned long long elapsed_ms) {
     rt_write_char(1, '\n');
 }
 
+static void write_i64_value(long long value) {
+    unsigned long long absolute;
+
+    if (value < 0) {
+        rt_write_char(1, '-');
+        absolute = (unsigned long long)(-(value + 1LL)) + 1ULL;
+    } else {
+        absolute = (unsigned long long)value;
+    }
+    rt_write_uint(1, absolute);
+}
+
+static void write_i64_field(const char *label, long long value) {
+    rt_write_cstr(1, label);
+    write_i64_value(value);
+    rt_write_char(1, '\n');
+}
+
+static void freeze_render_viewport(RenderContext *context) {
+    context->view_min_lon_nano = context->min_lon_nano;
+    context->view_min_lat_nano = context->min_lat_nano;
+    context->view_max_lon_nano = context->max_lon_nano;
+    context->view_max_lat_nano = context->max_lat_nano;
+    context->view_frozen = 1;
+}
+
+static long long render_min_lon_nano(const RenderContext *context) { return context->view_frozen ? context->view_min_lon_nano : context->min_lon_nano; }
+static long long render_min_lat_nano(const RenderContext *context) { return context->view_frozen ? context->view_min_lat_nano : context->min_lat_nano; }
+static long long render_max_lon_nano(const RenderContext *context) { return context->view_frozen ? context->view_max_lon_nano : context->max_lon_nano; }
+static long long render_max_lat_nano(const RenderContext *context) { return context->view_frozen ? context->view_max_lat_nano : context->max_lat_nano; }
+
 static int path_exists(const char *path) {
     int fd;
 
@@ -380,9 +416,9 @@ static void choose_missing_dimension(RenderContext *context, int width_explicit,
     unsigned long long scaled_lon_span;
 
     if (width_explicit == height_explicit) return;
-    if (context->max_lon_nano <= context->min_lon_nano || context->max_lat_nano <= context->min_lat_nano) return;
-    lon_span = (unsigned long long)(context->max_lon_nano - context->min_lon_nano);
-    lat_span = (unsigned long long)(context->max_lat_nano - context->min_lat_nano);
+    if (render_max_lon_nano(context) <= render_min_lon_nano(context) || render_max_lat_nano(context) <= render_min_lat_nano(context)) return;
+    lon_span = (unsigned long long)(render_max_lon_nano(context) - render_min_lon_nano(context));
+    lat_span = (unsigned long long)(render_max_lat_nano(context) - render_min_lat_nano(context));
     scaled_lon_span = (lon_span * 3ULL + 2ULL) / 5ULL;
     if (scaled_lon_span == 0ULL) scaled_lon_span = 1ULL;
     if (width_explicit) {
@@ -900,7 +936,7 @@ static int set_city_bbox(const char *city, RenderContext *context) {
 }
 
 static int render_bbox_is_valid(const RenderContext *context) {
-    return context->min_lon_nano < context->max_lon_nano && context->min_lat_nano < context->max_lat_nano;
+    return render_min_lon_nano(context) < render_max_lon_nano(context) && render_min_lat_nano(context) < render_max_lat_nano(context);
 }
 
 static void set_line_style(RenderStyle *style, unsigned char red, unsigned char green, unsigned char blue, unsigned int width) {
@@ -1250,8 +1286,8 @@ static int pack_reader_read_feature_header(PackReader *reader, PackFeatureHeader
 }
 
 static int feature_intersects_render_bbox(const RenderContext *context, const PackFeatureHeader *feature) {
-    if (feature->max_lon_nano < context->min_lon_nano || feature->min_lon_nano > context->max_lon_nano) return 0;
-    if (feature->max_lat_nano < context->min_lat_nano || feature->min_lat_nano > context->max_lat_nano) return 0;
+    if (feature->max_lon_nano < render_min_lon_nano(context) || feature->min_lon_nano > render_max_lon_nano(context)) return 0;
+    if (feature->max_lat_nano < render_min_lat_nano(context) || feature->min_lat_nano > render_max_lat_nano(context)) return 0;
     return 1;
 }
 
@@ -1312,12 +1348,16 @@ static int clamp_to_int(long long value) {
 }
 
 static int project_point(const RenderContext *context, long long lon_nano, long long lat_nano, long long *pixel_x_out, long long *pixel_y_out) {
-    long long lon_span = context->max_lon_nano - context->min_lon_nano;
-    long long lat_span = context->max_lat_nano - context->min_lat_nano;
+    long long min_lon = render_min_lon_nano(context);
+    long long min_lat = render_min_lat_nano(context);
+    long long max_lon = render_max_lon_nano(context);
+    long long max_lat = render_max_lat_nano(context);
+    long long lon_span = max_lon - min_lon;
+    long long lat_span = max_lat - min_lat;
 
     if (lon_span <= 0 || lat_span <= 0) return -1;
-    *pixel_x_out = ((lon_nano - context->min_lon_nano) * (long long)(context->width - 1U)) / lon_span;
-    *pixel_y_out = ((context->max_lat_nano - lat_nano) * (long long)(context->height - 1U)) / lat_span;
+    *pixel_x_out = ((lon_nano - min_lon) * (long long)(context->width - 1U)) / lon_span;
+    *pixel_y_out = ((max_lat - lat_nano) * (long long)(context->height - 1U)) / lat_span;
     return 0;
 }
 
@@ -1870,10 +1910,10 @@ static int collect_visible_features_v2(int fd, const OsmrPackV2Header *header, R
     unsigned int selected_count = 0U;
     unsigned int selected_capacity = 0U;
     unsigned int axis = v2_tile_axis(header->tile_zoom);
-    unsigned int min_x = v2_lon_to_tile_x(context->min_lon_nano, header->tile_zoom);
-    unsigned int max_x = v2_lon_to_tile_x(context->max_lon_nano, header->tile_zoom);
-    unsigned int min_y = v2_lat_to_tile_y(context->max_lat_nano, header->tile_zoom);
-    unsigned int max_y = v2_lat_to_tile_y(context->min_lat_nano, header->tile_zoom);
+    unsigned int min_x = v2_lon_to_tile_x(render_min_lon_nano(context), header->tile_zoom);
+    unsigned int max_x = v2_lon_to_tile_x(render_max_lon_nano(context), header->tile_zoom);
+    unsigned int min_y = v2_lat_to_tile_y(render_max_lat_nano(context), header->tile_zoom);
+    unsigned int max_y = v2_lat_to_tile_y(render_min_lat_nano(context), header->tile_zoom);
     unsigned int halo = header->tile_halo;
     unsigned long long tile_index;
     FeatureHashSet seen_hashes;
@@ -2335,7 +2375,7 @@ static int gtfs_load_visible_stops(RenderContext *context, const char *dir_path,
         (void)csv_get_fields(line, indexes, 4U, fields);
         if (fields[3].size != 0U && !csv_field_equals_cstr(fields[3], "0")) continue;
         if (parse_gtfs_coord_field(fields[1], &lat_nano) != 0 || parse_gtfs_coord_field(fields[2], &lon_nano) != 0) continue;
-        if (lon_nano < context->min_lon_nano || lon_nano > context->max_lon_nano || lat_nano < context->min_lat_nano || lat_nano > context->max_lat_nano) continue;
+        if (lon_nano < render_min_lon_nano(context) || lon_nano > render_max_lon_nano(context) || lat_nano < render_min_lat_nano(context) || lat_nano > render_max_lat_nano(context)) continue;
         if (gtfs_stop_set_add(stop_set, fields[0], lon_nano, lat_nano) != 0) {
             (void)platform_close(fd);
             return -1;
@@ -3091,6 +3131,7 @@ static int render_exclave_insets_v2(int fd, const OsmrPackV2Header *header, Rend
     inset.v2_boundary_payload_size = context->v2_boundary_payload_size;
     inset.v2_boundary_feature_count = context->v2_boundary_feature_count;
     apply_bbox_padding(&inset, context->exclave_min_lon_nano, context->exclave_min_lat_nano, context->exclave_max_lon_nano, context->exclave_max_lat_nano);
+    freeze_render_viewport(&inset);
     choose_inset_size(context, &inset);
     if (fill_background(&inset) != 0) goto cleanup;
     if (collect_visible_features_v2(fd, header, &inset, &selected_tile_count, &selected_tile_features) != 0) goto cleanup;
@@ -3520,6 +3561,10 @@ static void write_render_summary(const char *out_path, const RenderContext *cont
     rt_write_cstr(1, "tile_features: ");
     rt_write_uint(1, tile_features);
     rt_write_char(1, '\n');
+    write_i64_field("render_min_lon_nano: ", render_min_lon_nano(context));
+    write_i64_field("render_min_lat_nano: ", render_min_lat_nano(context));
+    write_i64_field("render_max_lon_nano: ", render_max_lon_nano(context));
+    write_i64_field("render_max_lat_nano: ", render_max_lat_nano(context));
     rt_write_cstr(1, "features_seen: ");
     rt_write_uint(1, context->features_seen);
     rt_write_char(1, '\n');
@@ -3777,6 +3822,7 @@ int main(int argc, char **argv) {
         rt_write_cstr(2, "osmrender-rpack: missing --bbox or --city\n");
         return 1;
     }
+    if (bbox_set && !context.city_enabled) freeze_render_viewport(&context);
     phase_start_ns = platform_get_monotonic_time_ns();
     if (context.city_enabled) {
         if (context.node_index_path == 0 && infer_index_path_from_pack(pack_path, ".osmnidx", default_node_index_path, sizeof(default_node_index_path)) == 0 && path_exists(default_node_index_path)) context.node_index_path = default_node_index_path;
@@ -3830,6 +3876,7 @@ int main(int argc, char **argv) {
             rt_write_cstr(2, "osmrender-rpack: could not resolve city bbox\n");
             return 1;
         }
+        if (!context.view_frozen) freeze_render_viewport(&context);
         choose_missing_dimension(&context, width_explicit, height_explicit);
         open_tile_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
         phase_start_ns = platform_get_monotonic_time_ns();
@@ -3917,6 +3964,7 @@ int main(int argc, char **argv) {
         rt_write_cstr(2, "osmrender-rpack: could not resolve city bbox\n");
         return 1;
     }
+    if (!context.view_frozen) freeze_render_viewport(&context);
     choose_missing_dimension(&context, width_explicit, height_explicit);
     header_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
     phase_start_ns = platform_get_monotonic_time_ns();

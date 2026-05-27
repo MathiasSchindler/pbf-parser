@@ -195,7 +195,7 @@ build/freestanding-macos-arm64/rtewalkroute data/brandenburg.rte \
 	--map build/route.png
 ```
 
-`--map` writes the route path to a temporary `lon,lat` polyline and invokes the sibling `osmrender-rpack` binary with a render pack. Pass `--rpack FILE.rpack` to choose the map layer explicitly; otherwise the tool first looks for a matching `.rpack` next to the `.rte`, then for known local packs such as `build/brandenburg-260525.rpack` and `data/germany.rpack`. When both endpoints are in the same city, the map uses the renderer's `--city` viewport and still prints the computed route bbox as `map_bbox`.
+`--map` writes the route path to a temporary `lon,lat` polyline and invokes the sibling `osmrender-rpack` binary with a render pack. Pass `--rpack FILE.rpack` to choose the map layer explicitly; otherwise the tool first looks for a matching `.rpack` next to the `.rte`, then for known local packs such as `build/brandenburg-260525.rpack` and `data/germany.rpack`. Use `--width N` and/or `--height N` to control map dimensions; if only one dimension is provided, the renderer derives the other from the selected viewport. Cross-city bbox maps default to `--width 1600` and derive height from the route bbox. When both endpoints are in the same city, the map uses the renderer's `--city` viewport and still prints the computed route bbox as `map_bbox`.
 
 The human-readable directions are currently coarse graph directions such as “continue generally north-west for 450 m”; edge street names and fuller snap-grid edge snapping remain future work. The builder currently duplicates cross-tile walking segments into both endpoint tiles and writes minimal snap-grid headers; endpoint snapping in `rtewalkroute` uses nearest graph nodes.
 

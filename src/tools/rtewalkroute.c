@@ -119,12 +119,20 @@ typedef struct {
     int use_color;
     const char *map_path;
     const char *rpack_path;
+    const char *map_width_arg;
+    const char *map_height_arg;
 } RteOutput;
 
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " FILE.rte FROM_ADDRESS TO_ADDRESS [--color] [--no-color] [--map OUT.png] [--rpack FILE.rpack]\n");
+    rt_write_cstr(2, " FILE.rte FROM_ADDRESS TO_ADDRESS [--color] [--no-color] [--map OUT.png] [--rpack FILE.rpack] [--width N] [--height N]\n");
+}
+
+static int parse_dimension_arg(const char *text) {
+    unsigned long long value;
+
+    return rt_parse_uint(text, &value) == 0 && value != 0ULL && value <= 10000ULL ? 0 : -1;
 }
 
 static void write_color(const RteOutput *output, const char *code) {
@@ -1194,7 +1202,7 @@ static int render_route_map(
     int fd;
     int pid;
     int exit_status;
-    char *argv[13];
+    char *argv[15];
     unsigned int argv_index = 0U;
 
     if (output->map_path == 0) return 0;
@@ -1232,13 +1240,26 @@ static int render_route_map(
     if (use_city_view) {
         argv[argv_index++] = "--city";
         argv[argv_index++] = city_arg;
-        argv[argv_index++] = "--width";
-        argv[argv_index++] = "1600";
-        argv[argv_index++] = "--height";
-        argv[argv_index++] = "1200";
     } else {
         argv[argv_index++] = "--bbox";
         argv[argv_index++] = bbox_arg;
+    }
+    if (output->map_width_arg != 0) {
+        argv[argv_index++] = "--width";
+        argv[argv_index++] = (char *)output->map_width_arg;
+    } else if (!use_city_view && output->map_height_arg == 0) {
+        argv[argv_index++] = "--width";
+        argv[argv_index++] = "1600";
+    } else if (use_city_view && output->map_height_arg == 0) {
+        argv[argv_index++] = "--width";
+        argv[argv_index++] = "1600";
+    }
+    if (output->map_height_arg != 0) {
+        argv[argv_index++] = "--height";
+        argv[argv_index++] = (char *)output->map_height_arg;
+    } else if (use_city_view && output->map_width_arg == 0) {
+        argv[argv_index++] = "--height";
+        argv[argv_index++] = "1200";
     }
     argv[argv_index++] = "--route-polyline";
     argv[argv_index++] = temp_path;
@@ -1317,6 +1338,14 @@ int main(int argc, char **argv) {
             argi += 1;
             if (argi >= argc) { write_usage(program); return 1; }
             output.rpack_path = argv[argi];
+        } else if (rt_strcmp(argv[argi], "--width") == 0) {
+            argi += 1;
+            if (argi >= argc || parse_dimension_arg(argv[argi]) != 0) { write_usage(program); return 1; }
+            output.map_width_arg = argv[argi];
+        } else if (rt_strcmp(argv[argi], "--height") == 0) {
+            argi += 1;
+            if (argi >= argc || parse_dimension_arg(argv[argi]) != 0) { write_usage(program); return 1; }
+            output.map_height_arg = argv[argi];
         }
         else { write_usage(program); return 1; }
     }
