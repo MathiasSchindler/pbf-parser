@@ -10,10 +10,14 @@ const state = {
   routeLoaded: false,
   renderLoaded: false,
   currentView: null,
+  currentRoutePoints: [],
   nextPointRole: 'from',
   selectedPoints: { from: null, to: null },
   dragRole: null,
   suppressNextClick: false,
+  pendingZoomView: null,
+  zoomTimer: 0,
+  zoomRendering: false,
   routeStdout: [],
   routeStderr: [],
   renderStdout: [],
@@ -241,6 +245,48 @@ function parseRenderView(stdout) {
   return null;
 }
 
+function viewToBbox(view) {
+  return `${view.minLon.toFixed(7)},${view.minLat.toFixed(7)},${view.maxLon.toFixed(7)},${view.maxLat.toFixed(7)}`;
+}
+
+function routePolyline(points) {
+  return points.map((point) => `${point.lon.toFixed(7)},${point.lat.toFixed(7)}`).join('\n') + '\n';
+}
+
+function clampZoomView(view) {
+  const centerLat = (view.minLat + view.maxLat) / 2;
+  const centerLon = (view.minLon + view.maxLon) / 2;
+  const minLatSpan = 0.0012;
+  const maxLatSpan = 0.42;
+  const aspect = (view.maxLon - view.minLon) / (view.maxLat - view.minLat);
+  let latSpan = Math.min(Math.max(view.maxLat - view.minLat, minLatSpan), maxLatSpan);
+  let lonSpan = latSpan * aspect;
+  const maxLonSpan = 0.9;
+  if (lonSpan > maxLonSpan) {
+    lonSpan = maxLonSpan;
+    latSpan = lonSpan / aspect;
+  }
+  return {
+    minLat: centerLat - latSpan / 2,
+    maxLat: centerLat + latSpan / 2,
+    minLon: centerLon - lonSpan / 2,
+    maxLon: centerLon + lonSpan / 2
+  };
+}
+
+function zoomViewAround(view, anchor, ratioX, ratioY, scale) {
+  const latSpan = (view.maxLat - view.minLat) * scale;
+  const lonSpan = (view.maxLon - view.minLon) * scale;
+  const maxLat = anchor.lat + latSpan * ratioY;
+  const minLon = anchor.lon - lonSpan * ratioX;
+  return clampZoomView({
+    minLat: maxLat - latSpan,
+    maxLat,
+    minLon,
+    maxLon: minLon + lonSpan
+  });
+}
+
 function coordText(point) {
   return `${point.lat.toFixed(7)},${point.lon.toFixed(7)}`;
 }
@@ -339,6 +385,7 @@ async function renderBerlin() {
   setStatus('Rendering Berlin...', null);
   const outputPath = '/out/berlin.png';
   const size = mapSize();
+  state.currentRoutePoints = [];
   ensureDir(state.renderModule, '/out');
   const result = callCli(state.renderModule, 'renderStdout', 'renderStderr', [
     RENDER_PACK_FS,
@@ -357,13 +404,42 @@ async function renderBerlin() {
   setStatus('Rendered Berlin.', 1);
 }
 
+async function renderViewport(view) {
+  await ensureRenderModule();
+  setStatus('Rendering zoomed map...', null);
+  ensureDir(state.renderModule, '/out');
+  const size = mapSize();
+  const outputPath = '/out/viewport.png';
+  const args = [
+    RENDER_PACK_FS,
+    outputPath,
+    '--bbox',
+    viewToBbox(view),
+    '--width',
+    String(size.width),
+    '--height',
+    String(size.height)
+  ];
+  if (state.currentRoutePoints.length !== 0) {
+    state.renderModule.FS.writeFile('/out/route.txt', routePolyline(state.currentRoutePoints));
+    args.push('--route-polyline', '/out/route.txt');
+  }
+  const result = callCli(state.renderModule, 'renderStdout', 'renderStderr', args);
+  showPng(state.renderModule, outputPath);
+  state.currentView = parseRenderView(result.stdout) || view;
+  refreshMarkers();
+  elements.log.textContent = state.currentRoutePoints.length === 0 ? state.renderStdout.slice(-18).join('\n') : interestingRenderLines(result.stdout);
+  setStatus('Map zoomed.', 1);
+  return result;
+}
+
 async function renderRouteMap(points) {
   await ensureRenderModule();
   setStatus('Rendering route overlay...', null);
   ensureDir(state.renderModule, '/out');
   const size = mapSize();
-  const polyline = points.map((point) => `${point.lon.toFixed(7)},${point.lat.toFixed(7)}`).join('\n') + '\n';
-  state.renderModule.FS.writeFile('/out/route.txt', polyline);
+  state.currentRoutePoints = points;
+  state.renderModule.FS.writeFile('/out/route.txt', routePolyline(points));
   const result = callCli(state.renderModule, 'renderStdout', 'renderStderr', [
     RENDER_PACK_FS,
     '/out/route.png',
@@ -421,16 +497,64 @@ async function findRoute(event) {
 }
 
 function pointFromClientPosition(clientX, clientY) {
-  if (!state.currentView || elements.map.hidden) return null;
+  return pointFromClientPositionInView(clientX, clientY, state.currentView);
+}
+
+function pointFromClientPositionInView(clientX, clientY, view) {
+  if (!view || elements.map.hidden) return null;
   const rect = mapContentRect();
   if (rect.width <= 0 || rect.height <= 0) return null;
   if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return null;
   const ratioX = Math.min(Math.max((clientX - rect.left) / rect.width, 0), 1);
   const ratioY = Math.min(Math.max((clientY - rect.top) / rect.height, 0), 1);
   return {
-    lat: state.currentView.maxLat - ratioY * (state.currentView.maxLat - state.currentView.minLat),
-    lon: state.currentView.minLon + ratioX * (state.currentView.maxLon - state.currentView.minLon)
+    lat: view.maxLat - ratioY * (view.maxLat - view.minLat),
+    lon: view.minLon + ratioX * (view.maxLon - view.minLon),
+    ratioX,
+    ratioY
   };
+}
+
+function normalizedWheelDelta(event) {
+  if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) return event.deltaY * 16;
+  if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) return event.deltaY * mapContentRect().height;
+  return event.deltaY;
+}
+
+function scheduleZoomRender() {
+  if (state.zoomTimer) window.clearTimeout(state.zoomTimer);
+  state.zoomTimer = window.setTimeout(renderPendingZoom, 140);
+}
+
+async function renderPendingZoom() {
+  state.zoomTimer = 0;
+  if (state.zoomRendering || !state.pendingZoomView) return;
+  const view = state.pendingZoomView;
+  state.pendingZoomView = null;
+  state.zoomRendering = true;
+  setBusy(true);
+  try {
+    await renderViewport(view);
+  } catch (error) {
+    setStatus(error?.message || String(error), 1);
+    elements.log.textContent = error.stack || String(error);
+  } finally {
+    setBusy(false);
+    state.zoomRendering = false;
+    if (state.pendingZoomView) scheduleZoomRender();
+  }
+}
+
+function handleMapWheel(event) {
+  const baseView = state.pendingZoomView || state.currentView;
+  const point = pointFromClientPositionInView(event.clientX, event.clientY, baseView);
+  if (!point) return;
+  event.preventDefault();
+  const delta = Math.max(-600, Math.min(600, normalizedWheelDelta(event)));
+  const scale = Math.max(0.5, Math.min(2, Math.exp(delta / 520)));
+  state.pendingZoomView = zoomViewAround(baseView, point, point.ratioX, point.ratioY, scale);
+  setStatus(delta < 0 ? 'Zooming in...' : 'Zooming out...', null);
+  scheduleZoomRender();
 }
 
 function setPoint(role, point) {
@@ -507,6 +631,7 @@ async function renderOnly() {
 elements.form.addEventListener('submit', findRoute);
 elements.renderButton.addEventListener('click', renderOnly);
 elements.mapPane.addEventListener('click', handleMapClick);
+elements.mapPane.addEventListener('wheel', handleMapWheel, { passive: false });
 elements.map.addEventListener('load', refreshMarkers);
 elements.fromMarker.addEventListener('pointerdown', (event) => handleMarkerPointerDown(event, 'from'));
 elements.toMarker.addEventListener('pointerdown', (event) => handleMarkerPointerDown(event, 'to'));

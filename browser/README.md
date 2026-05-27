@@ -43,6 +43,6 @@ python3 -m http.server 8080
 
 Then open `http://localhost:8080/browser/`.
 
-The app renders the Berlin map on load. Press `Find Route` to route between the form values, or click the map once to set the start point and a second time to set the target point. The second click starts routing immediately. Clicked points are written as `lat,lon` coordinates and routed through the same walking graph snapper as address results.
+The app renders the Berlin map on load. Use the mouse wheel over the map to zoom in and out around the cursor. Press `Find Route` to route between the form values, or click the map once to set the start point and a second time to set the target point. The second click starts routing immediately. Clicked points are written as `lat,lon` coordinates and routed through the same walking graph snapper as address results.
 
 After a route is shown, drag either endpoint marker to update the coordinate and rerender the route. Route map rendering expands the route bounding box to match the visible map aspect ratio, so mostly vertical or horizontal routes remain undistorted.
