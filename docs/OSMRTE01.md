@@ -304,7 +304,18 @@ tile_id = (level << 58) | (x_code << 29) | y_code
 
 `x` and `y` in the tile directory are signed 32-bit tile coordinates. `x_code` and `y_code` are biased unsigned 29-bit values used only for sortable IDs. Version 1 builders must reject tile coordinates outside the encodable range.
 
-`neighbor_mask` marks which of the 8 immediate neighboring tile positions exist. It is a fast hint for neighborhood expansion.
+`neighbor_mask` marks which of the 8 immediate neighboring tile positions exist. It is a fast hint for neighborhood expansion. Bit order is:
+
+```text
+bit 0 northwest  x - 1, y + 1
+bit 1 north      x,     y + 1
+bit 2 northeast  x + 1, y + 1
+bit 3 west       x - 1, y
+bit 4 east       x + 1, y
+bit 5 southwest  x - 1, y - 1
+bit 6 south      x,     y - 1
+bit 7 southeast  x + 1, y - 1
+```
 
 ## Tile Payload Directory
 

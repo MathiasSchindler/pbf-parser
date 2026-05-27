@@ -21,6 +21,7 @@ The repository currently provides:
 - `osmrpackinfo`, which prints render-pack header and directory metadata.
 - `osmrender-rpack`, which renders PNGs from `.rpack` files using `--city` or `--bbox` without scanning the source PBF.
 - `osmwalkroute`, which finds a walking route between two street addresses and can compare that result against a first-pass single-leg GTFS transit option for a departure time.
+- `osmroutepack`, an initial `OSMRTE01` route-pack converter that writes the binary container, source counts, metric tile metadata, bounds, sorted tile directory records, empty per-tile walking payload scaffolds, and a string-table section. It is not routeable yet; tiled walking graph and transit payload generation are the next phases.
 - `threadtest`, a small validation tool for the Linux nolibc threading layer.
 - `fonttest`, a small smoke tool for the vendored TrueType renderer used by future map labels.
 
@@ -146,6 +147,16 @@ GTFS comparison results:
 - `--threads 2`: real 72.41s, user 85.45s, sys 5.80s
 
 The best observed walking-only run is currently `--threads 2`, but the improvement is small. GTFS queries remain dominated by the full `stop_times.txt` scan, so threading the way pass does not improve the end-to-end transit comparison yet.
+
+The route-pack converter starts the move away from per-query source scans:
+
+```sh
+make -B build/freestanding-macos-arm64/osmroutepack
+build/freestanding-macos-arm64/osmroutepack --tile-size-m 4000 --threads 2 \
+	data/brandenburg-260525.osm.pbf build/brandenburg.rte
+```
+
+This first milestone writes an `OSMRTE01` file with real metric route tiles and empty walking payload scaffolds. It validates the binary header, section layout, tile directory, and tile payload layout before the heavier builder work fills tiled walking CSR arrays, snap grids, address dictionaries, GTFS route-pattern arrays, and service-day bitsets. The target format is documented in `docs/OSMRTE01.md`.
 
 ## Fonts
 
