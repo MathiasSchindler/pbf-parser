@@ -194,11 +194,15 @@ typedef struct {
     long long exclave_max_lat_nano;
     unsigned int boundary_feature_count;
     unsigned int exclave_component_count;
+    unsigned int coastline_feature_count;
+    unsigned int sea_fill_pixels;
     int city_enabled;
+    int boundary_enabled;
     int boundary_fade;
     int boundary_fade_applied;
     int exclave_insets;
     int have_exclave_bbox;
+    int sea_fill_applied;
     int png_palette;
     const char *gtfs_path;
     unsigned long long gtfs_stops_loaded;
@@ -332,7 +336,7 @@ static const RenderLayer render_layers[] = {
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " PACK.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--gtfs DIR] [--route-polyline FILE] [--exclave-insets] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]\n");
+    rt_write_cstr(2, " PACK.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--gtfs DIR] [--route-polyline FILE] [--exclave-insets] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary] [--no-boundary-fade] [--png-rgb] [--profile]\n");
 }
 
 static void write_profile_ms(const char *label, unsigned long long elapsed_ms) {
@@ -1868,7 +1872,7 @@ static int collect_v2_place_boundary(RenderContext *context, int fd) {
     unsigned long long feature_index;
     unsigned long long payload_end;
 
-    if (!context->city_enabled || context->v2_boundary_payload_offset == 0ULL || context->v2_boundary_payload_size < 8ULL || context->v2_boundary_feature_count == 0U) return 0;
+    if (!context->boundary_enabled || !context->city_enabled || context->v2_boundary_payload_offset == 0ULL || context->v2_boundary_payload_size < 8ULL || context->v2_boundary_feature_count == 0U) return 0;
     payload_end = context->v2_boundary_payload_offset + context->v2_boundary_payload_size;
     if (payload_end < context->v2_boundary_payload_offset) return -1;
     if (platform_seek(fd, (long long)context->v2_boundary_payload_offset, PLATFORM_SEEK_SET) < 0) return -1;
@@ -2162,7 +2166,7 @@ static int collect_city_boundary(RenderContext *context) {
     node_index.fd = -1;
     way_index.fd = -1;
     relation_index.fd = -1;
-    if (!context->city_enabled || context->city_name == 0 || context->node_index_path == 0 || context->way_index_path == 0 || context->relation_index_path == 0) return 0;
+    if (!context->boundary_enabled || !context->city_enabled || context->city_name == 0 || context->node_index_path == 0 || context->way_index_path == 0 || context->relation_index_path == 0) return 0;
     error[0] = '\0';
     if (osm_node_index_open(&node_index, context->node_index_path, error, sizeof(error)) != 0) goto cleanup;
     if (osm_way_index_open(&way_index, context->way_index_path, error, sizeof(error)) != 0) goto cleanup;
@@ -2853,6 +2857,46 @@ static void boundary_mask_line(unsigned char *mask, unsigned int width, unsigned
     }
 }
 
+static void mask_mark_disc(unsigned char *mask, unsigned int width, unsigned int height, int x, int y, int radius, unsigned char value) {
+    int dy;
+
+    if (radius < 0) radius = 0;
+    for (dy = -radius; dy <= radius; ++dy) {
+        int dx;
+        int yy = y + dy;
+        if (yy < 0 || yy >= (int)height) continue;
+        for (dx = -radius; dx <= radius; ++dx) {
+            int xx = x + dx;
+            if (xx < 0 || xx >= (int)width) continue;
+            if (dx * dx + dy * dy <= radius * radius) mask[(size_t)yy * (size_t)width + (size_t)xx] = value;
+        }
+    }
+}
+
+static void mask_line_radius(unsigned char *mask, unsigned int width, unsigned int height, int x0, int y0, int x1, int y1, int radius, unsigned char value) {
+    int delta_x = abs_int(x1 - x0);
+    int step_x = x0 < x1 ? 1 : -1;
+    int delta_y = -abs_int(y1 - y0);
+    int step_y = y0 < y1 ? 1 : -1;
+    int error = delta_x + delta_y;
+
+    for (;;) {
+        int twice_error;
+
+        mask_mark_disc(mask, width, height, x0, y0, radius, value);
+        if (x0 == x1 && y0 == y1) break;
+        twice_error = 2 * error;
+        if (twice_error >= delta_y) {
+            error += delta_y;
+            x0 += step_x;
+        }
+        if (twice_error <= delta_x) {
+            error += delta_x;
+            y0 += step_y;
+        }
+    }
+}
+
 static int boundary_mask_enqueue(unsigned char *mask, unsigned int *queue, unsigned int width, unsigned int height, unsigned int *tail_io, int x, int y) {
     unsigned int index;
 
@@ -2865,11 +2909,7 @@ static int boundary_mask_enqueue(unsigned char *mask, unsigned int *queue, unsig
     return 0;
 }
 
-static void fade_outside_boundary(RenderContext *context) {
-    unsigned int pixel_count;
-    unsigned char *mask;
-    unsigned int *queue;
-    BoundaryEndpoint *endpoints;
+static int build_outside_boundary_mask(RenderContext *context, unsigned char *mask, unsigned int *queue, BoundaryEndpoint *endpoints, unsigned int endpoint_capacity) {
     unsigned int endpoint_count = 0U;
     unsigned int head = 0U;
     unsigned int tail = 0U;
@@ -2878,20 +2918,7 @@ static void fade_outside_boundary(RenderContext *context) {
     unsigned int x;
     unsigned int y;
 
-    if (!context->boundary_fade || context->boundary_fade_applied || context->boundary_feature_count < 2U) return;
-    if ((size_t)context->width > ((size_t)-1) / (size_t)context->height) return;
-    pixel_count = (unsigned int)((size_t)context->width * (size_t)context->height);
-    if ((size_t)pixel_count != (size_t)context->width * (size_t)context->height) return;
-    mask = (unsigned char *)rt_malloc((size_t)pixel_count);
-    queue = (unsigned int *)rt_malloc(sizeof(unsigned int) * (size_t)pixel_count);
-    endpoints = (BoundaryEndpoint *)rt_malloc(sizeof(BoundaryEndpoint) * (size_t)context->boundary_feature_count * 2U);
-    if (mask == 0 || queue == 0 || endpoints == 0) {
-        rt_free(mask);
-        rt_free(queue);
-        rt_free(endpoints);
-        return;
-    }
-    rt_memset(mask, 0, (size_t)pixel_count);
+    if (context->boundary_feature_count < 2U || endpoint_capacity < context->boundary_feature_count * 2U) return -1;
     for (feature_index = 0U; feature_index < context->feature_count; ++feature_index) {
         const RenderFeature *feature = &context->features[feature_index];
         const int *points;
@@ -2904,7 +2931,7 @@ static void fade_outside_boundary(RenderContext *context) {
                                points[point_index * 2U + 0U], points[point_index * 2U + 1U],
                                points[(point_index + 1U) * 2U + 0U], points[(point_index + 1U) * 2U + 1U]);
         }
-        if (endpoint_count + 1U < context->boundary_feature_count * 2U) {
+        if (endpoint_count + 1U < endpoint_capacity) {
             endpoints[endpoint_count].x = points[0];
             endpoints[endpoint_count].y = points[1];
             endpoint_count += 1U;
@@ -2940,10 +2967,566 @@ static void fade_outside_boundary(RenderContext *context) {
         (void)boundary_mask_enqueue(mask, queue, context->width, context->height, &tail, px, py - 1);
         (void)boundary_mask_enqueue(mask, queue, context->width, context->height, &tail, px, py + 1);
     }
+    return 0;
+}
+
+static void fade_outside_boundary(RenderContext *context) {
+    unsigned int pixel_count;
+    unsigned char *mask;
+    unsigned int *queue;
+    BoundaryEndpoint *endpoints;
+    unsigned int endpoint_count = 0U;
+    unsigned int head = 0U;
+    unsigned int tail = 0U;
+    unsigned int feature_index;
+    unsigned int index;
+    unsigned int flooded_count = 0U;
+    unsigned int x;
+    unsigned int y;
+
+    if (!context->boundary_fade || context->boundary_fade_applied || context->boundary_feature_count < 2U) return;
+    if ((size_t)context->width > ((size_t)-1) / (size_t)context->height) return;
+    pixel_count = (unsigned int)((size_t)context->width * (size_t)context->height);
+    if ((size_t)pixel_count != (size_t)context->width * (size_t)context->height) return;
+    mask = (unsigned char *)rt_malloc((size_t)pixel_count);
+    queue = (unsigned int *)rt_malloc(sizeof(unsigned int) * (size_t)pixel_count);
+    endpoints = (BoundaryEndpoint *)rt_malloc(sizeof(BoundaryEndpoint) * (size_t)context->boundary_feature_count * 2U);
+    if (mask == 0 || queue == 0 || endpoints == 0) {
+        rt_free(mask);
+        rt_free(queue);
+        rt_free(endpoints);
+        return;
+    }
+    rt_memset(mask, 0, (size_t)pixel_count);
+    (void)endpoint_count;
+    (void)head;
+    (void)tail;
+    (void)feature_index;
+    (void)x;
+    (void)y;
+    if (build_outside_boundary_mask(context, mask, queue, endpoints, context->boundary_feature_count * 2U) != 0) {
+        rt_free(mask);
+        rt_free(queue);
+        rt_free(endpoints);
+        return;
+    }
     for (index = 0U; index < pixel_count; ++index) {
         if (mask[index] == 2U) fade_pixel_outside_boundary(context, (int)(index % context->width), (int)(index / context->width));
     }
     context->boundary_fade_applied = 1;
+    rt_free(mask);
+    rt_free(queue);
+    rt_free(endpoints);
+}
+
+static int scale_normal_component(int value, int denominator, int distance) {
+    int scaled;
+
+    if (denominator <= 0 || value == 0) return 0;
+    scaled = (value * distance) / denominator;
+    if (scaled == 0) scaled = value > 0 ? 1 : -1;
+    return scaled;
+}
+
+static void coastline_seed_line(unsigned char *mask, unsigned int *queue, unsigned int width, unsigned int height, unsigned int *tail_io, int x0, int y0, int x1, int y1, int side) {
+    int delta_x = abs_int(x1 - x0);
+    int step_x = x0 < x1 ? 1 : -1;
+    int delta_y_abs = abs_int(y1 - y0);
+    int delta_y = -delta_y_abs;
+    int step_y = y0 < y1 ? 1 : -1;
+    int error = delta_x + delta_y;
+    int normal_denominator = delta_x > delta_y_abs ? delta_x : delta_y_abs;
+    int seed_x = scale_normal_component(-(y1 - y0), normal_denominator, 5) * side;
+    int seed_y = scale_normal_component(x1 - x0, normal_denominator, 5) * side;
+
+    for (;;) {
+        int twice_error;
+
+        (void)boundary_mask_enqueue(mask, queue, width, height, tail_io, x0 + seed_x, y0 + seed_y);
+        if (x0 == x1 && y0 == y1) break;
+        twice_error = 2 * error;
+        if (twice_error >= delta_y) {
+            error += delta_y;
+            x0 += step_x;
+        }
+        if (twice_error <= delta_x) {
+            error += delta_x;
+            y0 += step_y;
+        }
+    }
+}
+
+static int collected_feature_is_coastline(const RenderFeature *feature) {
+    return feature->style_id == PACK_STYLE_WATER && (feature->flags & OSMRPACK_FEATURE_FLAG_COASTLINE) != 0U && feature->point_count >= 2U;
+}
+
+static int clamp_pixel_x(const RenderContext *context, int value) {
+    if (value < 0) return 0;
+    if (value >= (int)context->width) return (int)context->width - 1;
+    return value;
+}
+
+static int clamp_pixel_y(const RenderContext *context, int value) {
+    if (value < 0) return 0;
+    if (value >= (int)context->height) return (int)context->height - 1;
+    return value;
+}
+
+static void coastline_endpoint_to_edge(RenderContext *context, unsigned char *barrier, int x, int y) {
+    int clamped_x = clamp_pixel_x(context, x);
+    int clamped_y = clamp_pixel_y(context, y);
+    int left = clamped_x;
+    int right = (int)context->width - 1 - clamped_x;
+    int top = clamped_y;
+    int bottom = (int)context->height - 1 - clamped_y;
+    int edge_x = clamped_x;
+    int edge_y = 0;
+    int best = top;
+
+    if (bottom < best) {
+        best = bottom;
+        edge_x = clamped_x;
+        edge_y = (int)context->height - 1;
+    }
+    if (left < best) {
+        best = left;
+        edge_x = 0;
+        edge_y = clamped_y;
+    }
+    if (right < best) {
+        edge_x = (int)context->width - 1;
+        edge_y = clamped_y;
+    }
+    boundary_mask_line(barrier, context->width, context->height, clamped_x, clamped_y, edge_x, edge_y);
+}
+
+static void close_coastline_barriers(RenderContext *context, unsigned char *barrier, BoundaryEndpoint *endpoints, unsigned int endpoint_count) {
+    unsigned char *paired;
+    unsigned int index;
+
+    if (endpoint_count == 0U) return;
+    if (context->coastline_feature_count <= 8U) {
+        for (index = 0U; index < endpoint_count; ++index) coastline_endpoint_to_edge(context, barrier, endpoints[index].x, endpoints[index].y);
+        return;
+    }
+    paired = (unsigned char *)rt_malloc((size_t)endpoint_count);
+    if (paired == 0) return;
+    rt_memset(paired, 0, (size_t)endpoint_count);
+    for (index = 0U; index < endpoint_count; ++index) {
+        unsigned int other;
+        unsigned int best = 0xffffffffU;
+        unsigned int best_distance = 16U * 16U + 1U;
+
+        if (paired[index]) continue;
+        for (other = index + 1U; other < endpoint_count; ++other) {
+            int dx;
+            int dy;
+            unsigned int distance;
+
+            if (paired[other]) continue;
+            dx = endpoints[index].x - endpoints[other].x;
+            dy = endpoints[index].y - endpoints[other].y;
+            distance = (unsigned int)(dx * dx + dy * dy);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best = other;
+            }
+        }
+        if (best != 0xffffffffU && best_distance <= 16U * 16U) {
+            boundary_mask_line(barrier, context->width, context->height, endpoints[index].x, endpoints[index].y, endpoints[best].x, endpoints[best].y);
+            paired[index] = 1U;
+            paired[best] = 1U;
+        }
+    }
+    for (index = 0U; index < endpoint_count; ++index) {
+        if (!paired[index]) coastline_endpoint_to_edge(context, barrier, endpoints[index].x, endpoints[index].y);
+    }
+    rt_free(paired);
+}
+
+static void mark_coastline_barriers(RenderContext *context, unsigned char *barrier, BoundaryEndpoint *endpoints, unsigned int endpoint_capacity, unsigned int *endpoint_count_out) {
+    unsigned int feature_index;
+
+    *endpoint_count_out = 0U;
+
+    for (feature_index = 0U; feature_index < context->feature_count; ++feature_index) {
+        const RenderFeature *feature = &context->features[feature_index];
+        const int *points;
+        unsigned int point_index;
+        int have_endpoint = 0;
+        int start_x = 0;
+        int start_y = 0;
+        int end_x = 0;
+        int end_y = 0;
+
+        if (!collected_feature_is_coastline(feature)) continue;
+        points = context->points + feature->point_offset;
+        for (point_index = 0U; point_index + 1U < feature->point_count; ++point_index) {
+            long long x0 = points[point_index * 2U + 0U];
+            long long y0 = points[point_index * 2U + 1U];
+            long long x1 = points[(point_index + 1U) * 2U + 0U];
+            long long y1 = points[(point_index + 1U) * 2U + 1U];
+
+            if (clip_segment(context, &x0, &y0, &x1, &y1)) {
+                boundary_mask_line(barrier, context->width, context->height, (int)x0, (int)y0, (int)x1, (int)y1);
+                if (!have_endpoint) {
+                    start_x = (int)x0;
+                    start_y = (int)y0;
+                    have_endpoint = 1;
+                }
+                end_x = (int)x1;
+                end_y = (int)y1;
+            }
+        }
+        if (have_endpoint && *endpoint_count_out + 1U < endpoint_capacity) {
+            endpoints[*endpoint_count_out].x = clamp_pixel_x(context, start_x);
+            endpoints[*endpoint_count_out].y = clamp_pixel_y(context, start_y);
+            *endpoint_count_out += 1U;
+            endpoints[*endpoint_count_out].x = clamp_pixel_x(context, end_x);
+            endpoints[*endpoint_count_out].y = clamp_pixel_y(context, end_y);
+            *endpoint_count_out += 1U;
+        }
+    }
+    close_coastline_barriers(context, barrier, endpoints, *endpoint_count_out);
+}
+
+static unsigned int flood_coastline_side(RenderContext *context, const unsigned char *barrier, unsigned char *mask, unsigned int *queue, unsigned int pixel_count, int side, int paint,
+                                         const unsigned char *paint_limit_mask) {
+    unsigned int feature_index;
+    unsigned int index;
+    unsigned int head = 0U;
+    unsigned int tail = 0U;
+    unsigned int flooded_count = 0U;
+
+    memcpy(mask, barrier, (size_t)pixel_count);
+    for (feature_index = 0U; feature_index < context->feature_count; ++feature_index) {
+        const RenderFeature *feature = &context->features[feature_index];
+        const int *points;
+        unsigned int point_index;
+
+        if (!collected_feature_is_coastline(feature)) continue;
+        points = context->points + feature->point_offset;
+        for (point_index = 0U; point_index + 1U < feature->point_count; ++point_index) {
+            long long x0 = points[point_index * 2U + 0U];
+            long long y0 = points[point_index * 2U + 1U];
+            long long x1 = points[(point_index + 1U) * 2U + 0U];
+            long long y1 = points[(point_index + 1U) * 2U + 1U];
+
+            if (clip_segment(context, &x0, &y0, &x1, &y1)) coastline_seed_line(mask, queue, context->width, context->height, &tail, (int)x0, (int)y0, (int)x1, (int)y1, side);
+        }
+    }
+    while (head < tail) {
+        unsigned int pixel = queue[head++];
+        int px = (int)(pixel % context->width);
+        int py = (int)(pixel / context->width);
+
+        (void)boundary_mask_enqueue(mask, queue, context->width, context->height, &tail, px - 1, py);
+        (void)boundary_mask_enqueue(mask, queue, context->width, context->height, &tail, px + 1, py);
+        (void)boundary_mask_enqueue(mask, queue, context->width, context->height, &tail, px, py - 1);
+        (void)boundary_mask_enqueue(mask, queue, context->width, context->height, &tail, px, py + 1);
+    }
+    for (index = 0U; index < pixel_count; ++index) {
+        if (mask[index] == 2U) flooded_count += 1U;
+    }
+    if (paint) {
+        unsigned int painted_count = 0U;
+        for (index = 0U; index < pixel_count; ++index) {
+            if (mask[index] == 2U && (paint_limit_mask == 0 || paint_limit_mask[index] == 2U)) {
+                put_pixel_rgb(context, (int)(index % context->width), (int)(index / context->width), context->styles[PACK_STYLE_WATER].fill_red,
+                              context->styles[PACK_STYLE_WATER].fill_green, context->styles[PACK_STYLE_WATER].fill_blue, 255U);
+                painted_count += 1U;
+            }
+        }
+        return painted_count;
+    }
+    return flooded_count;
+}
+
+static int sea_fill_pixel_allowed(const unsigned char *mask, const unsigned char *paint_limit_mask, unsigned int index) {
+    return mask[index] == 2U && (paint_limit_mask == 0 || paint_limit_mask[index] == 2U);
+}
+
+static int coastline_barrier_pixel_touches_sea(RenderContext *context, const unsigned char *mask, const unsigned char *paint_limit_mask, unsigned int index) {
+    unsigned int x = index % context->width;
+    unsigned int y = index / context->width;
+
+    if (x > 0U && sea_fill_pixel_allowed(mask, paint_limit_mask, index - 1U)) return 1;
+    if (x + 1U < context->width && sea_fill_pixel_allowed(mask, paint_limit_mask, index + 1U)) return 1;
+    if (y > 0U && sea_fill_pixel_allowed(mask, paint_limit_mask, index - context->width)) return 1;
+    if (y + 1U < context->height && sea_fill_pixel_allowed(mask, paint_limit_mask, index + context->width)) return 1;
+    return 0;
+}
+
+static unsigned int paint_sea_pixel(RenderContext *context, unsigned int index) {
+    unsigned char *pixel = context->pixels + (size_t)index * 3U;
+    unsigned char red = context->styles[PACK_STYLE_WATER].fill_red;
+    unsigned char green = context->styles[PACK_STYLE_WATER].fill_green;
+    unsigned char blue = context->styles[PACK_STYLE_WATER].fill_blue;
+
+    if (pixel[0] == red && pixel[1] == green && pixel[2] == blue) return 0U;
+    pixel[0] = red;
+    pixel[1] = green;
+    pixel[2] = blue;
+    return 1U;
+}
+
+static unsigned int paint_sea_disc(RenderContext *context, unsigned int center_index, int radius, const unsigned char *paint_limit_mask) {
+    int center_x = (int)(center_index % context->width);
+    int center_y = (int)(center_index / context->width);
+    unsigned int painted = 0U;
+    int dy;
+
+    for (dy = -radius; dy <= radius; ++dy) {
+        int dx;
+        int y = center_y + dy;
+        if (y < 0 || y >= (int)context->height) continue;
+        for (dx = -radius; dx <= radius; ++dx) {
+            int x = center_x + dx;
+            unsigned int index;
+            if (x < 0 || x >= (int)context->width) continue;
+            if (dx * dx + dy * dy > radius * radius) continue;
+            index = (unsigned int)((size_t)y * (size_t)context->width + (size_t)x);
+            if (paint_limit_mask != 0 && paint_limit_mask[index] != 2U) continue;
+            painted += paint_sea_pixel(context, index);
+        }
+    }
+    return painted;
+}
+
+static unsigned int paint_flood_mask(RenderContext *context, const unsigned char *mask, const unsigned char *coastline_barrier, unsigned int pixel_count, const unsigned char *paint_limit_mask) {
+    unsigned int index;
+    unsigned int painted_count = 0U;
+    int coastline_paint_radius = (int)(context->width / 900U);
+
+    if (coastline_paint_radius < 3) coastline_paint_radius = 3;
+    if (coastline_paint_radius > 6) coastline_paint_radius = 6;
+    for (index = 0U; index < pixel_count; ++index) {
+        if (sea_fill_pixel_allowed(mask, paint_limit_mask, index)) painted_count += paint_sea_pixel(context, index);
+    }
+    if (coastline_barrier != 0) {
+        for (index = 0U; index < pixel_count; ++index) {
+            if (coastline_barrier[index] != 0U && coastline_barrier_pixel_touches_sea(context, mask, paint_limit_mask, index)) {
+                painted_count += paint_sea_disc(context, index, coastline_paint_radius, paint_limit_mask);
+            }
+        }
+    }
+    return painted_count;
+}
+
+static unsigned int sea_fill_blocker_radius(const RenderContext *context, const RenderFeature *feature) {
+    unsigned int base = context->width / 260U;
+
+    if (base < 6U) base = 6U;
+    if (base > 18U) base = 18U;
+    if (feature->style_id == PACK_STYLE_MOTORWAY || feature->style_id == PACK_STYLE_PRIMARY) return base + 5U;
+    if (feature->style_id == PACK_STYLE_SECONDARY) return base + 3U;
+    if (feature->style_id == PACK_STYLE_MINOR_ROAD || feature->style_id == PACK_STYLE_RAIL) return base + 1U;
+    if (feature->style_id == PACK_STYLE_PATH || feature->style_id == PACK_STYLE_BUILDING) return (base / 2U) + 3U;
+    return 0U;
+}
+
+static void mark_sea_fill_blockers(RenderContext *context, unsigned char *blocker_mask) {
+    unsigned int feature_index;
+
+    for (feature_index = 0U; feature_index < context->feature_count; ++feature_index) {
+        const RenderFeature *feature = &context->features[feature_index];
+        const int *points;
+        unsigned int point_index;
+        unsigned int radius = sea_fill_blocker_radius(context, feature);
+
+        if (radius == 0U || feature->point_count < 2U) continue;
+        points = context->points + feature->point_offset;
+        for (point_index = 0U; point_index + 1U < feature->point_count; ++point_index) {
+            long long x0 = points[point_index * 2U + 0U];
+            long long y0 = points[point_index * 2U + 1U];
+            long long x1 = points[(point_index + 1U) * 2U + 0U];
+            long long y1 = points[(point_index + 1U) * 2U + 1U];
+
+            if (clip_segment(context, &x0, &y0, &x1, &y1)) {
+                mask_line_radius(blocker_mask, context->width, context->height, (int)x0, (int)y0, (int)x1, (int)y1, (int)radius, 1U);
+            }
+        }
+    }
+}
+
+static unsigned int build_boundary_connected_sea_paint_mask(RenderContext *context, const unsigned char *flood_mask, const unsigned char *outside_mask,
+                                                            unsigned char *paint_mask, unsigned char *blocker_mask, unsigned int *queue, unsigned int pixel_count) {
+    unsigned int head = 0U;
+    unsigned int tail = 0U;
+    unsigned int index;
+
+    rt_memset(paint_mask, 0, (size_t)pixel_count);
+    rt_memset(blocker_mask, 0, (size_t)pixel_count);
+    mark_sea_fill_blockers(context, blocker_mask);
+    for (index = 0U; index < pixel_count; ++index) {
+        if (flood_mask[index] == 2U && outside_mask[index] == 2U) {
+            paint_mask[index] = 2U;
+            queue[tail++] = index;
+        }
+    }
+    while (head < tail) {
+        unsigned int pixel = queue[head++];
+        int px = (int)(pixel % context->width);
+        int py = (int)(pixel / context->width);
+        int offsets[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
+        unsigned int offset_index;
+
+        for (offset_index = 0U; offset_index < 4U; ++offset_index) {
+            int nx = px + offsets[offset_index][0];
+            int ny = py + offsets[offset_index][1];
+            unsigned int next;
+            int outside_pixel;
+
+            if (nx < 0 || ny < 0 || nx >= (int)context->width || ny >= (int)context->height) continue;
+            next = (unsigned int)((size_t)ny * (size_t)context->width + (size_t)nx);
+            if (paint_mask[next] != 0U || flood_mask[next] != 2U) continue;
+            outside_pixel = outside_mask[next] == 2U || outside_mask[next] == 1U;
+            if (!outside_pixel && blocker_mask[next] != 0U) continue;
+            paint_mask[next] = 2U;
+            queue[tail++] = next;
+        }
+    }
+    return tail;
+}
+
+static unsigned int count_flood_overlap(const unsigned char *flood_mask, const unsigned char *limit_mask, unsigned int pixel_count) {
+    unsigned int index;
+    unsigned int count = 0U;
+
+    if (limit_mask == 0) return 0U;
+    for (index = 0U; index < pixel_count; ++index) {
+        if (flood_mask[index] == 2U && limit_mask[index] == 2U) count += 1U;
+    }
+    return count;
+}
+
+static void fill_sea_from_coastlines(RenderContext *context) {
+    unsigned int pixel_count;
+    unsigned char *barrier;
+    unsigned char *coastline_barrier;
+    unsigned char *mask;
+    unsigned int *queue;
+    unsigned char *outside_mask = 0;
+    unsigned char *paint_mask = 0;
+    unsigned char *blocker_mask = 0;
+    unsigned char *paint_limit_mask = 0;
+    BoundaryEndpoint *endpoints;
+    BoundaryEndpoint *outside_endpoints = 0;
+    unsigned int endpoint_count = 0U;
+    unsigned int feature_index;
+    unsigned int positive_count;
+    unsigned int negative_count;
+    unsigned int positive_outside_count = 0U;
+    unsigned int negative_outside_count = 0U;
+    unsigned int min_fill_count;
+    unsigned int max_fill_count;
+    unsigned int chosen_count = 0U;
+    unsigned int chosen_outside_count = 0U;
+    int chosen_side = 0;
+
+    if (context->sea_fill_applied) return;
+    context->coastline_feature_count = 0U;
+    for (feature_index = 0U; feature_index < context->feature_count; ++feature_index) {
+        if (collected_feature_is_coastline(&context->features[feature_index])) context->coastline_feature_count += 1U;
+    }
+    if (context->coastline_feature_count == 0U) return;
+    if ((size_t)context->width > ((size_t)-1) / (size_t)context->height) return;
+    pixel_count = (unsigned int)((size_t)context->width * (size_t)context->height);
+    if ((size_t)pixel_count != (size_t)context->width * (size_t)context->height) return;
+    barrier = (unsigned char *)rt_malloc((size_t)pixel_count);
+    coastline_barrier = (unsigned char *)rt_malloc((size_t)pixel_count);
+    mask = (unsigned char *)rt_malloc((size_t)pixel_count);
+    queue = (unsigned int *)rt_malloc(sizeof(unsigned int) * (size_t)pixel_count);
+    endpoints = (BoundaryEndpoint *)rt_malloc(sizeof(*endpoints) * (size_t)context->coastline_feature_count * 2U);
+    if (barrier == 0 || coastline_barrier == 0 || mask == 0 || queue == 0 || endpoints == 0) {
+        rt_free(barrier);
+        rt_free(coastline_barrier);
+        rt_free(mask);
+        rt_free(queue);
+        rt_free(endpoints);
+        return;
+    }
+    if (context->boundary_feature_count >= 2U) {
+        outside_mask = (unsigned char *)rt_malloc((size_t)pixel_count);
+        outside_endpoints = (BoundaryEndpoint *)rt_malloc(sizeof(BoundaryEndpoint) * (size_t)context->boundary_feature_count * 2U);
+        if (outside_mask != 0 && outside_endpoints != 0) {
+            rt_memset(outside_mask, 0, (size_t)pixel_count);
+            if (build_outside_boundary_mask(context, outside_mask, queue, outside_endpoints, context->boundary_feature_count * 2U) != 0) {
+                rt_free(outside_mask);
+                outside_mask = 0;
+            }
+        } else {
+            rt_free(outside_mask);
+            outside_mask = 0;
+        }
+    }
+    rt_memset(barrier, 0, (size_t)pixel_count);
+    mark_coastline_barriers(context, barrier, endpoints, context->coastline_feature_count * 2U, &endpoint_count);
+    memcpy(coastline_barrier, barrier, (size_t)pixel_count);
+    if (outside_mask == 0) mark_sea_fill_blockers(context, barrier);
+    positive_count = flood_coastline_side(context, barrier, mask, queue, pixel_count, 1, 0, 0);
+    positive_outside_count = count_flood_overlap(mask, outside_mask, pixel_count);
+    negative_count = flood_coastline_side(context, barrier, mask, queue, pixel_count, -1, 0, 0);
+    negative_outside_count = count_flood_overlap(mask, outside_mask, pixel_count);
+    min_fill_count = pixel_count / 200U;
+    if (min_fill_count < 1000U) min_fill_count = 1000U;
+    max_fill_count = (unsigned int)(((unsigned long long)pixel_count * 97ULL) / 100ULL);
+    if (context->coastline_feature_count <= 8U) {
+        unsigned int sparse_max_fill_count = (unsigned int)(((unsigned long long)pixel_count * 35ULL) / 100ULL);
+        if (sparse_max_fill_count < max_fill_count) max_fill_count = sparse_max_fill_count;
+    }
+    if (positive_count >= min_fill_count && positive_count <= max_fill_count &&
+        (outside_mask == 0 || positive_outside_count * 100U >= positive_count * 55U)) {
+        chosen_count = positive_count;
+        chosen_outside_count = positive_outside_count;
+        chosen_side = 1;
+    }
+    if (negative_count >= min_fill_count && negative_count <= max_fill_count &&
+        (outside_mask == 0 || negative_outside_count * 100U >= negative_count * 55U) &&
+        (chosen_side == 0 || (negative_outside_count > chosen_outside_count) ||
+         (negative_outside_count == chosen_outside_count && negative_count < chosen_count))) {
+        chosen_count = negative_count;
+        chosen_outside_count = negative_outside_count;
+        chosen_side = -1;
+    }
+    if (chosen_side == 0 && context->coastline_feature_count >= 100U) {
+        unsigned int dense_max_fill_count = (unsigned int)(((unsigned long long)pixel_count * 999ULL) / 1000ULL);
+        if (positive_count >= min_fill_count && positive_count <= dense_max_fill_count &&
+            (outside_mask == 0 || positive_outside_count * 100U >= positive_count * 50U)) {
+            chosen_count = positive_count;
+            chosen_outside_count = positive_outside_count;
+            chosen_side = 1;
+        }
+        if (negative_count >= min_fill_count && negative_count <= dense_max_fill_count &&
+            (outside_mask == 0 || negative_outside_count * 100U >= negative_count * 50U) &&
+            (chosen_side == 0 || (negative_outside_count > chosen_outside_count) ||
+             (negative_outside_count == chosen_outside_count && negative_count < chosen_count))) {
+            chosen_count = negative_count;
+            chosen_outside_count = negative_outside_count;
+            chosen_side = -1;
+        }
+    }
+    if (chosen_side != 0) {
+        (void)flood_coastline_side(context, barrier, mask, queue, pixel_count, chosen_side, 0, 0);
+        if (outside_mask != 0) {
+            paint_mask = (unsigned char *)rt_malloc((size_t)pixel_count);
+            blocker_mask = (unsigned char *)rt_malloc((size_t)pixel_count);
+            if (paint_mask != 0 && blocker_mask != 0) {
+                (void)build_boundary_connected_sea_paint_mask(context, mask, outside_mask, paint_mask, blocker_mask, queue, pixel_count);
+                paint_limit_mask = paint_mask;
+            } else {
+                paint_limit_mask = outside_mask;
+            }
+        }
+        context->sea_fill_pixels = paint_flood_mask(context, mask, coastline_barrier, pixel_count, paint_limit_mask);
+        context->sea_fill_applied = context->sea_fill_pixels != 0U;
+    }
+    rt_free(paint_mask);
+    rt_free(blocker_mask);
+    rt_free(outside_mask);
+    rt_free(outside_endpoints);
+    rt_free(barrier);
+    rt_free(coastline_barrier);
     rt_free(mask);
     rt_free(queue);
     rt_free(endpoints);
@@ -3049,8 +3632,10 @@ static int draw_collected_feature(RenderContext *context, unsigned int step, con
 static void draw_collected_layers(RenderContext *context) {
     unsigned int layer_index;
 
+    fill_sea_from_coastlines(context);
     for (layer_index = 0U; layer_index < (unsigned int)(sizeof(render_layers) / sizeof(render_layers[0])); ++layer_index) {
         unsigned int feature_index;
+        if (!context->boundary_enabled && render_layers[layer_index].style_id == PACK_STYLE_BOUNDARY) continue;
         if (render_layers[layer_index].style_id == PACK_STYLE_BOUNDARY && !context->boundary_fade_applied) fade_outside_boundary(context);
         for (feature_index = 0U; feature_index < context->feature_count; ++feature_index) {
             const RenderFeature *feature = &context->features[feature_index];
@@ -3125,6 +3710,7 @@ static int render_exclave_insets_v2(int fd, const OsmrPackV2Header *header, Rend
     memcpy(inset.styles, context->styles, sizeof(inset.styles));
     inset.city_enabled = context->city_enabled;
     inset.city_name = context->city_name;
+    inset.boundary_enabled = context->boundary_enabled;
     inset.boundary_fade = context->boundary_fade;
     inset.png_palette = context->png_palette;
     inset.v2_boundary_payload_offset = context->v2_boundary_payload_offset;
@@ -3613,6 +4199,15 @@ static void write_render_summary(const char *out_path, const RenderContext *cont
     rt_write_cstr(1, "boundary_fade: ");
     rt_write_cstr(1, context->boundary_fade_applied ? "yes" : "no");
     rt_write_char(1, '\n');
+    rt_write_cstr(1, "coastline_features: ");
+    rt_write_uint(1, context->coastline_feature_count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "sea_fill: ");
+    rt_write_cstr(1, context->sea_fill_applied ? "yes" : "no");
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "sea_fill_pixels: ");
+    rt_write_uint(1, context->sea_fill_pixels);
+    rt_write_char(1, '\n');
     rt_write_cstr(1, "exclave_insets: ");
     rt_write_cstr(1, context->exclave_insets && context->have_exclave_bbox ? "yes" : "no");
     rt_write_char(1, '\n');
@@ -3717,6 +4312,7 @@ int main(int argc, char **argv) {
     rt_memset(&context, 0, sizeof(context));
     context.width = 1600U;
     context.height = 1200U;
+    context.boundary_enabled = 1;
     context.boundary_fade = 1;
     context.png_palette = 1;
     default_node_index_path[0] = '\0';
@@ -3797,6 +4393,10 @@ int main(int argc, char **argv) {
                 return 1;
             }
             context.route_polyline_path = argv[argi];
+            argi += 1;
+        } else if (rt_strcmp(argv[argi], "--no-boundary") == 0) {
+            context.boundary_enabled = 0;
+            context.boundary_fade = 0;
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--no-boundary-fade") == 0) {
             context.boundary_fade = 0;

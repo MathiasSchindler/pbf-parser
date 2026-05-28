@@ -271,9 +271,10 @@ Current feature flags:
 
 ```text
 bit 0: closed area feature, fillable by the renderer
+bit 1: coastline feature, used by the renderer to fill open sea/ocean regions
 ```
 
-The area flag is set only for closed ways in area-capable styles.
+The area flag is set only for closed ways in area-capable styles. Coastline features are not marked as closed areas even if a source way is closed.
 
 ## Style IDs
 
@@ -297,7 +298,9 @@ The current layer count is 12.
 Current way classification:
 
 ```text
-natural=water or waterway=riverbank                    -> water
+natural=coastline                                      -> water with coastline flag
+natural=water, waterway=riverbank, landuse=reservoir/basin,
+or water=lake/pond/reservoir/basin                        -> water
 any other waterway=*                                   -> waterway
 landuse=forest/orchard, natural=wood/scrub/tree_row    -> forest
 leisure=park/garden/nature_reserve                     -> park

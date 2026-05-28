@@ -16,6 +16,7 @@
 #define OSMRPACK_FLAG_EMPTY_GEOMETRY (1U << 0)
 
 #define OSMRPACK_FEATURE_FLAG_AREA (1U << 0)
+#define OSMRPACK_FEATURE_FLAG_COASTLINE (1U << 1)
 
 typedef struct {
     unsigned int version;

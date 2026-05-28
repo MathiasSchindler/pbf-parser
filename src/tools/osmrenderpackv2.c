@@ -76,17 +76,26 @@ static int tag_value_equals(const PbfText *value, const char *expected) {
     return value != 0 && text_equals(*value, expected);
 }
 
-static int classify_tags(const PbfTag *tags, unsigned int tag_count, int include_buildings, unsigned int *style_id_out, int *skipped_building_out) {
+static int classify_tags(const PbfTag *tags, unsigned int tag_count, int include_buildings, unsigned int *style_id_out, unsigned int *feature_flags_out, int *skipped_building_out) {
     const PbfText *highway = find_tag_value(tags, tag_count, "highway");
     const PbfText *railway = find_tag_value(tags, tag_count, "railway");
     const PbfText *waterway = find_tag_value(tags, tag_count, "waterway");
+    const PbfText *water = find_tag_value(tags, tag_count, "water");
     const PbfText *natural = find_tag_value(tags, tag_count, "natural");
     const PbfText *landuse = find_tag_value(tags, tag_count, "landuse");
     const PbfText *leisure = find_tag_value(tags, tag_count, "leisure");
     const PbfText *building = find_tag_value(tags, tag_count, "building");
 
+    *feature_flags_out = 0U;
     *skipped_building_out = 0;
-    if (tag_value_equals(natural, "water") || tag_value_equals(waterway, "riverbank")) {
+    if (tag_value_equals(natural, "coastline")) {
+        *style_id_out = PACK_STYLE_WATER;
+        *feature_flags_out = OSMRPACK_FEATURE_FLAG_COASTLINE;
+        return 1;
+    }
+    if (tag_value_equals(natural, "water") || tag_value_equals(waterway, "riverbank") || tag_value_equals(landuse, "reservoir") ||
+        tag_value_equals(landuse, "basin") || tag_value_equals(water, "lake") || tag_value_equals(water, "pond") ||
+        tag_value_equals(water, "reservoir") || tag_value_equals(water, "basin")) {
         *style_id_out = PACK_STYLE_WATER;
         return 1;
     }
@@ -167,6 +176,7 @@ static int grow_refs(PackBuildContext *context, unsigned int needed) {
 static int on_pack_way(void *user, const PbfWay *way) {
     PackBuildContext *context = (PackBuildContext *)user;
     unsigned int style_id;
+    unsigned int extra_flags;
     unsigned int flags = 0U;
     unsigned int ref_index;
     int skipped_building = 0;
@@ -174,11 +184,12 @@ static int on_pack_way(void *user, const PbfWay *way) {
 
     context->source_ways += 1ULL;
     if (way->ref_count < 2U) return 0;
-    if (!classify_tags(way->tags, way->tag_count, context->include_buildings, &style_id, &skipped_building)) {
+    if (!classify_tags(way->tags, way->tag_count, context->include_buildings, &style_id, &extra_flags, &skipped_building)) {
         if (skipped_building) context->skipped_buildings += 1ULL;
         return 0;
     }
-    if (style_can_be_area(style_id) && way->ref_count >= 4U && way->refs[0] == way->refs[way->ref_count - 1U]) flags |= OSMRPACK_FEATURE_FLAG_AREA;
+    flags = extra_flags;
+    if ((flags & OSMRPACK_FEATURE_FLAG_COASTLINE) == 0U && style_can_be_area(style_id) && way->ref_count >= 4U && way->refs[0] == way->refs[way->ref_count - 1U]) flags |= OSMRPACK_FEATURE_FLAG_AREA;
     if (grow_features(context, context->feature_count + 1U) != 0 || grow_refs(context, context->ref_count + way->ref_count) != 0) {
         context->failed = 1;
         return -1;
@@ -406,6 +417,7 @@ typedef struct {
     unsigned int place_way_capacity;
     long long pending_way_id;
     unsigned int pending_style_id;
+    unsigned int pending_flags;
     int pending_classified;
     int failed;
 } V2WayWorker;
@@ -990,6 +1002,7 @@ static int v2_way_worker_init(void *worker_user, unsigned int worker_index, void
 static int v2_on_way_worker_tags(void *user, long long id, const PbfTag *tags, unsigned int tag_count) {
     V2WayWorker *worker = (V2WayWorker *)user;
     unsigned int style_id = 0U;
+    unsigned int feature_flags = 0U;
     int skipped_building = 0;
     int classified;
     int needed_place_way;
@@ -997,11 +1010,13 @@ static int v2_on_way_worker_tags(void *user, long long id, const PbfTag *tags, u
     worker->pack.source_ways += 1ULL;
     worker->pending_way_id = id;
     worker->pending_style_id = 0U;
+    worker->pending_flags = 0U;
     worker->pending_classified = 0;
-    classified = classify_tags(tags, tag_count, worker->pack.include_buildings, &style_id, &skipped_building);
+    classified = classify_tags(tags, tag_count, worker->pack.include_buildings, &style_id, &feature_flags, &skipped_building);
     if (skipped_building) worker->pack.skipped_buildings += 1ULL;
     if (classified) {
         worker->pending_style_id = style_id;
+        worker->pending_flags = feature_flags;
         worker->pending_classified = 1;
     }
     needed_place_way = v2_needed_place_way_contains(worker->shared, id);
@@ -1018,8 +1033,8 @@ static int v2_on_way_worker(void *user, const PbfWay *way) {
     }
     if (worker->pending_classified && way->ref_count >= 2U) {
         PackBuildFeature *feature;
-        unsigned int flags = 0U;
-        if (style_can_be_area(worker->pending_style_id) && way->ref_count >= 4U && way->refs[0] == way->refs[way->ref_count - 1U]) flags |= OSMRPACK_FEATURE_FLAG_AREA;
+        unsigned int flags = worker->pending_flags;
+        if ((flags & OSMRPACK_FEATURE_FLAG_COASTLINE) == 0U && style_can_be_area(worker->pending_style_id) && way->ref_count >= 4U && way->refs[0] == way->refs[way->ref_count - 1U]) flags |= OSMRPACK_FEATURE_FLAG_AREA;
         if (grow_features(&worker->pack, worker->pack.feature_count + 1U) != 0 ||
             grow_refs(&worker->pack, worker->pack.ref_count + way->ref_count) != 0) {
             worker->failed = 1;
