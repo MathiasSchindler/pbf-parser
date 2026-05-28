@@ -4,7 +4,7 @@ set -eu
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 XZ_VERSION=5.8.1
 XZ_URL="https://github.com/tukaani-project/xz/releases/download/v${XZ_VERSION}/xz-${XZ_VERSION}.tar.xz"
-: "${TMPDIR:?TMPDIR must be set}"
+TMPDIR=${TMPDIR:-/tmp}
 WORK_DIR="${TMPDIR%/}/pbf-parser-xz-wasm-${XZ_VERSION}"
 SRC_DIR="$WORK_DIR/src"
 

@@ -2,6 +2,10 @@ CC := gcc-16
 OS := linux
 ARCH := x86_64
 BUILD_DIR := build/freestanding-$(OS)-$(ARCH)
+MAKE_JOBS ?= $(shell nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
+ifeq ($(filter -j%,$(MAKEFLAGS)),)
+MAKEFLAGS += -j$(MAKE_JOBS)
+endif
 MACOS_CC ?= clang
 MACOS_ARCH := aarch64
 MACOS_BUILD_DIR := build/freestanding-macos-arm64

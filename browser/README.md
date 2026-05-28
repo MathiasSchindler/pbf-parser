@@ -4,8 +4,8 @@ This folder contains a browser-only prototype for Berlin routing and map renderi
 
 Generated data files:
 
-- `berlin.rte.xz` - xz-compressed OSMRTE01 walking route pack built from `data/berlin-260526.osm.pbf`
-- `berlin.rpack.xz` - xz-compressed OSMRPACK render pack built from `data/berlin-260526.osm.pbf`
+- `berlin.rte.xz` - xz-compressed OSMRTE01 walking route pack built from `data/berlin-260524.osm.pbf`
+- `berlin.rpack.xz` - xz-compressed OSMRPACK render pack built from `data/berlin-260524.osm.pbf`
 
 WASM modules:
 
@@ -22,11 +22,11 @@ sh browser/build-wasm.sh
 Rebuild the Berlin packs with:
 
 ```sh
-make -B build/freestanding-macos-arm64/osmroutepack build/freestanding-macos-arm64/osmrenderpackv2
-build/freestanding-macos-arm64/osmroutepack --tile-size-m 2000 --threads 2 \
-  data/berlin-260526.osm.pbf browser/berlin.rte
-build/freestanding-macos-arm64/osmrenderpackv2 --threads 2 --way-threads 2 --buildings \
-  data/berlin-260526.osm.pbf browser/berlin.rpack
+make build/freestanding-linux-x86_64/osmroutepack build/freestanding-linux-x86_64/osmrenderpackv2
+build/freestanding-linux-x86_64/osmroutepack --tile-size-m 2000 --threads 2 \
+  data/berlin-260524.osm.pbf browser/berlin.rte
+build/freestanding-linux-x86_64/osmrenderpackv2 --threads 2 --way-threads 2 --buildings \
+  data/berlin-260524.osm.pbf browser/berlin.rpack
 xz -6 -k -f browser/berlin.rte
 xz -6 -k -f browser/berlin.rpack
 ```
