@@ -186,6 +186,7 @@ OSMRENDER_RPACK_SRCS := \
 
 OSMWALKROUTE_SRCS := \
     $(RUNTIME_SRCS) \
+    src/platform/linux/thread.c \
     src/shared/compression/zlib.c \
     src/shared/pbf.c \
     src/tools/osmwalkroute.c
@@ -204,6 +205,7 @@ OSMRTEINFO_SRCS := \
 
 RTEWALKROUTE_SRCS := \
     $(RUNTIME_SRCS) \
+    src/platform/linux/time.c \
     src/tools/rtewalkroute.c
 
 THREADTEST_SRCS := \
