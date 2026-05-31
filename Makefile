@@ -148,6 +148,14 @@ OSMADDRESSES_SRCS := \
     src/shared/pbf.c \
     src/tools/osmaddresses.c
 
+OSMBUILDINGS_SRCS := \
+    $(RUNTIME_SRCS) \
+    src/platform/linux/fs.c \
+    src/shared/compression/zlib.c \
+    src/shared/osm_index.c \
+    src/shared/pbf.c \
+    src/tools/osmbuildings.c
+
 OSMRENDER_SRCS := \
     $(RUNTIME_SRCS) \
     src/platform/linux/fs.c \
@@ -225,7 +233,7 @@ FONTTEST_SRCS := \
 
 .PHONY: all clean threadtest macos-rpack-tools macos-threadtest
 
-all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmwayindex $(BUILD_DIR)/osmindex $(BUILD_DIR)/osmrelindex $(BUILD_DIR)/osmspindex $(BUILD_DIR)/osmaddresses $(BUILD_DIR)/osmrender $(BUILD_DIR)/osmrenderpackv2 $(BUILD_DIR)/osmrpackinfo $(BUILD_DIR)/osmrender-rpack $(BUILD_DIR)/osmwalkroute $(BUILD_DIR)/osmroutepack $(BUILD_DIR)/osmrteinfo $(BUILD_DIR)/rtewalkroute $(BUILD_DIR)/threadtest $(BUILD_DIR)/fonttest
+all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmwayindex $(BUILD_DIR)/osmindex $(BUILD_DIR)/osmrelindex $(BUILD_DIR)/osmspindex $(BUILD_DIR)/osmaddresses $(BUILD_DIR)/osmbuildings $(BUILD_DIR)/osmrender $(BUILD_DIR)/osmrenderpackv2 $(BUILD_DIR)/osmrpackinfo $(BUILD_DIR)/osmrender-rpack $(BUILD_DIR)/osmwalkroute $(BUILD_DIR)/osmroutepack $(BUILD_DIR)/osmrteinfo $(BUILD_DIR)/rtewalkroute $(BUILD_DIR)/threadtest $(BUILD_DIR)/fonttest
 
 threadtest: $(BUILD_DIR)/threadtest
 
@@ -262,6 +270,9 @@ $(BUILD_DIR)/osmspindex: $(OSMSPINDEX_SRCS) | $(BUILD_DIR)
 
 $(BUILD_DIR)/osmaddresses: $(OSMADDRESSES_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMADDRESSES_SRCS) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/osmbuildings: $(OSMBUILDINGS_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(OSMBUILDINGS_SRCS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/osmrender: $(OSMRENDER_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMRENDER_SRCS) $(LDFLAGS) -o $@

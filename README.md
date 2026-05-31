@@ -11,6 +11,7 @@ The repository currently provides:
 - `pbfinfo`, which reads OSM PBF fileblocks and reports summary counts and metadata.
 - `osmlookup`, which streams nodes, ways, and relations and filters them by type, tags, IDs, names, and bounding boxes.
 - `osmaddresses`, which extracts address tags into TSV rows containing state, city, suburb, street, house number, and postcode fields.
+- `osmbuildings`, which extracts building/address candidates into TSV rows with address fields, building tags, levels/flats hints, centroid/bbox coordinates, and optional relation geometry via node/way indexes.
 - `osmnodeindex`, which builds a compact node coordinate index for way geometry lookup.
 - `osmwayindex`, which builds a compact way-reference index for targeted relation rendering.
 - `osmindex`, which builds node and way indexes together in one buffered pass through a PBF file.
@@ -77,6 +78,16 @@ For city rendering, build the indexes once for the matching extract:
 ./build/freestanding-linux-x86_64/osmindex --progress data/germany-260524.osm.pbf build/germany.osmnidx build/germany.osmwidx
 ./build/freestanding-linux-x86_64/osmrelindex --progress data/germany-260524.osm.pbf build/germany.osmridx
 ./build/freestanding-linux-x86_64/osmspindex --progress build/germany.osmnidx build/germany.osmwidx build/germany.osmspidx
+```
+
+Residential building/address candidates can be exported as TSV for a city-sized bbox. Bbox arguments use the same `MINLON,MINLAT,MAXLON,MAXLAT` order as `osmlookup`; `--node-index` enables way coordinates, `--spatial-index` prunes the national PBF to the city bbox before expensive geometry lookup, and `--way-index` enables multipolygon relation geometry.
+
+```sh
+./build/freestanding-linux-x86_64/osmbuildings data/germany-260524.osm.pbf potsdam_buildings.tsv \
+	--bbox 12.85,52.30,13.25,52.55 \
+	--node-index build/germany.osmnidx \
+	--way-index build/germany.osmwidx \
+	--spatial-index build/germany.osmspidx
 ```
 
 Then a short city render command uses sane defaults:
