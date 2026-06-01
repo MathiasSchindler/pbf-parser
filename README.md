@@ -1,8 +1,27 @@
 # pbf-parser
 
-This project contains small freestanding C tools for reading and processing OpenStreetMap PBF files. The current focus is on inspecting PBF metadata, streaming OSM entities, building simple indexes, running lookups, and experimenting with bitmap rendering.
+This project contains small freestanding C tools for reading and processing OpenStreetMap PBF files. The current focus is on inspecting PBF metadata, streaming OSM entities, running lookups, building render packs for map output, and building route packs for routing.
 
 The tools are written for static Linux x86_64 builds without the standard C library. They use a small local runtime, direct platform syscall wrappers, and project-local parsing and compression code instead of external libraries.
+
+## Current Status
+
+The active render-pack path is the `OSMRPK02` version 2 pipeline:
+
+```sh
+make
+./build/freestanding-linux-x86_64/osmrenderpackv2 data/brandenburg-260524.osm.pbf data/brandenburg.rpack
+./build/freestanding-linux-x86_64/osmrpackinfo data/brandenburg.rpack
+./build/freestanding-linux-x86_64/osmrender-rpack data/brandenburg.rpack build/potsdam.png --city Potsdam
+```
+
+The authoritative implemented render-pack spec is `docs/osmrpack_format.md`. The active builder is `src/tools/osmrenderpackv2.c`, the active renderer is `src/tools/osmrender_rpack.c`, and `osmrpackinfo` understands the same v2 header.
+
+Directory status:
+
+- `src/` and `docs/` contain the active tools and implemented format documentation.
+- `actual/` contains future stable-format design notes, not the format currently emitted by the tools.
+- `browser/` is a browser prototype that consumes packs produced by the active top-level tools.
 
 ## Scope
 
@@ -11,13 +30,7 @@ The repository currently provides:
 - `pbfinfo`, which reads OSM PBF fileblocks and reports summary counts and metadata.
 - `osmlookup`, which streams nodes, ways, and relations and filters them by type, tags, IDs, names, and bounding boxes.
 - `osmaddresses`, which extracts address tags into TSV rows containing state, city, suburb, street, house number, and postcode fields.
-- `osmbuildings`, which extracts building/address candidates into TSV rows with address fields, building tags, levels/flats hints, centroid/bbox coordinates, and optional relation geometry via node/way indexes.
-- `osmnodeindex`, which builds a compact node coordinate index for way geometry lookup.
-- `osmwayindex`, which builds a compact way-reference index for targeted relation rendering.
-- `osmindex`, which builds node and way indexes together in one buffered pass through a PBF file.
-- `osmrelindex`, which builds a compact administrative relation index for fast city-boundary lookup.
-- `osmspindex`, which builds a way bounding-box index from node and way indexes for faster viewport filtering.
-- `osmrender`, an experimental BMP/PNG renderer with bbox, relation-boundary, city-name, green-area, major-road rendering modes, and a font-rendered status footer.
+- `osmbuildings`, which extracts building/address candidates into TSV rows with address fields, building tags, levels/flats hints, and centroid/bbox coordinates.
 - `osmrenderpackv2`, which builds `OSMRPK02` render-pack files from `.osm.pbf` extracts for faster repeated city/bbox rendering.
 - `osmrpackinfo`, which prints render-pack header and directory metadata.
 - `osmrender-rpack`, which renders PNGs from `.rpack` files using `--city` or `--bbox` without scanning the source PBF.
@@ -39,7 +52,7 @@ The code is split into platform, runtime, shared parser, and tool layers:
 - `src/shared/runtime` contains the small runtime functions used instead of libc.
 - `src/shared/compression` contains the local zlib/deflate implementation used for PBF blobs.
 - `src/shared/pbf.c` and `src/shared/pbf.h` contain the OSM PBF and protobuf streaming parser.
-- `src/shared/osm_index.c` and `src/shared/osm_index.h` contain the reusable node, way, relation, and spatial index formats and lookup code.
+- `src/shared/osm_index.c` and `src/shared/osm_index.h` contain legacy index readers used by older lookup/extraction helpers.
 - `src/shared/fontrender` contains the vendored freestanding TrueType parser/rasterizer core from `~/fontrender`.
 - `src/shared/fontrender_runtime.c` installs this project's memory, file, and logging hooks for the font renderer.
 - `src/tools` contains the command-line tools built on top of the shared layers.
@@ -62,7 +75,7 @@ For the freestanding macOS arm64 router build used during Potsdam routing work:
 make -B build/freestanding-macos-arm64/osmwalkroute
 ```
 
-`make clean` removes the whole build directory, including generated OSM indexes. Recreate the binaries with `make`, then recreate any needed `.osm*idx` files before city rendering from a large extract.
+`make clean` removes the whole build directory. Recreate the binaries with `make`, then recreate any needed `.rpack` or `.rte` files.
 
 ## Data
 
@@ -72,42 +85,21 @@ Place local `.osm.pbf` files under `data/` when running the tools. Example:
 ./build/freestanding-linux-x86_64/pbfinfo data/example.osm.pbf
 ```
 
-For city rendering, build the indexes once for the matching extract:
-
-```sh
-./build/freestanding-linux-x86_64/osmindex --progress data/germany-260524.osm.pbf build/germany.osmnidx build/germany.osmwidx
-./build/freestanding-linux-x86_64/osmrelindex --progress data/germany-260524.osm.pbf build/germany.osmridx
-./build/freestanding-linux-x86_64/osmspindex --progress build/germany.osmnidx build/germany.osmwidx build/germany.osmspidx
-```
-
-Residential building/address candidates can be exported as TSV for a city-sized bbox. Bbox arguments use the same `MINLON,MINLAT,MAXLON,MAXLAT` order as `osmlookup`; `--node-index` enables way coordinates, `--spatial-index` prunes the national PBF to the city bbox before expensive geometry lookup, and `--way-index` enables multipolygon relation geometry.
+Residential building/address candidates can be exported as TSV for a city-sized bbox. Bbox arguments use the same `MINLON,MINLAT,MAXLON,MAXLAT` order as `osmlookup`.
 
 ```sh
 ./build/freestanding-linux-x86_64/osmbuildings data/germany-260524.osm.pbf potsdam_buildings.tsv \
-	--bbox 12.85,52.30,13.25,52.55 \
-	--node-index build/germany.osmnidx \
-	--way-index build/germany.osmwidx \
-	--spatial-index build/germany.osmspidx
+	--bbox 12.85,52.30,13.25,52.55
 ```
 
-Then a short city render command uses sane defaults:
-
-```sh
-./build/freestanding-linux-x86_64/osmrender data/germany-260524.osm.pbf city.png --city Berlin
-```
-
-With `--city`, `osmrender` infers matching `build/<extract>.osmnidx`, `.osmwidx`, optional `.osmridx`, optional `.osmspidx`, the default style file, green-area rendering, major roads, aspect-aware output dimensions, and a brighter outside-boundary mask. If the inferred indexes are missing, it prints the commands needed to rebuild them.
-
-By default, `osmrender` appends a small status footer below the map when the configured TrueType font is available. Footer font, colors, size, and text are configured with `footer.*` keys in `styles/osmrender-default.conf`; `--font FILE.ttf` overrides the configured font for one run, and `--no-status-footer` disables the footer for clean exports. Available footer variables are documented in `docs/osmrender_footer.md`.
-
-For repeated renders from a large extract, build a render pack once and render from it:
+For map rendering, build a render pack once and render from it:
 
 ```sh
 ./build/freestanding-linux-x86_64/osmrenderpackv2 --tile-zoom 10 --threads 8 data/germany-260524.osm.pbf build/germany.rpack
 ./build/freestanding-linux-x86_64/osmrender-rpack build/germany.rpack city.png --city Berlin --width 1600 --height 1200 --profile
 ```
 
-`osmrender-rpack` can render directly from the pack-contained place directory, tile payloads, and embedded per-place boundary payloads. For `--city`, it draws the matching administrative boundary and fades pixels outside it without sidecar indexes; distant exclave components are excluded from the default viewport and can be shown with `--exclave-insets`. A route overlay can be drawn with `--route-polyline FILE`, where the file contains one `lon,lat` point per line. `.osmnidx`, `.osmwidx`, and `.osmridx` remain as a fallback for older packs. The pack format is documented in `docs/osmrpack_format.md`.
+`osmrender-rpack` renders directly from the pack-contained place directory, tile payloads, and embedded per-place boundary payloads. It loads `styles/osmrender-default.conf` when present, and `--style FILE` can override the map colors and stroke widths for one render. For `--city`, it draws the matching administrative boundary and fades pixels outside it from the `.rpack` data; distant exclave components are excluded from the default viewport and can be shown with `--exclave-insets`. A route overlay can be drawn with `--route-polyline FILE`, where the file contains one `lon,lat` point per line. The pack format is documented in `docs/osmrpack_format.md`.
 
 ## Routing
 
@@ -240,7 +232,7 @@ The human-readable directions are currently coarse graph directions such as “c
 
 ## Fonts
 
-The project vendors the freestanding TrueType backend from `~/fontrender` under `src/shared/fontrender`. The core remains dependency-free and is connected to this runtime by `fontrender_runtime_install()`. `osmrender` uses it for the diagnostic footer; full map labels are still future work.
+The project vendors the freestanding TrueType backend from `~/fontrender` under `src/shared/fontrender`. The core remains dependency-free and is connected to this runtime by `fontrender_runtime_install()`. Full map labels are still future work.
 
 A smoke test can load a `.ttf` and rasterize one glyph:
 
@@ -256,11 +248,8 @@ Additional notes are in:
 
 - `docs/threading.md`
 - `docs/osm_streaming.md`
-- `docs/osm_rendering.md`
-- `docs/osmrender_footer.md`
 - `docs/osmrpack_format.md`
 - `docs/OSMRTE01.md`
-- `docs/berlin_green_data.md`
 
 ## Generation And License
 

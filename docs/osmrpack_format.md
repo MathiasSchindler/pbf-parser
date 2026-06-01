@@ -11,7 +11,7 @@ An `.rpack` file contains:
 - per-place boundary payloads for city outline/fade rendering
 - a UTF-8 string table for place names
 
-All map feature geometry used by the pack renderer is stored in the `.rpack` file, including per-place administrative boundary geometry for `--city` outline and outside-boundary fade. The renderer can still load boundary geometry from external `.osmnidx`, `.osmwidx`, and `.osmridx` files as a fallback for older packs.
+All map feature geometry used by the pack renderer is stored in the `.rpack` file, including per-place administrative boundary geometry for `--city` outline and outside-boundary fade.
 
 ## Tools
 
@@ -36,10 +36,12 @@ Inspect a pack header:
 Render from a pack:
 
 ```sh
-./build/freestanding-linux-x86_64/osmrender-rpack OUT.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--route-polyline FILE] [--exclave-insets] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary-fade] [--png-rgb] [--profile]
+./build/freestanding-linux-x86_64/osmrender-rpack OUT.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--style FILE] [--route-polyline FILE] [--exclave-insets] [--no-boundary-fade] [--png-rgb] [--profile]
 ```
 
 If only `--width` or only `--height` is supplied, the renderer derives the missing dimension from the resolved bbox aspect ratio. Supplying both dimensions keeps the exact requested image size.
+
+By default, `osmrender-rpack` loads `styles/osmrender-default.conf` when that file exists. Pass `--style FILE` to use another render style. Style keys are `background`, plus `STYLE.line`, `STYLE.fill`, `STYLE.casing`, `STYLE.width`, and `STYLE.casing_width` for the style names listed below.
 
 `--route-polyline FILE` draws a route overlay after the normal map and optional GTFS layers. The file is a plain text polyline with one `lon,lat` WGS84 decimal-degree point per line. The overlay is rendered as a single red route stroke.
 
@@ -132,7 +134,7 @@ Tile IDs are sortable unsigned 64-bit values:
 tile_id = (z << 58) | (x << 29) | y
 ```
 
-The renderer accepts `tile_zoom <= 29`. The builder uses the shared experimental maximum from `osmrpack.h`.
+The renderer accepts `tile_zoom <= 29`. The builder uses the shared maximum from `osmrpack.h`.
 
 ## Place Directory
 

@@ -2,9 +2,9 @@
 
 #include "compression/crc32.h"
 #include "compression/zlib.h"
-#include "osm_index.h"
 #include "platform.h"
 #include "runtime.h"
+#include "simple_config.h"
 
 #define PACK_STYLE_WATER 0U
 #define PACK_STYLE_WATERWAY 1U
@@ -181,10 +181,10 @@ typedef struct {
     unsigned int point_count;
     unsigned int point_capacity;
     RenderStyle styles[PACK_STYLE_COUNT];
+    unsigned char background_red;
+    unsigned char background_green;
+    unsigned char background_blue;
     const char *city_name;
-    const char *node_index_path;
-    const char *way_index_path;
-    const char *relation_index_path;
     unsigned long long v2_boundary_payload_offset;
     unsigned long long v2_boundary_payload_size;
     unsigned int v2_boundary_feature_count;
@@ -336,7 +336,7 @@ static const RenderLayer render_layers[] = {
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " PACK.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--gtfs DIR] [--route-polyline FILE] [--exclave-insets] [--node-index FILE] [--way-index FILE] [--relation-index FILE] [--no-boundary] [--no-boundary-fade] [--png-rgb] [--profile]\n");
+    rt_write_cstr(2, " PACK.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--style FILE] [--gtfs DIR] [--route-polyline FILE] [--exclave-insets] [--no-boundary] [--no-boundary-fade] [--png-rgb] [--profile]\n");
 }
 
 static void write_profile_ms(const char *label, unsigned long long elapsed_ms) {
@@ -384,20 +384,6 @@ static int path_exists(const char *path) {
     if (fd < 0) return 0;
     (void)platform_close(fd);
     return 1;
-}
-
-static int infer_index_path_from_pack(const char *pack_path, const char *extension, char *buffer, size_t buffer_size) {
-    size_t length = rt_strlen(pack_path);
-    size_t dot = length;
-    size_t prefix_size;
-
-    while (dot > 0U && pack_path[dot - 1U] != '.') dot -= 1U;
-    if (dot == 0U) return -1;
-    prefix_size = dot - 1U;
-    if (prefix_size + rt_strlen(extension) + 1U > buffer_size) return -1;
-    memcpy(buffer, pack_path, prefix_size);
-    memcpy(buffer + prefix_size, extension, rt_strlen(extension) + 1U);
-    return 0;
 }
 
 static int parse_uint_arg(const char *text, unsigned int *value_out) {
@@ -969,8 +955,131 @@ static void set_casing_style(RenderStyle *style, unsigned char red, unsigned cha
     style->flags |= STYLE_FLAG_CASING;
 }
 
+static int parse_style_uint_value(const char *text, unsigned int max_value, unsigned int *value_out) {
+    unsigned long long value;
+
+    if (rt_parse_uint(text, &value) != 0 || value > (unsigned long long)max_value) return -1;
+    *value_out = (unsigned int)value;
+    return 0;
+}
+
+static void skip_style_spaces(const char **text_io) {
+    while (rt_is_space(**text_io)) *text_io += 1;
+}
+
+static int parse_style_color_component(const char **text_io, unsigned char *component_out) {
+    unsigned int value = 0U;
+    unsigned int digits = 0U;
+
+    skip_style_spaces(text_io);
+    while (**text_io >= '0' && **text_io <= '9') {
+        value = value * 10U + (unsigned int)(**text_io - '0');
+        if (value > 255U) return -1;
+        digits += 1U;
+        *text_io += 1;
+    }
+    if (digits == 0U) return -1;
+    skip_style_spaces(text_io);
+    *component_out = (unsigned char)value;
+    return 0;
+}
+
+static int parse_style_color(const char *text, unsigned char default_alpha, unsigned char *red, unsigned char *green, unsigned char *blue, unsigned char *alpha) {
+    const char *cursor = text;
+
+    if (parse_style_color_component(&cursor, red) != 0 || *cursor != ',') return -1;
+    cursor += 1;
+    if (parse_style_color_component(&cursor, green) != 0 || *cursor != ',') return -1;
+    cursor += 1;
+    if (parse_style_color_component(&cursor, blue) != 0) return -1;
+    *alpha = default_alpha;
+    if (*cursor == ',') {
+        cursor += 1;
+        if (parse_style_color_component(&cursor, alpha) != 0) return -1;
+    }
+    skip_style_spaces(&cursor);
+    return *cursor == '\0' ? 0 : -1;
+}
+
+static int style_name_equals(const char *key, size_t key_size, const char *name) {
+    size_t name_size = rt_strlen(name);
+
+    return key_size == name_size && memcmp(key, name, name_size) == 0;
+}
+
+static int text_starts_with(const char *text, const char *prefix) {
+    while (*prefix != '\0') {
+        if (*text != *prefix) return 0;
+        text += 1;
+        prefix += 1;
+    }
+    return 1;
+}
+
+static int style_id_from_name(const char *name, size_t name_size, unsigned int *style_id_out) {
+    if (style_name_equals(name, name_size, "water")) *style_id_out = PACK_STYLE_WATER;
+    else if (style_name_equals(name, name_size, "waterway")) *style_id_out = PACK_STYLE_WATERWAY;
+    else if (style_name_equals(name, name_size, "forest")) *style_id_out = PACK_STYLE_FOREST;
+    else if (style_name_equals(name, name_size, "park")) *style_id_out = PACK_STYLE_PARK;
+    else if (style_name_equals(name, name_size, "building")) *style_id_out = PACK_STYLE_BUILDING;
+    else if (style_name_equals(name, name_size, "motorway")) *style_id_out = PACK_STYLE_MOTORWAY;
+    else if (style_name_equals(name, name_size, "primary")) *style_id_out = PACK_STYLE_PRIMARY;
+    else if (style_name_equals(name, name_size, "secondary")) *style_id_out = PACK_STYLE_SECONDARY;
+    else if (style_name_equals(name, name_size, "minor_road")) *style_id_out = PACK_STYLE_MINOR_ROAD;
+    else if (style_name_equals(name, name_size, "path")) *style_id_out = PACK_STYLE_PATH;
+    else if (style_name_equals(name, name_size, "rail")) *style_id_out = PACK_STYLE_RAIL;
+    else if (style_name_equals(name, name_size, "boundary")) *style_id_out = PACK_STYLE_BOUNDARY;
+    else return -1;
+    return 0;
+}
+
+static int style_config_visit(const char *key, const char *value, void *user) {
+    RenderContext *context = (RenderContext *)user;
+    const char *dot = key;
+    unsigned int style_id;
+    RenderStyle *style;
+
+    if (rt_strcmp(key, "background") == 0) {
+        unsigned char alpha;
+        return parse_style_color(value, 255U, &context->background_red, &context->background_green, &context->background_blue, &alpha);
+    }
+    if (text_starts_with(key, "footer.")) return 0;
+    while (*dot != '\0' && *dot != '.') dot += 1;
+    if (*dot != '.' || dot == key || dot[1] == '\0') return -1;
+    if (style_id_from_name(key, (size_t)(dot - key), &style_id) != 0) return -1;
+    style = &context->styles[style_id];
+    dot += 1;
+    if (rt_strcmp(dot, "line") == 0) {
+        if (parse_style_color(value, 255U, &style->red, &style->green, &style->blue, &style->alpha) != 0) return -1;
+        if (style->width == 0U) style->width = 1U;
+        style->flags |= STYLE_FLAG_LINE;
+        return 0;
+    }
+    if (rt_strcmp(dot, "fill") == 0) {
+        if (parse_style_color(value, 200U, &style->fill_red, &style->fill_green, &style->fill_blue, &style->fill_alpha) != 0) return -1;
+        style->flags |= STYLE_FLAG_FILL;
+        return 0;
+    }
+    if (rt_strcmp(dot, "casing") == 0) {
+        if (parse_style_color(value, 220U, &style->casing_red, &style->casing_green, &style->casing_blue, &style->casing_alpha) != 0) return -1;
+        if (style->casing_width == 0U) style->casing_width = style->width + 2U;
+        style->flags |= STYLE_FLAG_CASING;
+        return 0;
+    }
+    if (rt_strcmp(dot, "width") == 0) return parse_style_uint_value(value, 64U, &style->width);
+    if (rt_strcmp(dot, "casing_width") == 0) return parse_style_uint_value(value, 64U, &style->casing_width);
+    return -1;
+}
+
+static int load_style_config(const char *path, RenderContext *context) {
+    return simple_config_parse_file(path, style_config_visit, context);
+}
+
 static void styles_init(RenderContext *context) {
     rt_memset(context->styles, 0, sizeof(context->styles));
+    context->background_red = 242U;
+    context->background_green = 239U;
+    context->background_blue = 232U;
     set_fill_style(&context->styles[PACK_STYLE_WATER], 154U, 196U, 214U, 230U);
     set_line_style(&context->styles[PACK_STYLE_WATER], 94U, 151U, 183U, 2U);
     set_line_style(&context->styles[PACK_STYLE_WATERWAY], 92U, 158U, 194U, 2U);
@@ -2025,167 +2134,6 @@ static int collect_visible_features_v2(int fd, const OsmrPackV2Header *header, R
 cleanup:
     feature_hash_set_destroy(&seen_hashes);
     rt_free(selected_records);
-    return result;
-}
-
-static int compute_city_boundary_bbox(RenderContext *context) {
-    OsmNodeIndex node_index;
-    OsmWayIndex way_index;
-    OsmRelationIndex relation_index;
-    OsmRelationIndexRecord relation_record;
-    char error[OSM_INDEX_ERROR_CAPACITY];
-    long long min_lon = 9223372036854775807LL;
-    long long min_lat = 9223372036854775807LL;
-    long long max_lon = -9223372036854775807LL;
-    long long max_lat = -9223372036854775807LL;
-    unsigned long long nodes_resolved = 0ULL;
-    unsigned int member_index;
-    int result = -1;
-
-    rt_memset(&node_index, 0, sizeof(node_index));
-    rt_memset(&way_index, 0, sizeof(way_index));
-    rt_memset(&relation_index, 0, sizeof(relation_index));
-    node_index.fd = -1;
-    way_index.fd = -1;
-    relation_index.fd = -1;
-    if (!context->city_enabled || context->city_name == 0 || context->node_index_path == 0 || context->way_index_path == 0 || context->relation_index_path == 0) return 0;
-    error[0] = '\0';
-    if (osm_node_index_open(&node_index, context->node_index_path, error, sizeof(error)) != 0) goto cleanup;
-    if (osm_way_index_open(&way_index, context->way_index_path, error, sizeof(error)) != 0) goto cleanup;
-    if (osm_relation_index_open(&relation_index, context->relation_index_path, error, sizeof(error)) != 0) goto cleanup;
-    if (!osm_relation_index_find_city(&relation_index, context->city_name, &relation_record)) {
-        result = 0;
-        goto cleanup;
-    }
-    for (member_index = 0U; member_index < relation_record.member_count; ++member_index) {
-        unsigned long long relation_member_index = relation_record.member_offset + (unsigned long long)member_index;
-        OsmWayIndexRecord way_record;
-        long long *refs = 0;
-        unsigned int ref_index;
-        int found;
-
-        if (relation_member_index >= relation_index.member_count) goto cleanup;
-        found = osm_way_index_find(&way_index, relation_index.members[relation_member_index], &way_record, error, sizeof(error));
-        if (found < 0) goto cleanup;
-        if (found == 0) continue;
-        if (osm_way_index_read_refs(&way_index, &way_record, &refs, error, sizeof(error)) != 0) goto cleanup;
-        for (ref_index = 0U; ref_index < way_record.ref_count; ++ref_index) {
-            OsmNodeIndexRecord node_record;
-
-            found = osm_node_index_find(&node_index, refs[ref_index], &node_record, error, sizeof(error));
-            if (found < 0) {
-                rt_free(refs);
-                goto cleanup;
-            }
-            if (found == 0) continue;
-            if (node_record.lon_nano < min_lon) min_lon = node_record.lon_nano;
-            if (node_record.lon_nano > max_lon) max_lon = node_record.lon_nano;
-            if (node_record.lat_nano < min_lat) min_lat = node_record.lat_nano;
-            if (node_record.lat_nano > max_lat) max_lat = node_record.lat_nano;
-            nodes_resolved += 1ULL;
-        }
-        rt_free(refs);
-    }
-    if (nodes_resolved != 0ULL && min_lon < max_lon && min_lat < max_lat) {
-        long long lon_padding = (max_lon - min_lon) / 10LL;
-        long long lat_padding = (max_lat - min_lat) / 10LL;
-        if (lon_padding < 5000000LL) lon_padding = 5000000LL;
-        if (lat_padding < 5000000LL) lat_padding = 5000000LL;
-        context->min_lon_nano = min_lon - lon_padding;
-        context->max_lon_nano = max_lon + lon_padding;
-        context->min_lat_nano = min_lat - lat_padding;
-        context->max_lat_nano = max_lat + lat_padding;
-        result = 0;
-    }
-
-cleanup:
-    osm_relation_index_close(&relation_index);
-    osm_way_index_close(&way_index);
-    osm_node_index_close(&node_index);
-    return result;
-}
-
-static int collect_boundary_way(RenderContext *context, OsmNodeIndex *node_index, OsmWayIndex *way_index, long long way_id, char *error, size_t error_capacity) {
-    OsmWayIndexRecord way_record;
-    long long *refs = 0;
-    int *projected_points;
-    unsigned int ref_index;
-    int found;
-
-    found = osm_way_index_find(way_index, way_id, &way_record, error, error_capacity);
-    if (found < 0) return -1;
-    if (found == 0 || way_record.ref_count < 2U) return 0;
-    if (osm_way_index_read_refs(way_index, &way_record, &refs, error, error_capacity) != 0) return -1;
-    projected_points = (int *)rt_malloc(sizeof(int) * (size_t)way_record.ref_count * 2U);
-    if (projected_points == 0) {
-        rt_free(refs);
-        return -1;
-    }
-    for (ref_index = 0U; ref_index < way_record.ref_count; ++ref_index) {
-        OsmNodeIndexRecord node_record;
-        long long pixel_x;
-        long long pixel_y;
-
-        found = osm_node_index_find(node_index, refs[ref_index], &node_record, error, error_capacity);
-        if (found < 0) {
-            rt_free(projected_points);
-            rt_free(refs);
-            return -1;
-        }
-        if (found == 0 || project_point(context, node_record.lon_nano, node_record.lat_nano, &pixel_x, &pixel_y) != 0) {
-            rt_free(projected_points);
-            rt_free(refs);
-            return 0;
-        }
-        projected_points[ref_index * 2U + 0U] = clamp_to_int(pixel_x);
-        projected_points[ref_index * 2U + 1U] = clamp_to_int(pixel_y);
-    }
-    if (append_render_feature(context, PACK_STYLE_BOUNDARY, 0U, way_record.ref_count, projected_points) != 0) {
-        rt_free(projected_points);
-        rt_free(refs);
-        return -1;
-    }
-    context->boundary_feature_count += 1U;
-    rt_free(projected_points);
-    rt_free(refs);
-    return 0;
-}
-
-static int collect_city_boundary(RenderContext *context) {
-    OsmNodeIndex node_index;
-    OsmWayIndex way_index;
-    OsmRelationIndex relation_index;
-    OsmRelationIndexRecord relation_record;
-    char error[OSM_INDEX_ERROR_CAPACITY];
-    unsigned int member_index;
-    int result = -1;
-
-    rt_memset(&node_index, 0, sizeof(node_index));
-    rt_memset(&way_index, 0, sizeof(way_index));
-    rt_memset(&relation_index, 0, sizeof(relation_index));
-    node_index.fd = -1;
-    way_index.fd = -1;
-    relation_index.fd = -1;
-    if (!context->boundary_enabled || !context->city_enabled || context->city_name == 0 || context->node_index_path == 0 || context->way_index_path == 0 || context->relation_index_path == 0) return 0;
-    error[0] = '\0';
-    if (osm_node_index_open(&node_index, context->node_index_path, error, sizeof(error)) != 0) goto cleanup;
-    if (osm_way_index_open(&way_index, context->way_index_path, error, sizeof(error)) != 0) goto cleanup;
-    if (osm_relation_index_open(&relation_index, context->relation_index_path, error, sizeof(error)) != 0) goto cleanup;
-    if (!osm_relation_index_find_city(&relation_index, context->city_name, &relation_record)) {
-        result = 0;
-        goto cleanup;
-    }
-    for (member_index = 0U; member_index < relation_record.member_count; ++member_index) {
-        unsigned long long relation_member_index = relation_record.member_offset + (unsigned long long)member_index;
-        if (relation_member_index >= relation_index.member_count) goto cleanup;
-        if (collect_boundary_way(context, &node_index, &way_index, relation_index.members[relation_member_index], error, sizeof(error)) != 0) goto cleanup;
-    }
-    result = 0;
-
-cleanup:
-    osm_relation_index_close(&relation_index);
-    osm_way_index_close(&way_index);
-    osm_node_index_close(&node_index);
     return result;
 }
 
@@ -3783,9 +3731,9 @@ static int fill_background(RenderContext *context) {
     context->pixels = (unsigned char *)rt_malloc(pixel_count * 3U);
     if (context->pixels == 0) return -1;
     for (pixel_index = 0U; pixel_index < pixel_count; ++pixel_index) {
-        context->pixels[pixel_index * 3U + 0U] = 242U;
-        context->pixels[pixel_index * 3U + 1U] = 239U;
-        context->pixels[pixel_index * 3U + 2U] = 232U;
+        context->pixels[pixel_index * 3U + 0U] = context->background_red;
+        context->pixels[pixel_index * 3U + 1U] = context->background_green;
+        context->pixels[pixel_index * 3U + 2U] = context->background_blue;
     }
     return 0;
 }
@@ -4274,9 +4222,7 @@ int main(int argc, char **argv) {
     const char *program = argc > 0 ? argv[0] : "osmrender-rpack";
     const char *pack_path;
     const char *out_path;
-    char default_node_index_path[256];
-    char default_way_index_path[256];
-    char default_relation_index_path[256];
+    const char *style_path = 0;
     OsmrPackHeader pack_header;
     OsmrPackTileRecord tile_record;
     OsmrPackV2Header v2_header;
@@ -4315,9 +4261,6 @@ int main(int argc, char **argv) {
     context.boundary_enabled = 1;
     context.boundary_fade = 1;
     context.png_palette = 1;
-    default_node_index_path[0] = '\0';
-    default_way_index_path[0] = '\0';
-    default_relation_index_path[0] = '\0';
     styles_init(&context);
     while (argi < argc) {
         if (rt_strcmp(argv[argi], "--bbox") == 0) {
@@ -4354,29 +4297,13 @@ int main(int argc, char **argv) {
             }
             height_explicit = 1;
             argi += 1;
-        } else if (rt_strcmp(argv[argi], "--node-index") == 0) {
+        } else if (rt_strcmp(argv[argi], "--style") == 0) {
             argi += 1;
             if (argi >= argc) {
                 write_usage(program);
                 return 1;
             }
-            context.node_index_path = argv[argi];
-            argi += 1;
-        } else if (rt_strcmp(argv[argi], "--way-index") == 0) {
-            argi += 1;
-            if (argi >= argc) {
-                write_usage(program);
-                return 1;
-            }
-            context.way_index_path = argv[argi];
-            argi += 1;
-        } else if (rt_strcmp(argv[argi], "--relation-index") == 0) {
-            argi += 1;
-            if (argi >= argc) {
-                write_usage(program);
-                return 1;
-            }
-            context.relation_index_path = argv[argi];
+            style_path = argv[argi];
             argi += 1;
         } else if (rt_strcmp(argv[argi], "--gtfs") == 0) {
             argi += 1;
@@ -4418,23 +4345,18 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    if (style_path == 0 && path_exists("styles/osmrender-default.conf")) style_path = "styles/osmrender-default.conf";
+    if (style_path != 0 && load_style_config(style_path, &context) != 0) {
+        rt_write_cstr(2, "osmrender-rpack: could not parse style file: ");
+        rt_write_cstr(2, style_path);
+        rt_write_char(2, '\n');
+        return 1;
+    }
     if (!bbox_set && !context.city_enabled) {
         rt_write_cstr(2, "osmrender-rpack: missing --bbox or --city\n");
         return 1;
     }
     if (bbox_set && !context.city_enabled) freeze_render_viewport(&context);
-    phase_start_ns = platform_get_monotonic_time_ns();
-    if (context.city_enabled) {
-        if (context.node_index_path == 0 && infer_index_path_from_pack(pack_path, ".osmnidx", default_node_index_path, sizeof(default_node_index_path)) == 0 && path_exists(default_node_index_path)) context.node_index_path = default_node_index_path;
-        if (context.way_index_path == 0 && infer_index_path_from_pack(pack_path, ".osmwidx", default_way_index_path, sizeof(default_way_index_path)) == 0 && path_exists(default_way_index_path)) context.way_index_path = default_way_index_path;
-        if (context.relation_index_path == 0 && infer_index_path_from_pack(pack_path, ".osmridx", default_relation_index_path, sizeof(default_relation_index_path)) == 0 && path_exists(default_relation_index_path)) context.relation_index_path = default_relation_index_path;
-        if (compute_city_boundary_bbox(&context) != 0) {
-            rt_write_cstr(2, "osmrender-rpack: failed while computing city boundary bbox\n");
-            return 1;
-        }
-        if (render_bbox_is_valid(&context)) bbox_set = 1;
-    }
-    bbox_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
     error[0] = '\0';
     phase_start_ns = platform_get_monotonic_time_ns();
     v2_header_result = read_v2_header_path(pack_path, &v2_header);
@@ -4495,7 +4417,7 @@ int main(int argc, char **argv) {
         }
         collect_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
         phase_start_ns = platform_get_monotonic_time_ns();
-        if (collect_v2_place_boundary(&context, fd) != 0 || (context.boundary_feature_count == 0U && collect_city_boundary(&context) != 0)) {
+        if (collect_v2_place_boundary(&context, fd) != 0) {
             rt_free(context.features);
             rt_free(context.points);
             rt_free(context.pixels);
@@ -4594,16 +4516,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     collect_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
-    phase_start_ns = platform_get_monotonic_time_ns();
-    if (collect_city_boundary(&context) != 0) {
-        rt_free(context.features);
-        rt_free(context.points);
-        rt_free(context.pixels);
-        (void)platform_close(fd);
-        rt_write_cstr(2, "osmrender-rpack: failed while collecting city boundary\n");
-        return 1;
-    }
-    boundary_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
+    boundary_elapsed_ms = 0ULL;
     phase_start_ns = platform_get_monotonic_time_ns();
     draw_collected_layers(&context);
     if (render_gtfs_overlay(&context) != 0) {

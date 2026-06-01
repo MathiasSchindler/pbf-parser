@@ -1,6 +1,7 @@
 CC := gcc-16
 OS := linux
 ARCH := x86_64
+.DEFAULT_GOAL := all
 BUILD_DIR := build/freestanding-$(OS)-$(ARCH)
 MAKE_JOBS ?= $(shell nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
 ifeq ($(filter -j%,$(MAKEFLAGS)),)
@@ -11,6 +12,8 @@ MACOS_ARCH := aarch64
 MACOS_BUILD_DIR := build/freestanding-macos-arm64
 MACOS_SDKROOT := $(shell xcrun --sdk macosx --show-sdk-path 2>/dev/null)
 
+# The default Linux build is intentionally freestanding/nolibc: no system
+# headers, no C runtime startup files, no libc link, and no dynamic loader.
 CFLAGS := -std=c11 -Os -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fdata-sections -ffunction-sections -fno-asynchronous-unwind-tables -fno-unwind-tables -nostdinc -Isrc/shared -Isrc/shared/fontrender -Isrc/platform/linux -Isrc/platform/common -DNEWOS_DISABLE_STACK_GUARD_INIT -DFR_RASTER_DISABLE_SIMD
 LDFLAGS := -nostdlib -static -no-pie -Wl,--gc-sections
 MACOS_CFLAGS := -target arm64-apple-macos11 -std=c11 -Os -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fdata-sections -ffunction-sections -fno-asynchronous-unwind-tables -fno-unwind-tables -nostdinc -Isrc/shared -Isrc/shared/fontrender -Isrc/platform/macos -Isrc/platform/common -Isrc/arch/aarch64/macos -DNEWOS_DISABLE_STACK_GUARD_INIT -DFR_RASTER_DISABLE_SIMD
@@ -58,9 +61,9 @@ MACOS_OSMRENDER_RPACK_SRCS := \
     $(MACOS_RUNTIME_SRCS) \
     src/shared/compression/crc32.c \
     src/shared/compression/zlib.c \
-    src/shared/osm_index.c \
     src/shared/pbf.c \
     src/shared/osmrpack.c \
+    src/shared/simple_config.c \
     src/tools/osmrender_rpack.c
 
 MACOS_OSMWALKROUTE_SRCS := \
@@ -102,46 +105,6 @@ OSMLOOKUP_SRCS := \
     src/shared/pbf.c \
     src/tools/osmlookup.c
 
-OSMNODEINDEX_SRCS := \
-    $(RUNTIME_SRCS) \
-    src/platform/linux/fs.c \
-    src/shared/compression/zlib.c \
-    src/shared/osm_index.c \
-    src/shared/pbf.c \
-    src/tools/osmnodeindex.c
-
-OSMWAYINDEX_SRCS := \
-    $(RUNTIME_SRCS) \
-    src/platform/linux/fs.c \
-    src/shared/compression/zlib.c \
-    src/shared/osm_index.c \
-    src/shared/pbf.c \
-    src/tools/osmwayindex.c
-
-OSMINDEX_SRCS := \
-    $(RUNTIME_SRCS) \
-    src/platform/linux/fs.c \
-    src/shared/compression/zlib.c \
-    src/shared/osm_index.c \
-    src/shared/pbf.c \
-    src/tools/osmindex.c
-
-OSMRELINDEX_SRCS := \
-    $(RUNTIME_SRCS) \
-    src/platform/linux/fs.c \
-    src/shared/compression/zlib.c \
-    src/shared/osm_index.c \
-    src/shared/pbf.c \
-    src/tools/osmrelindex.c
-
-OSMSPINDEX_SRCS := \
-    $(RUNTIME_SRCS) \
-    src/platform/linux/fs.c \
-    src/shared/compression/zlib.c \
-    src/shared/osm_index.c \
-    src/shared/pbf.c \
-    src/tools/osmspindex.c
-
 OSMADDRESSES_SRCS := \
     $(RUNTIME_SRCS) \
     src/shared/compression/zlib.c \
@@ -155,19 +118,6 @@ OSMBUILDINGS_SRCS := \
     src/shared/osm_index.c \
     src/shared/pbf.c \
     src/tools/osmbuildings.c
-
-OSMRENDER_SRCS := \
-    $(RUNTIME_SRCS) \
-    src/platform/linux/fs.c \
-    src/platform/linux/time.c \
-    src/shared/compression/crc32.c \
-    src/shared/compression/zlib.c \
-    src/shared/runtime/unicode_utf8.c \
-    $(FONTRENDER_SRCS) \
-    src/shared/osm_index.c \
-    src/shared/pbf.c \
-    src/shared/simple_config.c \
-    src/tools/osmrender.c
 
 OSMRENDERPACKV2_SRCS := \
     $(RUNTIME_SRCS) \
@@ -191,9 +141,9 @@ OSMRENDER_RPACK_SRCS := \
     src/platform/linux/time.c \
     src/shared/compression/crc32.c \
     src/shared/compression/zlib.c \
-    src/shared/osm_index.c \
     src/shared/pbf.c \
     src/shared/osmrpack.c \
+    src/shared/simple_config.c \
     src/tools/osmrender_rpack.c
 
 OSMWALKROUTE_SRCS := \
@@ -231,9 +181,33 @@ FONTTEST_SRCS := \
     $(FONTRENDER_SRCS) \
     src/tools/fonttest.c
 
-.PHONY: all clean threadtest macos-rpack-tools macos-threadtest
+LINUX_TOOLS := \
+    $(BUILD_DIR)/pbfinfo \
+    $(BUILD_DIR)/osmlookup \
+    $(BUILD_DIR)/osmaddresses \
+    $(BUILD_DIR)/osmbuildings \
+    $(BUILD_DIR)/osmrenderpackv2 \
+    $(BUILD_DIR)/osmrpackinfo \
+    $(BUILD_DIR)/osmrender-rpack \
+    $(BUILD_DIR)/osmwalkroute \
+    $(BUILD_DIR)/osmroutepack \
+    $(BUILD_DIR)/osmrteinfo \
+    $(BUILD_DIR)/rtewalkroute \
+    $(BUILD_DIR)/threadtest \
+    $(BUILD_DIR)/fonttest
 
-all: $(BUILD_DIR)/pbfinfo $(BUILD_DIR)/osmlookup $(BUILD_DIR)/osmnodeindex $(BUILD_DIR)/osmwayindex $(BUILD_DIR)/osmindex $(BUILD_DIR)/osmrelindex $(BUILD_DIR)/osmspindex $(BUILD_DIR)/osmaddresses $(BUILD_DIR)/osmbuildings $(BUILD_DIR)/osmrender $(BUILD_DIR)/osmrenderpackv2 $(BUILD_DIR)/osmrpackinfo $(BUILD_DIR)/osmrender-rpack $(BUILD_DIR)/osmwalkroute $(BUILD_DIR)/osmroutepack $(BUILD_DIR)/osmrteinfo $(BUILD_DIR)/rtewalkroute $(BUILD_DIR)/threadtest $(BUILD_DIR)/fonttest
+.PHONY: all clean check-static threadtest macos-rpack-tools macos-threadtest
+
+all: $(LINUX_TOOLS)
+
+check-static: all
+	@set -e; \
+	for tool in $(LINUX_TOOLS); do \
+		if readelf -l "$$tool" | grep -q 'INTERP'; then echo "$$tool: has dynamic interpreter"; exit 1; fi; \
+		if readelf -d "$$tool" 2>/dev/null | grep -q 'NEEDED'; then echo "$$tool: has shared library dependency"; exit 1; fi; \
+		if nm -u "$$tool" 2>/dev/null | grep -q .; then echo "$$tool: has undefined symbols"; exit 1; fi; \
+	done; \
+	echo "all Linux tools are static freestanding ELF binaries"
 
 threadtest: $(BUILD_DIR)/threadtest
 
@@ -253,29 +227,11 @@ $(BUILD_DIR)/pbfinfo: $(PBFINFO_SRCS) | $(BUILD_DIR)
 $(BUILD_DIR)/osmlookup: $(OSMLOOKUP_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMLOOKUP_SRCS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/osmnodeindex: $(OSMNODEINDEX_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMNODEINDEX_SRCS) $(LDFLAGS) -o $@
-
-$(BUILD_DIR)/osmwayindex: $(OSMWAYINDEX_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMWAYINDEX_SRCS) $(LDFLAGS) -o $@
-
-$(BUILD_DIR)/osmindex: $(OSMINDEX_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMINDEX_SRCS) $(LDFLAGS) -o $@
-
-$(BUILD_DIR)/osmrelindex: $(OSMRELINDEX_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMRELINDEX_SRCS) $(LDFLAGS) -o $@
-
-$(BUILD_DIR)/osmspindex: $(OSMSPINDEX_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMSPINDEX_SRCS) $(LDFLAGS) -o $@
-
 $(BUILD_DIR)/osmaddresses: $(OSMADDRESSES_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMADDRESSES_SRCS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/osmbuildings: $(OSMBUILDINGS_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMBUILDINGS_SRCS) $(LDFLAGS) -o $@
-
-$(BUILD_DIR)/osmrender: $(OSMRENDER_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMRENDER_SRCS) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/osmrenderpackv2: $(OSMRENDERPACKV2_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(OSMRENDERPACKV2_SRCS) $(LDFLAGS) -o $@

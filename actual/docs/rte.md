@@ -1,5 +1,7 @@
 # RTE Route Pack Format
 
+Status: future stable-format design. This is not the `.rte` format currently written by the repository tools. The active implemented route-pack format is `OSMRTE01`, documented in `../../docs/OSMRTE01.md`, built by `../../src/tools/osmroutepack.c`, inspected by `../../src/tools/osmrteinfo.c`, and queried by `../../src/tools/rtewalkroute.c`.
+
 `RTE` is a binary, seekable, tile-oriented route format built from OpenStreetMap PBF source data and optional public-transport feeds. It is optimized for walking and public-transport route queries over large regions while avoiding source parsing at query time.
 
 The file is an application-native routing cache. The builder may spend significant time parsing source data, selecting walkable geometry, simplifying graphs, resolving addresses, building snap indexes, grouping transit schedules, and compressing payload chunks. A query engine should open the file, read compact directories and indexes, then load only the graph and schedule chunks required for a route query.
