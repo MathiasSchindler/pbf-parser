@@ -112,7 +112,7 @@ build/freestanding-macos-arm64/pbf-to-rte --tile-size-m 4000 --threads 2 \
 	data/brandenburg-260525.osm.pbf build/brandenburg-gtfs.rte
 ```
 
-This milestone writes an `OSMRTE01` file with real metric route tiles, tiled walking nodes, edge-offset arrays, directed walking edges, minimal snap-grid records, a first global address section for exact street/house lookup, and an optional embedded GTFS single-leg transit payload. Full route-pattern transfer routing and optimized address dictionaries are still future work. The target format is documented in `docs/OSMRTE01.md`.
+This milestone writes an `OSMRTE01` file with real metric route tiles, tiled walking nodes, edge-offset arrays, directed walking edges, minimal snap-grid records, a first global address section for exact street/house lookup, and an optional embedded GTFS transit payload. Optimized route-pattern indexes and address dictionaries are still future work. The target format is documented in `docs/OSMRTE01.md`.
 
 Inspect a generated route pack:
 
@@ -138,7 +138,7 @@ build/freestanding-macos-arm64/rte-route data/brandenburg.rte \
 	"Friedrich-Ebert-Straße 4, Potsdam"
 ```
 
-When the pack was built with GTFS, `rte-route` also asks for a single public-transport leg with walking access at both ends. If neither `--depart` nor `--arrive` is provided, the query uses the current time as `--depart now`:
+When the pack was built with GTFS, `rte-route` also evaluates public transport with walking access, walking transfers between nearby stops, and multiple scheduled vehicle legs. If neither `--depart` nor `--arrive` is provided, the query uses the current time as `--depart now`:
 
 ```sh
 build/freestanding-macos-arm64/rte-route build/brandenburg-gtfs.rte \
@@ -147,11 +147,11 @@ build/freestanding-macos-arm64/rte-route build/brandenburg-gtfs.rte \
 	--depart 2026-05-27T11:00
 ```
 
-The transit suggestion reports the access walk, boarding stop, vehicle mode and line, alighting stop, final walk, and total time. The first embedded planner intentionally evaluates one GTFS vehicle leg plus walking at both ends; multi-transfer routing and stop-to-walk edge snapping are next milestones.
+Pass `--transit` to print only the public-transport itinerary and skip loading or printing the full walking route. Human output keeps successful diagnostic key/value fields such as resolved address metadata and tile/graph counters behind `--verbose`; JSON output is unchanged. The transit suggestion reports the access walk, each vehicle leg with mode and line, transfer walks, the final walk, and total time. Departure-time queries use multi-leg scheduled routing; arrive-by queries keep the compact single-leg fallback until reverse transfer routing is added.
 
 For the Potsdam sample above, the current route pack resolves node and building-way addresses, loads a small tile neighborhood, and reports `route_status: found`. `rte-route` keeps the machine-readable key/value fields and also prints a human-readable walking summary with ANSI colors by default. Use `--no-color` when capturing output for scripts or logs.
 
-Use `--json` to emit newline-delimited JSON events instead of the human/key-value text output. JSON mode disables terminal color and follows the `newos.tool.v1` envelope documented in `docs/json-output.md`. Successful walking routes stream `metadata`, `address`, `tile_context`, `graph_loaded`, `route_status`, `route`, `route_point`, and `route_step` events; GTFS-enabled packs also emit a `transit_plan` event, using the current departure time unless `--depart` or `--arrive` is supplied. Each route point includes latitude/longitude and cumulative distance, while each step includes action, distance, direction where available, and start/end coordinates. Diagnostics are written as JSON events on stderr.
+Use `--json` to emit newline-delimited JSON events instead of the human/key-value text output. JSON mode disables terminal color and follows the `newos.tool.v1` envelope documented in `docs/json-output.md`. Successful walking routes stream `metadata`, `address`, `tile_context`, `graph_loaded`, `route_status`, `route`, `route_point`, and `route_step` events; GTFS-enabled packs also emit a `transit_plan` event, using the current departure time unless `--depart` or `--arrive` is supplied. With `--transit --json`, the stream skips the walking graph events and emits only endpoint metadata/address events plus `transit_plan`. Each route point includes latitude/longitude and cumulative distance, while each step includes action, distance, direction where available, and start/end coordinates. Diagnostics are written as JSON events on stderr.
 
 ```sh
 build/freestanding-macos-arm64/rte-route data/brandenburg.rte \

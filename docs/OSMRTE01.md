@@ -218,7 +218,7 @@ Version 1 required global section types:
 0x0505 stop-to-pattern index, when public transport profile is present
 ```
 
-Current implementation note: `pbf-to-rte --gtfs DIR` writes a compact first transit payload in section `0x0500`. The section is named `GTFSLEG1` and is intentionally narrower than the final route-pattern model: it supports one scheduled vehicle leg plus walking access/egress, which lets `rte-route --depart` and `--arrive` suggest bus, tram, subway, or train options without reading GTFS CSV files at query time. Future sections `0x0501..0x0505` can be added alongside it for multi-transfer routing.
+Current implementation note: `pbf-to-rte --gtfs DIR` writes a compact first transit payload in section `0x0500`. The section is named `GTFSLEG1` and stores stops, routes, services, trips, and stop-time events. `rte-route --depart` can chain multiple scheduled vehicle legs with walking access, walking transfers between nearby stops, and walking egress without reading GTFS CSV files at query time. Pass `--transit` to run only the public-transport planner and skip walking-route graph loading/output; pass `--verbose` to include successful human diagnostic fields. `--arrive` currently keeps a compact single-leg fallback. Future sections `0x0501..0x0505` can add optimized route-pattern and transfer indexes alongside it.
 
 ### GTFSLEG1 Transit Section
 

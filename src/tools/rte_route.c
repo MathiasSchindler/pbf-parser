@@ -21,6 +21,19 @@
 #define RTE_TILE_TYPE_WALKING_NODES 0x1000U
 #define RTE_TILE_TYPE_WALKING_OFFSETS 0x1001U
 #define RTE_TILE_TYPE_WALKING_EDGES 0x1002U
+#define RTE_TRANSIT_NO_INDEX 0xffffffffU
+#define RTE_TRANSIT_INF_TIME 0xffffffffU
+#define RTE_TRANSIT_ACCESS_WALK_M 5000U
+#define RTE_TRANSIT_EGRESS_WALK_M 5000U
+#define RTE_TRANSIT_TRANSFER_WALK_M 800U
+#define RTE_TRANSIT_MAX_ROUNDS 6U
+#define RTE_TRANSIT_MAX_PLAN_LEGS 16U
+#define RTE_TRANSIT_STOP_GRID_CELL_E7 50000
+#define RTE_TRANSIT_TRANSFER_CELL_RADIUS 4
+#define RTE_TRANSIT_STATE_NONE 0U
+#define RTE_TRANSIT_STATE_ORIGIN_WALK 1U
+#define RTE_TRANSIT_STATE_VEHICLE 2U
+#define RTE_TRANSIT_STATE_TRANSFER_WALK 3U
 
 typedef struct {
     unsigned long long offset;
@@ -199,6 +212,51 @@ typedef struct {
 } RteTransitStore;
 
 typedef struct {
+    int lat_cell;
+    int lon_cell;
+    unsigned int first_entry;
+    int used;
+} RteTransitStopGridSlot;
+
+typedef struct {
+    int lat_cell;
+    int lon_cell;
+    unsigned int stop_index;
+    unsigned int next_entry;
+} RteTransitStopGridEntry;
+
+typedef struct {
+    RteTransitStopGridSlot *slots;
+    RteTransitStopGridEntry *entries;
+    unsigned int slot_capacity;
+    unsigned int entry_count;
+} RteTransitStopGrid;
+
+typedef struct {
+    unsigned int kind;
+    unsigned int previous_stop_index;
+    unsigned int trip_index;
+    unsigned int route_index;
+    unsigned int mode;
+    unsigned int board_stop_index;
+    unsigned int alight_stop_index;
+    unsigned int departure_sec;
+    unsigned int arrival_sec;
+    unsigned int walk_m;
+} RteTransitStopState;
+
+typedef struct {
+    unsigned int kind;
+    unsigned int mode;
+    unsigned int route_index;
+    unsigned int board_stop_index;
+    unsigned int alight_stop_index;
+    unsigned int departure_sec;
+    unsigned int arrival_sec;
+    unsigned int walk_m;
+} RteTransitPlanLeg;
+
+typedef struct {
     int found;
     unsigned int mode;
     unsigned int route_index;
@@ -213,6 +271,9 @@ typedef struct {
     unsigned int active_trips;
     unsigned int candidate_origin_stops;
     unsigned int candidate_destination_stops;
+    unsigned int transit_leg_count;
+    unsigned int leg_count;
+    RteTransitPlanLeg legs[RTE_TRANSIT_MAX_PLAN_LEGS];
     unsigned long long events_scanned;
     unsigned long long board_candidates;
 } RteTransitPlan;
@@ -227,6 +288,8 @@ typedef struct {
     const char *map_height_arg;
     int have_depart;
     int have_arrive;
+    int transit_only;
+    int verbose;
     unsigned int depart_date;
     unsigned int depart_seconds;
     unsigned int arrive_date;
@@ -239,7 +302,7 @@ static void write_distance_human(unsigned long long meters);
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
     rt_write_cstr(2, program);
-    rt_write_cstr(2, " FILE.rte FROM_ADDRESS TO_ADDRESS [--color] [--no-color] [--json] [--depart YYYY-MM-DDTHH:MM[:SS]] [--arrive YYYY-MM-DDTHH:MM[:SS]] [--map OUT.png] [--rpack FILE.rpack] [--width N] [--height N]\n");
+    rt_write_cstr(2, " FILE.rte FROM_ADDRESS TO_ADDRESS [--transit] [--verbose] [--color] [--no-color] [--json] [--depart YYYY-MM-DDTHH:MM[:SS]] [--arrive YYYY-MM-DDTHH:MM[:SS]] [--map OUT.png] [--rpack FILE.rpack] [--width N] [--height N]\n");
 }
 
 static int parse_dimension_arg(const char *text) {
@@ -1324,83 +1387,304 @@ static unsigned int walking_seconds_for_meters(unsigned int meters) {
     return (unsigned int)(((unsigned long long)meters * 3600ULL + 4799ULL) / 4800ULL);
 }
 
+static int transit_cell_for_e7(int value) {
+    if (value >= 0) return value / RTE_TRANSIT_STOP_GRID_CELL_E7;
+    return -(((-value) + RTE_TRANSIT_STOP_GRID_CELL_E7 - 1) / RTE_TRANSIT_STOP_GRID_CELL_E7);
+}
+
+static unsigned int transit_hash_cell(int lat_cell, int lon_cell) {
+    unsigned int x = (unsigned int)lat_cell;
+    unsigned int y = (unsigned int)lon_cell;
+    unsigned int hash = x * 2654435761U;
+    hash ^= y + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+    return hash;
+}
+
+static int transit_stop_grid_build(const RteTransitStore *store, RteTransitStopGrid *grid) {
+    unsigned int capacity = 1U;
+    unsigned int index;
+
+    rt_memset(grid, 0, sizeof(*grid));
+    while (capacity < store->stop_count * 2U && capacity < 0x80000000U) capacity <<= 1U;
+    if (capacity < 16U) capacity = 16U;
+    grid->slots = (RteTransitStopGridSlot *)rt_malloc(sizeof(*grid->slots) * capacity);
+    grid->entries = (RteTransitStopGridEntry *)rt_malloc(sizeof(*grid->entries) * (size_t)store->stop_count);
+    if (grid->slots == 0 || (store->stop_count != 0U && grid->entries == 0)) return -1;
+    rt_memset(grid->slots, 0, sizeof(*grid->slots) * capacity);
+    grid->slot_capacity = capacity;
+    for (index = 0U; index < store->stop_count; ++index) {
+        int lat_cell = transit_cell_for_e7(store->stops[index].lat_e7);
+        int lon_cell = transit_cell_for_e7(store->stops[index].lon_e7);
+        unsigned int slot = transit_hash_cell(lat_cell, lon_cell) & (capacity - 1U);
+        while (grid->slots[slot].used && (grid->slots[slot].lat_cell != lat_cell || grid->slots[slot].lon_cell != lon_cell)) slot = (slot + 1U) & (capacity - 1U);
+        grid->entries[index].lat_cell = lat_cell;
+        grid->entries[index].lon_cell = lon_cell;
+        grid->entries[index].stop_index = index;
+        if (!grid->slots[slot].used) {
+            grid->slots[slot].used = 1;
+            grid->slots[slot].lat_cell = lat_cell;
+            grid->slots[slot].lon_cell = lon_cell;
+            grid->slots[slot].first_entry = RTE_TRANSIT_NO_INDEX;
+        }
+        grid->entries[index].next_entry = grid->slots[slot].first_entry;
+        grid->slots[slot].first_entry = index;
+    }
+    grid->entry_count = store->stop_count;
+    return 0;
+}
+
+static void transit_stop_grid_destroy(RteTransitStopGrid *grid) {
+    rt_free(grid->slots);
+    rt_free(grid->entries);
+    rt_memset(grid, 0, sizeof(*grid));
+}
+
+static const RteTransitStopGridSlot *transit_stop_grid_find_cell(const RteTransitStopGrid *grid, int lat_cell, int lon_cell) {
+    unsigned int slot;
+    unsigned int probes = 0U;
+    if (grid->slot_capacity == 0U) return 0;
+    slot = transit_hash_cell(lat_cell, lon_cell) & (grid->slot_capacity - 1U);
+    while (probes < grid->slot_capacity && grid->slots[slot].used) {
+        if (grid->slots[slot].lat_cell == lat_cell && grid->slots[slot].lon_cell == lon_cell) return &grid->slots[slot];
+        slot = (slot + 1U) & (grid->slot_capacity - 1U);
+        probes += 1U;
+    }
+    return 0;
+}
+
+static int transit_push_stop(unsigned int *stops, unsigned char *queued, unsigned int *count, unsigned int capacity, unsigned int stop_index) {
+    if (stop_index >= capacity) return -1;
+    if (queued[stop_index]) return 0;
+    if (*count >= capacity) return -1;
+    queued[stop_index] = 1U;
+    stops[*count] = stop_index;
+    *count += 1U;
+    return 0;
+}
+
+static int transit_apply_transfer_walks(
+    const RteTransitStore *store,
+    const RteTransitStopGrid *grid,
+    unsigned int *arrival,
+    unsigned char *rides_used,
+    RteTransitStopState *states,
+    const unsigned int *changed_stops,
+    unsigned int changed_count
+) {
+    unsigned int changed_index;
+
+    for (changed_index = 0U; changed_index < changed_count; ++changed_index) {
+        unsigned int from_stop_index = changed_stops[changed_index];
+        const RteTransitStop *from_stop;
+        int lat_cell;
+        int lon_cell;
+        int dlat;
+        if (from_stop_index >= store->stop_count || arrival[from_stop_index] == RTE_TRANSIT_INF_TIME) continue;
+        from_stop = &store->stops[from_stop_index];
+        lat_cell = transit_cell_for_e7(from_stop->lat_e7);
+        lon_cell = transit_cell_for_e7(from_stop->lon_e7);
+        for (dlat = -RTE_TRANSIT_TRANSFER_CELL_RADIUS; dlat <= RTE_TRANSIT_TRANSFER_CELL_RADIUS; ++dlat) {
+            int dlon;
+            for (dlon = -RTE_TRANSIT_TRANSFER_CELL_RADIUS; dlon <= RTE_TRANSIT_TRANSFER_CELL_RADIUS; ++dlon) {
+                const RteTransitStopGridSlot *slot = transit_stop_grid_find_cell(grid, lat_cell + dlat, lon_cell + dlon);
+                unsigned int entry_index;
+                if (slot == 0) continue;
+                entry_index = slot->first_entry;
+                while (entry_index != RTE_TRANSIT_NO_INDEX && entry_index < grid->entry_count) {
+                    unsigned int to_stop_index = grid->entries[entry_index].stop_index;
+                    const RteTransitStop *to_stop = &store->stops[to_stop_index];
+                    if (to_stop_index != from_stop_index) {
+                        unsigned int meters = direct_distance_m(from_stop->lat_e7, from_stop->lon_e7, to_stop->lat_e7, to_stop->lon_e7);
+                        if (meters <= RTE_TRANSIT_TRANSFER_WALK_M) {
+                            unsigned int walk_sec = walking_seconds_for_meters(meters);
+                            if (arrival[from_stop_index] <= RTE_TRANSIT_INF_TIME - walk_sec && arrival[from_stop_index] + walk_sec < arrival[to_stop_index]) {
+                                arrival[to_stop_index] = arrival[from_stop_index] + walk_sec;
+                                rides_used[to_stop_index] = rides_used[from_stop_index];
+                                states[to_stop_index].kind = RTE_TRANSIT_STATE_TRANSFER_WALK;
+                                states[to_stop_index].previous_stop_index = from_stop_index;
+                                states[to_stop_index].trip_index = RTE_TRANSIT_NO_INDEX;
+                                states[to_stop_index].route_index = RTE_TRANSIT_NO_INDEX;
+                                states[to_stop_index].mode = 0U;
+                                states[to_stop_index].board_stop_index = from_stop_index;
+                                states[to_stop_index].alight_stop_index = to_stop_index;
+                                states[to_stop_index].departure_sec = arrival[from_stop_index];
+                                states[to_stop_index].arrival_sec = arrival[to_stop_index];
+                                states[to_stop_index].walk_m = meters;
+                            }
+                        }
+                    }
+                    entry_index = grid->entries[entry_index].next_entry;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static void transit_reverse_plan_legs(RteTransitPlan *plan, const RteTransitPlanLeg *reverse_legs, unsigned int reverse_count) {
+    unsigned int index;
+    plan->leg_count = reverse_count;
+    plan->transit_leg_count = 0U;
+    for (index = 0U; index < reverse_count; ++index) {
+        const RteTransitPlanLeg *leg = &reverse_legs[reverse_count - 1U - index];
+        plan->legs[index] = *leg;
+        if (leg->kind == RTE_TRANSIT_STATE_VEHICLE) {
+            if (plan->transit_leg_count == 0U) {
+                plan->mode = leg->mode;
+                plan->route_index = leg->route_index;
+                plan->board_stop_index = leg->board_stop_index;
+                plan->alight_stop_index = leg->alight_stop_index;
+                plan->board_departure_sec = leg->departure_sec;
+                plan->alight_arrival_sec = leg->arrival_sec;
+            }
+            plan->transit_leg_count += 1U;
+        }
+    }
+}
+
+static int transit_build_plan_from_arrivals(
+    const RteTransitStore *store,
+    const RteResolvedAddress *from,
+    const RteResolvedAddress *to,
+    const RteOutput *output,
+    const unsigned int *arrival,
+    const unsigned char *rides_used,
+    const RteTransitStopState *states,
+    RteTransitPlan *plan
+) {
+    unsigned int stop_index;
+    unsigned int best_stop_index = RTE_TRANSIT_NO_INDEX;
+    unsigned int best_arrival = RTE_TRANSIT_INF_TIME;
+    unsigned int best_egress_m = 0U;
+
+    for (stop_index = 0U; stop_index < store->stop_count; ++stop_index) {
+        unsigned int walk_m = direct_distance_m(to->record.lat_e7, to->record.lon_e7, store->stops[stop_index].lat_e7, store->stops[stop_index].lon_e7);
+        if (walk_m <= RTE_TRANSIT_EGRESS_WALK_M) plan->candidate_destination_stops += 1U;
+        if (rides_used[stop_index] == 0U || arrival[stop_index] == RTE_TRANSIT_INF_TIME || walk_m > RTE_TRANSIT_EGRESS_WALK_M) continue;
+        {
+            unsigned int walk_sec = walking_seconds_for_meters(walk_m);
+            if (arrival[stop_index] <= RTE_TRANSIT_INF_TIME - walk_sec && arrival[stop_index] + walk_sec < best_arrival) {
+                best_stop_index = stop_index;
+                best_arrival = arrival[stop_index] + walk_sec;
+                best_egress_m = walk_m;
+            }
+        }
+    }
+    if (best_stop_index == RTE_TRANSIT_NO_INDEX) return 0;
+
+    {
+        RteTransitPlanLeg reverse_legs[RTE_TRANSIT_MAX_PLAN_LEGS];
+        unsigned int reverse_count = 0U;
+        unsigned int current_stop = best_stop_index;
+        unsigned int guard = 0U;
+        unsigned int access_stop_index = best_stop_index;
+        while (current_stop != RTE_TRANSIT_NO_INDEX && current_stop < store->stop_count && guard < store->stop_count) {
+            const RteTransitStopState *state = &states[current_stop];
+            guard += 1U;
+            if (state->kind == RTE_TRANSIT_STATE_VEHICLE) {
+                if (reverse_count >= RTE_TRANSIT_MAX_PLAN_LEGS) return 0;
+                reverse_legs[reverse_count].kind = RTE_TRANSIT_STATE_VEHICLE;
+                reverse_legs[reverse_count].mode = state->mode;
+                reverse_legs[reverse_count].route_index = state->route_index;
+                reverse_legs[reverse_count].board_stop_index = state->board_stop_index;
+                reverse_legs[reverse_count].alight_stop_index = state->alight_stop_index;
+                reverse_legs[reverse_count].departure_sec = state->departure_sec;
+                reverse_legs[reverse_count].arrival_sec = state->arrival_sec;
+                reverse_legs[reverse_count].walk_m = 0U;
+                reverse_count += 1U;
+                access_stop_index = state->board_stop_index;
+                current_stop = state->previous_stop_index;
+            } else if (state->kind == RTE_TRANSIT_STATE_TRANSFER_WALK) {
+                if (reverse_count >= RTE_TRANSIT_MAX_PLAN_LEGS) return 0;
+                reverse_legs[reverse_count].kind = RTE_TRANSIT_STATE_TRANSFER_WALK;
+                reverse_legs[reverse_count].mode = 0U;
+                reverse_legs[reverse_count].route_index = RTE_TRANSIT_NO_INDEX;
+                reverse_legs[reverse_count].board_stop_index = state->board_stop_index;
+                reverse_legs[reverse_count].alight_stop_index = state->alight_stop_index;
+                reverse_legs[reverse_count].departure_sec = state->departure_sec;
+                reverse_legs[reverse_count].arrival_sec = state->arrival_sec;
+                reverse_legs[reverse_count].walk_m = state->walk_m;
+                reverse_count += 1U;
+                access_stop_index = state->previous_stop_index;
+                current_stop = state->previous_stop_index;
+            } else if (state->kind == RTE_TRANSIT_STATE_ORIGIN_WALK) {
+                access_stop_index = current_stop;
+                break;
+            } else {
+                return 0;
+            }
+        }
+        if (reverse_count == 0U || access_stop_index >= store->stop_count) return 0;
+        plan->found = 1;
+        plan->origin_departure_sec = output->depart_seconds;
+        plan->total_sec = best_arrival - output->depart_seconds;
+        plan->walk_to_stop_m = direct_distance_m(from->record.lat_e7, from->record.lon_e7, store->stops[access_stop_index].lat_e7, store->stops[access_stop_index].lon_e7);
+        plan->walk_from_stop_m = best_egress_m;
+        transit_reverse_plan_legs(plan, reverse_legs, reverse_count);
+    }
+    return 0;
+}
+
 static int evaluate_transit_plan(const RteTransitStore *store, const RteResolvedAddress *from, const RteResolvedAddress *to, const RteOutput *output, RteTransitPlan *plan) {
-    unsigned int event_index;
-    unsigned int current_trip = 0xffffffffU;
-    int trip_active = 0;
-    int board_found = 0;
-    unsigned int board_departure = 0U;
-    unsigned int board_sequence = 0U;
-    unsigned int board_stop_index = 0U;
+    unsigned int *arrival;
+    unsigned int *base_arrival;
+    unsigned int *changed_stops;
+    unsigned char *rides_used;
+    unsigned char *base_rides_used;
+    unsigned char *changed_queued;
+    unsigned char *trip_active;
+    RteTransitStopState *states;
+    RteTransitStopGrid grid;
+    unsigned int index;
+    unsigned int round;
+    unsigned int active_trip_count = 0U;
 
     rt_memset(plan, 0, sizeof(*plan));
+    rt_memset(&grid, 0, sizeof(grid));
     if ((!output->have_depart && !output->have_arrive) || store->stop_count == 0U || store->event_count == 0U) return 0;
-    for (event_index = 0U; event_index < store->event_count; ++event_index) {
-        const RteTransitEvent *event = &store->events[event_index];
-        const RteTransitTrip *trip;
-        const RteTransitStop *stop;
-        unsigned int walk_from_m;
-        unsigned int walk_to_m;
-        unsigned int walk_from_sec;
-        unsigned int walk_to_sec;
-        plan->events_scanned += 1ULL;
-        if (event->trip_index >= store->trip_count || event->stop_index >= store->stop_count) continue;
-        if (event->trip_index != current_trip) {
-            current_trip = event->trip_index;
-            trip = &store->trips[current_trip];
-            trip_active = transit_service_active(store, trip->service_index, output->have_depart ? output->depart_date : output->arrive_date);
-            if (trip_active) plan->active_trips += 1U;
-            board_found = 0;
-            board_departure = 0U;
-            board_sequence = 0U;
-            board_stop_index = 0U;
-        }
-        if (!trip_active) continue;
-        stop = &store->stops[event->stop_index];
-        walk_from_m = direct_distance_m(from->record.lat_e7, from->record.lon_e7, stop->lat_e7, stop->lon_e7);
-        walk_to_m = direct_distance_m(to->record.lat_e7, to->record.lon_e7, stop->lat_e7, stop->lon_e7);
-        walk_from_sec = walking_seconds_for_meters(walk_from_m);
-        walk_to_sec = walking_seconds_for_meters(walk_to_m);
-        if (walk_from_m <= 5000U) plan->candidate_origin_stops += 1U;
-        if (walk_to_m <= 5000U) plan->candidate_destination_stops += 1U;
-        if (output->have_depart) {
-            unsigned int earliest_board = output->depart_seconds + walk_from_sec;
-            if (walk_from_m <= 5000U && event->departure_sec >= earliest_board) {
-                plan->board_candidates += 1ULL;
-                if (!board_found || event->departure_sec < board_departure) {
-                    board_found = 1;
-                    board_departure = event->departure_sec;
-                    board_sequence = event->sequence;
-                    board_stop_index = event->stop_index;
-                }
+    if (output->have_arrive) {
+        unsigned int event_index;
+        unsigned int current_trip = RTE_TRANSIT_NO_INDEX;
+        int trip_active = 0;
+        int board_found = 0;
+        unsigned int board_departure = 0U;
+        unsigned int board_sequence = 0U;
+        unsigned int board_stop_index = 0U;
+
+        for (event_index = 0U; event_index < store->event_count; ++event_index) {
+            const RteTransitEvent *event = &store->events[event_index];
+            const RteTransitTrip *trip;
+            const RteTransitStop *stop;
+            unsigned int walk_from_m;
+            unsigned int walk_to_m;
+            plan->events_scanned += 1ULL;
+            if (event->trip_index >= store->trip_count || event->stop_index >= store->stop_count) continue;
+            if (event->trip_index != current_trip) {
+                current_trip = event->trip_index;
+                trip = &store->trips[current_trip];
+                trip_active = transit_service_active(store, trip->service_index, output->arrive_date);
+                if (trip_active) plan->active_trips += 1U;
+                board_found = 0;
+                board_departure = 0U;
+                board_sequence = 0U;
+                board_stop_index = 0U;
             }
-            if (board_found && walk_to_m <= 5000U && event->sequence > board_sequence && event->arrival_sec >= board_departure) {
-                unsigned int total_arrival = event->arrival_sec + walk_to_sec;
-                if (!plan->found || total_arrival < output->depart_seconds + plan->total_sec) {
-                    trip = &store->trips[current_trip];
-                    plan->found = 1;
-                    plan->mode = trip->mode;
-                    plan->route_index = trip->route_index;
-                    plan->board_stop_index = board_stop_index;
-                    plan->alight_stop_index = event->stop_index;
-                    plan->board_departure_sec = board_departure;
-                    plan->alight_arrival_sec = event->arrival_sec;
-                    plan->walk_to_stop_m = direct_distance_m(from->record.lat_e7, from->record.lon_e7, store->stops[board_stop_index].lat_e7, store->stops[board_stop_index].lon_e7);
-                    plan->walk_from_stop_m = walk_to_m;
-                    plan->origin_departure_sec = output->depart_seconds;
-                    plan->total_sec = total_arrival - output->depart_seconds;
-                }
-            }
-        } else if (output->have_arrive) {
-            if (walk_from_m <= 5000U && event->departure_sec >= walk_from_sec) {
+            if (!trip_active) continue;
+            stop = &store->stops[event->stop_index];
+            walk_from_m = direct_distance_m(from->record.lat_e7, from->record.lon_e7, stop->lat_e7, stop->lon_e7);
+            walk_to_m = direct_distance_m(to->record.lat_e7, to->record.lon_e7, stop->lat_e7, stop->lon_e7);
+            if (walk_from_m <= RTE_TRANSIT_ACCESS_WALK_M) plan->candidate_origin_stops += 1U;
+            if (walk_to_m <= RTE_TRANSIT_EGRESS_WALK_M) plan->candidate_destination_stops += 1U;
+            if (walk_from_m <= RTE_TRANSIT_ACCESS_WALK_M && event->departure_sec >= walking_seconds_for_meters(walk_from_m)) {
                 board_found = 1;
                 board_departure = event->departure_sec;
                 board_sequence = event->sequence;
                 board_stop_index = event->stop_index;
                 plan->board_candidates += 1ULL;
             }
-            if (board_found && walk_to_m <= 5000U && event->sequence > board_sequence && event->arrival_sec >= board_departure && event->arrival_sec + walk_to_sec <= output->arrive_seconds) {
-                unsigned int origin_departure = board_departure - walking_seconds_for_meters(direct_distance_m(from->record.lat_e7, from->record.lon_e7, store->stops[board_stop_index].lat_e7, store->stops[board_stop_index].lon_e7));
+            if (board_found && walk_to_m <= RTE_TRANSIT_EGRESS_WALK_M && event->sequence > board_sequence && event->arrival_sec >= board_departure && event->arrival_sec + walking_seconds_for_meters(walk_to_m) <= output->arrive_seconds) {
+                unsigned int origin_walk_m = direct_distance_m(from->record.lat_e7, from->record.lon_e7, store->stops[board_stop_index].lat_e7, store->stops[board_stop_index].lon_e7);
+                unsigned int origin_departure = board_departure - walking_seconds_for_meters(origin_walk_m);
                 if (!plan->found || origin_departure > plan->origin_departure_sec) {
                     trip = &store->trips[current_trip];
                     plan->found = 1;
@@ -1410,14 +1694,138 @@ static int evaluate_transit_plan(const RteTransitStore *store, const RteResolved
                     plan->alight_stop_index = event->stop_index;
                     plan->board_departure_sec = board_departure;
                     plan->alight_arrival_sec = event->arrival_sec;
-                    plan->walk_to_stop_m = direct_distance_m(from->record.lat_e7, from->record.lon_e7, store->stops[board_stop_index].lat_e7, store->stops[board_stop_index].lon_e7);
+                    plan->walk_to_stop_m = origin_walk_m;
                     plan->walk_from_stop_m = walk_to_m;
                     plan->origin_departure_sec = origin_departure;
                     plan->total_sec = output->arrive_seconds - origin_departure;
+                    plan->transit_leg_count = 1U;
+                    plan->leg_count = 1U;
+                    plan->legs[0].kind = RTE_TRANSIT_STATE_VEHICLE;
+                    plan->legs[0].mode = trip->mode;
+                    plan->legs[0].route_index = trip->route_index;
+                    plan->legs[0].board_stop_index = board_stop_index;
+                    plan->legs[0].alight_stop_index = event->stop_index;
+                    plan->legs[0].departure_sec = board_departure;
+                    plan->legs[0].arrival_sec = event->arrival_sec;
+                    plan->legs[0].walk_m = 0U;
                 }
             }
         }
+        return 0;
     }
+
+    arrival = (unsigned int *)rt_malloc(sizeof(*arrival) * (size_t)store->stop_count);
+    base_arrival = (unsigned int *)rt_malloc(sizeof(*base_arrival) * (size_t)store->stop_count);
+    changed_stops = (unsigned int *)rt_malloc(sizeof(*changed_stops) * (size_t)store->stop_count);
+    rides_used = (unsigned char *)rt_malloc(sizeof(*rides_used) * (size_t)store->stop_count);
+    base_rides_used = (unsigned char *)rt_malloc(sizeof(*base_rides_used) * (size_t)store->stop_count);
+    changed_queued = (unsigned char *)rt_malloc(sizeof(*changed_queued) * (size_t)store->stop_count);
+    trip_active = (unsigned char *)rt_malloc(sizeof(*trip_active) * (size_t)store->trip_count);
+    states = (RteTransitStopState *)rt_malloc(sizeof(*states) * (size_t)store->stop_count);
+    if (arrival == 0 || base_arrival == 0 || changed_stops == 0 || rides_used == 0 || base_rides_used == 0 || changed_queued == 0 || trip_active == 0 || states == 0 || transit_stop_grid_build(store, &grid) != 0) {
+        rt_free(arrival); rt_free(base_arrival); rt_free(changed_stops); rt_free(rides_used); rt_free(base_rides_used); rt_free(changed_queued); rt_free(trip_active); rt_free(states); transit_stop_grid_destroy(&grid);
+        return -1;
+    }
+
+    for (index = 0U; index < store->stop_count; ++index) {
+        unsigned int walk_m = direct_distance_m(from->record.lat_e7, from->record.lon_e7, store->stops[index].lat_e7, store->stops[index].lon_e7);
+        arrival[index] = RTE_TRANSIT_INF_TIME;
+        rides_used[index] = 0U;
+        changed_queued[index] = 0U;
+        rt_memset(&states[index], 0, sizeof(states[index]));
+        states[index].previous_stop_index = RTE_TRANSIT_NO_INDEX;
+        states[index].trip_index = RTE_TRANSIT_NO_INDEX;
+        states[index].route_index = RTE_TRANSIT_NO_INDEX;
+        if (walk_m <= RTE_TRANSIT_ACCESS_WALK_M) {
+            unsigned int walk_sec = walking_seconds_for_meters(walk_m);
+            if (output->depart_seconds <= RTE_TRANSIT_INF_TIME - walk_sec) {
+                arrival[index] = output->depart_seconds + walk_sec;
+                states[index].kind = RTE_TRANSIT_STATE_ORIGIN_WALK;
+                states[index].previous_stop_index = RTE_TRANSIT_NO_INDEX;
+                states[index].board_stop_index = index;
+                states[index].alight_stop_index = index;
+                states[index].departure_sec = output->depart_seconds;
+                states[index].arrival_sec = arrival[index];
+                states[index].walk_m = walk_m;
+                plan->candidate_origin_stops += 1U;
+            }
+        }
+    }
+    for (index = 0U; index < store->trip_count; ++index) {
+        trip_active[index] = transit_service_active(store, store->trips[index].service_index, output->depart_date) ? 1U : 0U;
+        if (trip_active[index]) active_trip_count += 1U;
+    }
+    plan->active_trips = active_trip_count;
+
+    for (round = 0U; round < RTE_TRANSIT_MAX_ROUNDS; ++round) {
+        unsigned int event_index;
+        unsigned int changed_count = 0U;
+        unsigned int current_trip = RTE_TRANSIT_NO_INDEX;
+        unsigned int board_stop_index = RTE_TRANSIT_NO_INDEX;
+        unsigned int board_departure = 0U;
+        unsigned int board_sequence = 0U;
+        unsigned char board_rides = 0U;
+        int current_trip_active = 0;
+
+        memcpy(base_arrival, arrival, sizeof(*arrival) * (size_t)store->stop_count);
+        memcpy(base_rides_used, rides_used, sizeof(*rides_used) * (size_t)store->stop_count);
+
+        for (event_index = 0U; event_index < store->event_count; ++event_index) {
+            const RteTransitEvent *event = &store->events[event_index];
+            const RteTransitTrip *trip;
+            plan->events_scanned += 1ULL;
+            if (event->trip_index >= store->trip_count || event->stop_index >= store->stop_count) continue;
+            if (event->trip_index != current_trip) {
+                current_trip = event->trip_index;
+                board_stop_index = RTE_TRANSIT_NO_INDEX;
+                board_departure = 0U;
+                board_sequence = 0U;
+                board_rides = 0U;
+                current_trip_active = trip_active[current_trip] != 0U;
+            }
+            if (!current_trip_active) continue;
+            trip = &store->trips[current_trip];
+            if (board_stop_index != RTE_TRANSIT_NO_INDEX && event->sequence > board_sequence && event->arrival_sec >= board_departure && event->arrival_sec < arrival[event->stop_index]) {
+                arrival[event->stop_index] = event->arrival_sec;
+                rides_used[event->stop_index] = board_rides;
+                states[event->stop_index].kind = RTE_TRANSIT_STATE_VEHICLE;
+                states[event->stop_index].previous_stop_index = board_stop_index;
+                states[event->stop_index].trip_index = current_trip;
+                states[event->stop_index].route_index = trip->route_index;
+                states[event->stop_index].mode = trip->mode;
+                states[event->stop_index].board_stop_index = board_stop_index;
+                states[event->stop_index].alight_stop_index = event->stop_index;
+                states[event->stop_index].departure_sec = board_departure;
+                states[event->stop_index].arrival_sec = event->arrival_sec;
+                states[event->stop_index].walk_m = 0U;
+                if (transit_push_stop(changed_stops, changed_queued, &changed_count, store->stop_count, event->stop_index) != 0) break;
+            }
+            if (base_arrival[event->stop_index] != RTE_TRANSIT_INF_TIME && base_arrival[event->stop_index] <= event->departure_sec && base_rides_used[event->stop_index] < RTE_TRANSIT_MAX_ROUNDS) {
+                unsigned char candidate_rides = (unsigned char)(base_rides_used[event->stop_index] + 1U);
+                if (candidate_rides == round + 1U && (board_stop_index == RTE_TRANSIT_NO_INDEX || event->sequence < board_sequence)) {
+                    board_stop_index = event->stop_index;
+                    board_departure = event->departure_sec;
+                    board_sequence = event->sequence;
+                    board_rides = candidate_rides;
+                    plan->board_candidates += 1ULL;
+                }
+            }
+        }
+        if (changed_count == 0U) break;
+        (void)transit_apply_transfer_walks(store, &grid, arrival, rides_used, states, changed_stops, changed_count);
+        for (index = 0U; index < changed_count; ++index) changed_queued[changed_stops[index]] = 0U;
+    }
+
+    (void)transit_build_plan_from_arrivals(store, from, to, output, arrival, rides_used, states, plan);
+    rt_free(arrival);
+    rt_free(base_arrival);
+    rt_free(changed_stops);
+    rt_free(rides_used);
+    rt_free(base_rides_used);
+    rt_free(changed_queued);
+    rt_free(trip_active);
+    rt_free(states);
+    transit_stop_grid_destroy(&grid);
     return 0;
 }
 
@@ -1868,40 +2276,61 @@ static int write_human_route(
 }
 
 static void write_transit_plan_text(const RteOutput *output, const RteTransitStore *store, const RteTransitPlan *plan, unsigned long long walking_total_m) {
-    const RteTransitStop *board_stop;
-    const RteTransitStop *alight_stop;
-    const RteTransitRoute *route;
     unsigned long long walking_sec = walking_seconds_for_meters((unsigned int)walking_total_m);
+    unsigned int leg_index;
+    unsigned int step = 1U;
     if (!plan->found || plan->board_stop_index >= store->stop_count || plan->alight_stop_index >= store->stop_count || plan->route_index >= store->route_count) return;
-    board_stop = &store->stops[plan->board_stop_index];
-    alight_stop = &store->stops[plan->alight_stop_index];
-    route = &store->routes[plan->route_index];
-    rt_write_char(1, '\n');
+    if (!output->transit_only || output->verbose) rt_write_char(1, '\n');
     write_colored_cstr(output, "\033[1;35m", "Transit option");
     rt_write_char(1, '\n');
-    rt_write_cstr(1, "Walk ");
+    rt_write_uint(1, step++);
+    rt_write_cstr(1, ". Walk ");
     write_distance_human(plan->walk_to_stop_m);
     rt_write_cstr(1, " to ");
     write_color(output, "\033[1;36m");
-    write_transit_string(store, board_stop->name_offset, board_stop->name_size);
+    write_transit_string(store, store->stops[plan->board_stop_index].name_offset, store->stops[plan->board_stop_index].name_size);
     write_color_reset(output);
-    rt_write_cstr(1, ", take the ");
-    write_colored_cstr(output, "\033[1;33m", transit_mode_name(plan->mode));
-    rt_write_char(1, ' ');
-    write_color(output, "\033[1;33m");
-    write_transit_string(store, route->short_name_offset, route->short_name_size);
-    write_color_reset(output);
-    rt_write_cstr(1, " at ");
-    write_hhmm(plan->board_departure_sec);
-    rt_write_cstr(1, ", get off at ");
-    write_color(output, "\033[1;36m");
-    write_transit_string(store, alight_stop->name_offset, alight_stop->name_size);
-    write_color_reset(output);
-    rt_write_cstr(1, " at ");
-    write_hhmm(plan->alight_arrival_sec);
-    rt_write_cstr(1, ", then walk ");
+    rt_write_cstr(1, ".\n");
+    for (leg_index = 0U; leg_index < plan->leg_count; ++leg_index) {
+        const RteTransitPlanLeg *leg = &plan->legs[leg_index];
+        if (leg->kind == RTE_TRANSIT_STATE_VEHICLE && leg->board_stop_index < store->stop_count && leg->alight_stop_index < store->stop_count && leg->route_index < store->route_count) {
+            const RteTransitRoute *route = &store->routes[leg->route_index];
+            rt_write_uint(1, step++);
+            rt_write_cstr(1, ". Take the ");
+            write_colored_cstr(output, "\033[1;33m", transit_mode_name(leg->mode));
+            rt_write_char(1, ' ');
+            write_color(output, "\033[1;33m");
+            write_transit_string(store, route->short_name_offset, route->short_name_size);
+            write_color_reset(output);
+            rt_write_cstr(1, " from ");
+            write_color(output, "\033[1;36m");
+            write_transit_string(store, store->stops[leg->board_stop_index].name_offset, store->stops[leg->board_stop_index].name_size);
+            write_color_reset(output);
+            rt_write_cstr(1, " at ");
+            write_hhmm(leg->departure_sec);
+            rt_write_cstr(1, " to ");
+            write_color(output, "\033[1;36m");
+            write_transit_string(store, store->stops[leg->alight_stop_index].name_offset, store->stops[leg->alight_stop_index].name_size);
+            write_color_reset(output);
+            rt_write_cstr(1, ", arriving ");
+            write_hhmm(leg->arrival_sec);
+            rt_write_cstr(1, ".\n");
+        } else if (leg->kind == RTE_TRANSIT_STATE_TRANSFER_WALK && leg->alight_stop_index < store->stop_count) {
+            rt_write_uint(1, step++);
+            rt_write_cstr(1, ". Walk ");
+            write_distance_human(leg->walk_m);
+            rt_write_cstr(1, " to ");
+            write_color(output, "\033[1;36m");
+            write_transit_string(store, store->stops[leg->alight_stop_index].name_offset, store->stops[leg->alight_stop_index].name_size);
+            write_color_reset(output);
+            rt_write_cstr(1, ".\n");
+        }
+    }
+    rt_write_uint(1, step++);
+    rt_write_cstr(1, ". Walk ");
     write_distance_human(plan->walk_from_stop_m);
-    rt_write_cstr(1, " to the destination. Total: about ");
+    rt_write_cstr(1, " to the destination.\n");
+    rt_write_cstr(1, "Total: about ");
     write_colored_uint(output, "\033[1;33m", (plan->total_sec + 59U) / 60U);
     rt_write_cstr(1, " min.");
     if (walking_sec > plan->total_sec + 60U) {
@@ -1916,6 +2345,7 @@ static void json_write_transit_plan_event(RteOutput *output, const RteTransitSto
     const RteTransitStop *board_stop;
     const RteTransitStop *alight_stop;
     const RteTransitRoute *route;
+    unsigned int leg_index;
     json_event_begin(output, 1, "transit_plan");
     if (!plan->found || plan->board_stop_index >= store->stop_count || plan->alight_stop_index >= store->stop_count || plan->route_index >= store->route_count) {
         rt_write_cstr(1, ",\"data\":{\"status\":\"unavailable\",\"active_trips\":");
@@ -1943,10 +2373,44 @@ static void json_write_transit_plan_event(RteOutput *output, const RteTransitSto
     rt_write_cstr(1, ",\"walk_to_stop_m\":"); rt_write_uint(1, plan->walk_to_stop_m);
     rt_write_cstr(1, ",\"walk_from_stop_m\":"); rt_write_uint(1, plan->walk_from_stop_m);
     rt_write_cstr(1, ",\"total_sec\":"); rt_write_uint(1, plan->total_sec);
+    rt_write_cstr(1, ",\"transit_leg_count\":"); rt_write_uint(1, plan->transit_leg_count);
     rt_write_cstr(1, ",\"active_trips\":"); rt_write_uint(1, plan->active_trips);
     rt_write_cstr(1, ",\"events_scanned\":"); rt_write_uint(1, plan->events_scanned);
     json_write_coord_pair(1, "board", board_stop->lat_e7, board_stop->lon_e7);
     json_write_coord_pair(1, "alight", alight_stop->lat_e7, alight_stop->lon_e7);
+    rt_write_cstr(1, ",\"legs\":[");
+    for (leg_index = 0U; leg_index < plan->leg_count; ++leg_index) {
+        const RteTransitPlanLeg *leg = &plan->legs[leg_index];
+        if (leg_index != 0U) rt_write_char(1, ',');
+        if (leg->kind == RTE_TRANSIT_STATE_VEHICLE && leg->board_stop_index < store->stop_count && leg->alight_stop_index < store->stop_count && leg->route_index < store->route_count) {
+            const RteTransitRoute *leg_route = &store->routes[leg->route_index];
+            rt_write_cstr(1, "{\"kind\":\"ride\",\"mode\":");
+            json_write_cstr_escaped(1, transit_mode_name(leg->mode));
+            rt_write_cstr(1, ",\"route_short_name\":");
+            json_write_transit_string_or_null(1, store, leg_route->short_name_offset, leg_route->short_name_size);
+            rt_write_cstr(1, ",\"route_long_name\":");
+            json_write_transit_string_or_null(1, store, leg_route->long_name_offset, leg_route->long_name_size);
+            rt_write_cstr(1, ",\"board_stop\":");
+            json_write_transit_string_or_null(1, store, store->stops[leg->board_stop_index].name_offset, store->stops[leg->board_stop_index].name_size);
+            rt_write_cstr(1, ",\"alight_stop\":");
+            json_write_transit_string_or_null(1, store, store->stops[leg->alight_stop_index].name_offset, store->stops[leg->alight_stop_index].name_size);
+            rt_write_cstr(1, ",\"departure_sec\":"); rt_write_uint(1, leg->departure_sec);
+            rt_write_cstr(1, ",\"arrival_sec\":"); rt_write_uint(1, leg->arrival_sec);
+            rt_write_char(1, '}');
+        } else if (leg->kind == RTE_TRANSIT_STATE_TRANSFER_WALK && leg->board_stop_index < store->stop_count && leg->alight_stop_index < store->stop_count) {
+            rt_write_cstr(1, "{\"kind\":\"transfer_walk\",\"from_stop\":");
+            json_write_transit_string_or_null(1, store, store->stops[leg->board_stop_index].name_offset, store->stops[leg->board_stop_index].name_size);
+            rt_write_cstr(1, ",\"to_stop\":");
+            json_write_transit_string_or_null(1, store, store->stops[leg->alight_stop_index].name_offset, store->stops[leg->alight_stop_index].name_size);
+            rt_write_cstr(1, ",\"walk_m\":"); rt_write_uint(1, leg->walk_m);
+            rt_write_cstr(1, ",\"departure_sec\":"); rt_write_uint(1, leg->departure_sec);
+            rt_write_cstr(1, ",\"arrival_sec\":"); rt_write_uint(1, leg->arrival_sec);
+            rt_write_char(1, '}');
+        } else {
+            rt_write_cstr(1, "{\"kind\":\"unknown\"}");
+        }
+    }
+    rt_write_char(1, ']');
     rt_write_cstr(1, "}}\n");
 }
 
@@ -2332,6 +2796,8 @@ int main(int argc, char **argv) {
         if (rt_strcmp(argv[argi], "--no-color") == 0) output.use_color = 0;
         else if (rt_strcmp(argv[argi], "--color") == 0) output.use_color = 1;
         else if (rt_strcmp(argv[argi], "--json") == 0) output.json = 1;
+        else if (rt_strcmp(argv[argi], "--transit") == 0) output.transit_only = 1;
+        else if (rt_strcmp(argv[argi], "--verbose") == 0) output.verbose = 1;
         else if (rt_strcmp(argv[argi], "--depart") == 0) {
             argi += 1;
             if (argi >= argc || parse_datetime_arg(argv[argi], &output.depart_date, &output.depart_seconds) != 0) { if (output.json) json_diagnostic(&output, "error", "invalid or missing --depart value", 0); else write_usage(program); return 1; }
@@ -2397,13 +2863,47 @@ int main(int argc, char **argv) {
         json_write_metadata_event(&output, from_query, to_query);
         json_write_address_event(&output, "from", from_query, &from, strings, strings_size);
         json_write_address_event(&output, "to", to_query, &to, strings, strings_size);
-    } else {
+    } else if (output.verbose) {
         rt_write_cstr(1, "format: OSMRTE01\n");
-        rt_write_cstr(1, "profile: walking\n");
+        rt_write_cstr(1, output.transit_only ? "profile: transit\n" : "profile: walking\n");
         rt_write_cstr(1, "from_query: "); rt_write_cstr(1, from_query); rt_write_char(1, '\n');
         write_address_summary("from", &from, strings, strings_size);
         rt_write_cstr(1, "to_query: "); rt_write_cstr(1, to_query); rt_write_char(1, '\n');
         write_address_summary("to", &to, strings, strings_size);
+    }
+
+    if (output.transit_only) {
+        if (!from.found || !to.found) {
+            if (output.json) json_write_route_status_event(&output, "unavailable", "address_not_found");
+            else rt_write_cstr(1, "transit_status: unavailable\ntransit_status_reason: address_not_found\n");
+        } else if ((from.record.flags & 1U) == 0U || (to.record.flags & 1U) == 0U) {
+            if (output.json) json_write_route_status_event(&output, "unavailable", "address record has no coordinate yet; way/relation address centroids are not embedded in this route pack");
+            else rt_write_cstr(1, "transit_status: unavailable\ntransit_status_reason: address record has no coordinate yet\n");
+        } else if (transit_store.event_count != 0U) {
+            RteTransitPlan transit_plan;
+            (void)evaluate_transit_plan(&transit_store, &from, &to, &output, &transit_plan);
+            if (output.json) json_write_transit_plan_event(&output, &transit_store, &transit_plan);
+            else if (transit_plan.found) write_transit_plan_text(&output, &transit_store, &transit_plan, 0ULL);
+            else rt_write_cstr(1, "transit_status: unavailable\ntransit_status_reason: no GTFS transit option found for this time\n");
+        } else {
+            if (output.json) {
+                RteTransitPlan empty_plan;
+                rt_memset(&empty_plan, 0, sizeof(empty_plan));
+                json_write_transit_plan_event(&output, &transit_store, &empty_plan);
+            } else {
+                rt_write_cstr(1, "transit_status: unavailable\ntransit_status_reason: no GTFS data in route pack\n");
+            }
+        }
+        rt_free(transit_store.stops);
+        rt_free(transit_store.routes);
+        rt_free(transit_store.services);
+        rt_free(transit_store.exceptions);
+        rt_free(transit_store.trips);
+        rt_free(transit_store.events);
+        rt_free(transit_store.strings);
+        rt_free(strings);
+        (void)platform_close(fd);
+        return 0;
     }
 
     if (!from.found || !to.found) {
@@ -2441,7 +2941,7 @@ int main(int argc, char **argv) {
             rt_write_cstr(1, ",\"to_tile_found\":"); rt_write_cstr(1, to_tile_found > 0 ? "true" : "false");
             rt_write_cstr(1, ",\"direct_distance_m\":"); rt_write_uint(1, straight_distance);
             rt_write_cstr(1, "}}\n");
-        } else {
+        } else if (output.verbose) {
             rt_write_cstr(1, "from_tile_x: "); rt_write_int(1, from_tile_x); rt_write_char(1, '\n');
             rt_write_cstr(1, "from_tile_y: "); rt_write_int(1, from_tile_y); rt_write_char(1, '\n');
             rt_write_cstr(1, "to_tile_x: "); rt_write_int(1, to_tile_x); rt_write_char(1, '\n');
@@ -2485,7 +2985,7 @@ int main(int argc, char **argv) {
                     json_write_coord_pair(1, "source", graph.nodes[source].lat_e7, graph.nodes[source].lon_e7);
                     json_write_coord_pair(1, "target", graph.nodes[target].lat_e7, graph.nodes[target].lon_e7);
                     rt_write_cstr(1, "}}\n");
-                } else {
+                } else if (output.verbose) {
                     rt_write_cstr(1, "loaded_tiles: "); rt_write_uint(1, tiles_loaded); rt_write_char(1, '\n');
                     rt_write_cstr(1, "loaded_graph_nodes: "); rt_write_uint(1, graph.node_count); rt_write_char(1, '\n');
                     rt_write_cstr(1, "loaded_graph_edges: "); rt_write_uint(1, graph.edge_count); rt_write_char(1, '\n');
@@ -2506,9 +3006,11 @@ int main(int argc, char **argv) {
                         json_write_route_summary_event(&output, &graph, source, target, tiles_loaded, from_snap_m, to_snap_m, route_distance, total_distance, straight_distance);
                         if (json_write_route_geometry_and_steps(&output, &graph, source, target, &from, &to, strings, strings_size, from_snap_m, to_snap_m, total_distance) != 0) json_diagnostic(&output, "error", "failed to emit route geometry", 0);
                     } else {
-                        rt_write_cstr(1, "route_status: found\n");
-                        rt_write_cstr(1, "route_distance_m: "); rt_write_uint(1, total_distance); rt_write_char(1, '\n');
-                        rt_write_cstr(1, "graph_distance_m: "); rt_write_uint(1, route_distance); rt_write_char(1, '\n');
+                        if (output.verbose) {
+                            rt_write_cstr(1, "route_status: found\n");
+                            rt_write_cstr(1, "route_distance_m: "); rt_write_uint(1, total_distance); rt_write_char(1, '\n');
+                            rt_write_cstr(1, "graph_distance_m: "); rt_write_uint(1, route_distance); rt_write_char(1, '\n');
+                        }
                         (void)write_human_route(&output, &graph, source, target, &from, &to, strings, strings_size, from_snap_m, to_snap_m, route_distance, total_distance, tiles_loaded);
                     }
                     if ((output.have_depart || output.have_arrive) && transit_store.event_count != 0U) {

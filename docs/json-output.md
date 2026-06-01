@@ -78,12 +78,12 @@ Each command that supports `--json` documents its event names and `data` fields 
 
 ### rte-route
 
-`rte-route --json` emits route progress as JSON Lines. Successful walking routes include `metadata`, `address`, `tile_context`, `graph_loaded`, `route_status`, `route`, `route_point`, and `route_step` events. When the route pack contains embedded GTFS data, the stream also includes one `transit_plan` event. If the query does not include `--depart` or `--arrive`, the tool treats it as a departure at the current time.
+`rte-route --json` emits route progress as JSON Lines. Successful walking routes include `metadata`, `address`, `tile_context`, `graph_loaded`, `route_status`, `route`, `route_point`, and `route_step` events. When the route pack contains embedded GTFS data, the stream also includes one `transit_plan` event. With `--transit --json`, the stream skips walking graph events and emits only endpoint metadata/address events plus `transit_plan`. The human-output `--verbose` flag does not change JSON output. If the query does not include `--depart` or `--arrive`, the tool treats it as a departure at the current time.
 
-A found transit plan uses this shape:
+A found transit plan includes the first vehicle leg in the legacy top-level fields and the complete itinerary in `legs`:
 
 ```json
-{"schema":"newos.tool.v1","tool":"rte-route","stream":"stdout","event":"transit_plan","seq":273,"data":{"status":"found","mode":"tram","route_short_name":"92","route_long_name":"1556_900","board_stop":"S Potsdam Hauptbahnhof","alight_stop":"Potsdam, Hannes-Meyer-Str.","board_departure_sec":40620,"alight_arrival_sec":41520,"walk_to_stop_m":916,"walk_from_stop_m":214,"total_sec":2081,"active_trips":70778,"events_scanned":6175001,"board_lat":52.3910050,"board_lon":13.0652830,"alight_lat":52.4153520,"alight_lon":13.0402590}}
+{"schema":"newos.tool.v1","tool":"rte-route","stream":"stdout","event":"transit_plan","seq":273,"data":{"status":"found","mode":"subway","route_short_name":"U5","route_long_name":"","board_stop":"S+U Brandenburger Tor (Berlin)","alight_stop":"S+U Berlin Hauptbahnhof","board_departure_sec":32580,"alight_arrival_sec":32760,"walk_to_stop_m":273,"walk_from_stop_m":214,"total_sec":3900,"transit_leg_count":3,"active_trips":70778,"events_scanned":35730192,"board_lat":52.5169410,"board_lon":13.3803900,"alight_lat":52.5255890,"alight_lon":13.3695480,"legs":[{"kind":"ride","mode":"subway","route_short_name":"U5","route_long_name":"","board_stop":"S+U Brandenburger Tor (Berlin)","alight_stop":"S+U Berlin Hauptbahnhof","departure_sec":32580,"arrival_sec":32760},{"kind":"transfer_walk","from_stop":"S+U Berlin Hauptbahnhof","to_stop":"S+U Berlin Hauptbahnhof","walk_m":48,"departure_sec":32760,"arrival_sec":32796},{"kind":"ride","mode":"train","route_short_name":"S7","route_long_name":"","board_stop":"S+U Berlin Hauptbahnhof","alight_stop":"S Potsdam Hauptbahnhof","departure_sec":32820,"arrival_sec":34920}]}}
 ```
 
 If no embedded GTFS plan is available, `status` is `unavailable` and the event still reports `active_trips` and `events_scanned` for diagnostics.
