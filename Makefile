@@ -154,6 +154,9 @@ RTE_INFO_SRCS := \
 
 RTE_ROUTE_SRCS := \
 	$(RUNTIME_SRCS) \
+    src/platform/linux/fs.c \
+    src/platform/linux/identity.c \
+    src/platform/linux/process.c \
     src/platform/linux/time.c \
     src/tools/rte_route.c
 

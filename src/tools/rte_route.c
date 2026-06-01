@@ -2153,7 +2153,6 @@ static int render_route_map(
     const char *strings,
     unsigned int strings_size
 ) {
-#if defined(__APPLE__)
     unsigned int *path;
     unsigned int path_count;
     unsigned int index;
@@ -2301,20 +2300,6 @@ static int render_route_map(
         }
     }
     return 0;
-#else
-    (void)program;
-    (void)rte_path;
-    (void)output;
-    (void)graph;
-    (void)source;
-    (void)target;
-    (void)from;
-    (void)to;
-    (void)strings;
-    (void)strings_size;
-    rt_write_cstr(2, "rte-route: --map is currently implemented for the macOS freestanding build\n");
-    return -1;
-#endif
 }
 
 int main(int argc, char **argv) {
