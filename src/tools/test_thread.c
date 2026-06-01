@@ -25,7 +25,7 @@ static int threadtest_worker_main(void *arg) {
 }
 
 static void threadtest_write_failure(const char *message) {
-    rt_write_cstr(2, "threadtest: ");
+    rt_write_cstr(2, "test-thread: ");
     rt_write_cstr(2, message);
     rt_write_char(2, '\n');
 }
@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
     unsigned int worker_count = THREADTEST_DEFAULT_WORKERS;
     unsigned int iterations = THREADTEST_ITERATIONS;
     unsigned int worker_index;
-    const char *program = argc > 0 ? argv[0] : "threadtest";
+    const char *program = argc > 0 ? argv[0] : "test-thread";
 
     if (argc > 3) {
         threadtest_write_usage(program);

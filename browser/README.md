@@ -10,8 +10,8 @@ Generated data files:
 WASM modules:
 
 - `wasm/xzdec.js` / `wasm/xzdec.wasm`
-- `wasm/rtewalkroute.js` / `wasm/rtewalkroute.wasm`
-- `wasm/osmrender-rpack.js` / `wasm/osmrender-rpack.wasm`
+- `wasm/rte-route.js` / `wasm/rte-route.wasm`
+- `wasm/rpack-render.js` / `wasm/rpack-render.wasm`
 
 Rebuild the WASM modules with:
 
@@ -22,10 +22,10 @@ sh browser/build-wasm.sh
 Rebuild the Berlin packs with:
 
 ```sh
-make build/freestanding-linux-x86_64/osmroutepack build/freestanding-linux-x86_64/osmrenderpackv2
-build/freestanding-linux-x86_64/osmroutepack --tile-size-m 2000 --threads 2 \
+make build/freestanding-linux-x86_64/pbf-to-rte build/freestanding-linux-x86_64/pbf-to-rpack
+build/freestanding-linux-x86_64/pbf-to-rte --tile-size-m 2000 --threads 2 \
   data/berlin-260524.osm.pbf browser/berlin.rte
-build/freestanding-linux-x86_64/osmrenderpackv2 --threads 2 --way-threads 2 --buildings \
+build/freestanding-linux-x86_64/pbf-to-rpack --threads 2 --way-threads 2 --buildings \
   data/berlin-260524.osm.pbf browser/berlin.rpack
 xz -6 -k -f browser/berlin.rte
 xz -6 -k -f browser/berlin.rpack

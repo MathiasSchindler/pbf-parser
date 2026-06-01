@@ -657,7 +657,7 @@ static char *make_temp_path(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    const char *program = argc > 0 ? argv[0] : "osmbuildings";
+    const char *program = argc > 0 ? argv[0] : "osm-buildings";
     const char *pbf_path;
     const char *out_path;
     char *temp_path = 0;
@@ -729,20 +729,20 @@ int main(int argc, char **argv) {
         }
     }
     if (context.has_bbox && context.node_index_path == 0) {
-        rt_write_cstr(2, "osmbuildings: --bbox requires --node-index for way geometry\n");
+        rt_write_cstr(2, "osm-buildings: --bbox requires --node-index for way geometry\n");
         return 1;
     }
     if (context.way_index_path != 0 && context.node_index_path == 0) {
-        rt_write_cstr(2, "osmbuildings: --way-index requires --node-index\n");
+        rt_write_cstr(2, "osm-buildings: --way-index requires --node-index\n");
         return 1;
     }
     if (context.spatial_index_path != 0 && context.node_index_path == 0) {
-        rt_write_cstr(2, "osmbuildings: --spatial-index requires --node-index\n");
+        rt_write_cstr(2, "osm-buildings: --spatial-index requires --node-index\n");
         return 1;
     }
     if (context.node_index_path != 0) {
         if (osm_node_index_open(&context.node_index, context.node_index_path, context.error, sizeof(context.error)) != 0) {
-            rt_write_cstr(2, "osmbuildings: ");
+            rt_write_cstr(2, "osm-buildings: ");
             rt_write_cstr(2, context.error[0] == '\0' ? "could not open node index" : context.error);
             rt_write_char(2, '\n');
             return 1;
@@ -751,7 +751,7 @@ int main(int argc, char **argv) {
     }
     if (context.way_index_path != 0) {
         if (osm_way_index_open(&context.way_index, context.way_index_path, context.error, sizeof(context.error)) != 0) {
-            rt_write_cstr(2, "osmbuildings: ");
+            rt_write_cstr(2, "osm-buildings: ");
             rt_write_cstr(2, context.error[0] == '\0' ? "could not open way index" : context.error);
             rt_write_char(2, '\n');
             if (context.node_index_open) osm_node_index_close(&context.node_index);
@@ -761,7 +761,7 @@ int main(int argc, char **argv) {
     }
     if (context.spatial_index_path != 0) {
         if (osm_spatial_index_open(&context.spatial_index, context.spatial_index_path, context.error, sizeof(context.error)) != 0) {
-            rt_write_cstr(2, "osmbuildings: ");
+            rt_write_cstr(2, "osm-buildings: ");
             rt_write_cstr(2, context.error[0] == '\0' ? "could not open spatial index" : context.error);
             rt_write_char(2, '\n');
             if (context.way_index_open) osm_way_index_close(&context.way_index);
@@ -774,7 +774,7 @@ int main(int argc, char **argv) {
     if (!output_stdout) {
         temp_path = make_temp_path(out_path);
         if (temp_path == 0) {
-            rt_write_cstr(2, "osmbuildings: out of memory\n");
+            rt_write_cstr(2, "osm-buildings: out of memory\n");
             if (context.way_index_open) osm_way_index_close(&context.way_index);
             if (context.node_index_open) osm_node_index_close(&context.node_index);
             return 1;
@@ -785,7 +785,7 @@ int main(int argc, char **argv) {
     }
     context.writer.fd = output_stdout ? 1 : platform_open_write(write_path, 0644U);
     if (context.writer.fd < 0) {
-        rt_write_cstr(2, "osmbuildings: could not open output file\n");
+        rt_write_cstr(2, "osm-buildings: could not open output file\n");
         rt_free(temp_path);
         if (context.spatial_index_open) osm_spatial_index_close(&context.spatial_index);
         if (context.way_index_open) osm_way_index_close(&context.way_index);
@@ -795,7 +795,7 @@ int main(int argc, char **argv) {
     context.writer.capacity = OSM_BUILDINGS_BUFFER_SIZE;
     context.writer.data = (unsigned char *)rt_malloc(context.writer.capacity);
     if (context.writer.data == 0) {
-        rt_write_cstr(2, "osmbuildings: out of memory\n");
+        rt_write_cstr(2, "osm-buildings: out of memory\n");
         if (!output_stdout) (void)platform_close(context.writer.fd);
         rt_free(temp_path);
         if (context.spatial_index_open) osm_spatial_index_close(&context.spatial_index);
@@ -804,7 +804,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (context.write_header && write_header(&context.writer) != 0) {
-        rt_write_cstr(2, "osmbuildings: could not write output header\n");
+        rt_write_cstr(2, "osm-buildings: could not write output header\n");
         rt_free(context.writer.data);
         if (!output_stdout) (void)platform_close(context.writer.fd);
         rt_free(temp_path);
@@ -821,7 +821,7 @@ int main(int argc, char **argv) {
     if (pbf_stream_entities(pbf_path, &callbacks, &context, parse_error, sizeof(parse_error)) != 0 ||
         context.failed ||
         writer_flush(&context.writer) != 0) {
-        rt_write_cstr(2, "osmbuildings: ");
+        rt_write_cstr(2, "osm-buildings: ");
         rt_write_cstr(2, context.failed ? (context.error[0] == '\0' ? "failed while writing or reading indexes" : context.error) : (parse_error[0] == '\0' ? "failed to parse PBF" : parse_error));
         rt_write_char(2, '\n');
         rt_free(context.writer.data);
@@ -837,7 +837,7 @@ int main(int argc, char **argv) {
     }
     rt_free(context.writer.data);
     if (!output_stdout && platform_close(context.writer.fd) != 0) {
-        rt_write_cstr(2, "osmbuildings: could not close output file\n");
+        rt_write_cstr(2, "osm-buildings: could not close output file\n");
         if (temp_path != 0) (void)platform_remove_file(temp_path);
         rt_free(temp_path);
         if (context.spatial_index_open) osm_spatial_index_close(&context.spatial_index);
@@ -846,7 +846,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (!output_stdout && temp_path != 0 && platform_rename_path(temp_path, out_path) != 0) {
-        rt_write_cstr(2, "osmbuildings: could not move temporary output into place\n");
+        rt_write_cstr(2, "osm-buildings: could not move temporary output into place\n");
         (void)platform_remove_file(temp_path);
         rt_free(temp_path);
         if (context.spatial_index_open) osm_spatial_index_close(&context.spatial_index);

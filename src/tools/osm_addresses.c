@@ -244,7 +244,7 @@ static int output_is_stdout(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    const char *program = argc > 0 ? argv[0] : "osmaddresses";
+    const char *program = argc > 0 ? argv[0] : "osm-addresses";
     const char *pbf_path;
     const char *out_path;
     OsmAddressesContext context;
@@ -285,18 +285,18 @@ int main(int argc, char **argv) {
     output_stdout = output_is_stdout(out_path);
     context.writer.fd = output_stdout ? 1 : platform_open_write(out_path, 0644U);
     if (context.writer.fd < 0) {
-        rt_write_cstr(2, "osmaddresses: could not open output file\n");
+        rt_write_cstr(2, "osm-addresses: could not open output file\n");
         return 1;
     }
     context.writer.capacity = OSM_ADDRESSES_BUFFER_SIZE;
     context.writer.data = (unsigned char *)rt_malloc(context.writer.capacity);
     if (context.writer.data == 0) {
-        rt_write_cstr(2, "osmaddresses: out of memory\n");
+        rt_write_cstr(2, "osm-addresses: out of memory\n");
         if (!output_stdout) (void)platform_close(context.writer.fd);
         return 1;
     }
     if (context.write_header && write_header(&context.writer) != 0) {
-        rt_write_cstr(2, "osmaddresses: could not write output header\n");
+        rt_write_cstr(2, "osm-addresses: could not write output header\n");
         rt_free(context.writer.data);
         if (!output_stdout) (void)platform_close(context.writer.fd);
         return 1;
@@ -307,7 +307,7 @@ int main(int argc, char **argv) {
     callbacks.relation_tags = on_relation_tags;
     error[0] = '\0';
     if (pbf_stream_entities(pbf_path, &callbacks, &context, error, sizeof(error)) != 0 || context.failed || writer_flush(&context.writer) != 0) {
-        rt_write_cstr(2, "osmaddresses: ");
+        rt_write_cstr(2, "osm-addresses: ");
         rt_write_cstr(2, context.failed ? "could not write output" : (error[0] == '\0' ? "failed to parse PBF" : error));
         rt_write_char(2, '\n');
         rt_free(context.writer.data);
@@ -316,7 +316,7 @@ int main(int argc, char **argv) {
     }
     rt_free(context.writer.data);
     if (!output_stdout && platform_close(context.writer.fd) != 0) {
-        rt_write_cstr(2, "osmaddresses: could not close output file\n");
+        rt_write_cstr(2, "osm-addresses: could not close output file\n");
         return 1;
     }
     stats_fd = output_stdout ? 2 : 1;

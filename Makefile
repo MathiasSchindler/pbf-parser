@@ -45,98 +45,92 @@ MACOS_RUNTIME_SRCS := \
     src/shared/runtime/parse.c \
     src/shared/runtime/string.c
 
-MACOS_OSMRENDERPACKV2_SRCS := \
-    $(MACOS_RUNTIME_SRCS) \
+MACOS_PBF_TO_RPACK_SRCS := \
+	$(MACOS_RUNTIME_SRCS) \
     src/shared/compression/zlib.c \
     src/shared/pbf.c \
     src/shared/osmrpack.c \
-    src/tools/osmrenderpackv2.c
+    src/tools/pbf_to_rpack.c
 
-MACOS_OSMRPACKINFO_SRCS := \
-    $(MACOS_RUNTIME_SRCS) \
+MACOS_RPACK_INFO_SRCS := \
+	$(MACOS_RUNTIME_SRCS) \
     src/shared/osmrpack.c \
-    src/tools/osmrpackinfo.c
+    src/tools/rpack_info.c
 
-MACOS_OSMRENDER_RPACK_SRCS := \
-    $(MACOS_RUNTIME_SRCS) \
+MACOS_RPACK_RENDER_SRCS := \
+	$(MACOS_RUNTIME_SRCS) \
     src/shared/compression/crc32.c \
     src/shared/compression/zlib.c \
     src/shared/pbf.c \
     src/shared/osmrpack.c \
     src/shared/simple_config.c \
-    src/tools/osmrender_rpack.c
+    src/tools/rpack_render.c
 
-MACOS_OSMWALKROUTE_SRCS := \
-    $(MACOS_RUNTIME_SRCS) \
+MACOS_PBF_TO_RTE_SRCS := \
+	$(MACOS_RUNTIME_SRCS) \
     src/shared/compression/zlib.c \
     src/shared/pbf.c \
-    src/tools/osmwalkroute.c
+    src/tools/pbf_to_rte.c
 
-MACOS_OSMROUTEPACK_SRCS := \
-    $(MACOS_RUNTIME_SRCS) \
-    src/shared/compression/zlib.c \
-    src/shared/pbf.c \
-    src/tools/osmroutepack.c
+MACOS_RTE_INFO_SRCS := \
+	$(MACOS_RUNTIME_SRCS) \
+    src/tools/rte_info.c
 
-MACOS_OSMRTEINFO_SRCS := \
-    $(MACOS_RUNTIME_SRCS) \
-    src/tools/osmrteinfo.c
+MACOS_RTE_ROUTE_SRCS := \
+	$(MACOS_RUNTIME_SRCS) \
+    src/tools/rte_route.c
 
-MACOS_RTEWALKROUTE_SRCS := \
-    $(MACOS_RUNTIME_SRCS) \
-    src/tools/rtewalkroute.c
+MACOS_TEST_THREAD_SRCS := \
+	$(MACOS_RUNTIME_SRCS) \
+    src/tools/test_thread.c
 
-MACOS_THREADTEST_SRCS := \
-    $(MACOS_RUNTIME_SRCS) \
-    src/tools/threadtest.c
-
-PBFINFO_SRCS := \
-    $(RUNTIME_SRCS) \
+PBF_INFO_SRCS := \
+	$(RUNTIME_SRCS) \
     src/platform/linux/thread.c \
     src/shared/compression/zlib.c \
     src/shared/pbf.c \
-    src/tools/pbfinfo.c
+    src/tools/pbf_info.c
 
-OSMLOOKUP_SRCS := \
-    $(RUNTIME_SRCS) \
+OSM_LOOKUP_SRCS := \
+	$(RUNTIME_SRCS) \
     src/platform/linux/fs.c \
     src/shared/compression/zlib.c \
     src/shared/osm_index.c \
     src/shared/pbf.c \
-    src/tools/osmlookup.c
+    src/tools/osm_lookup.c
 
-OSMADDRESSES_SRCS := \
-    $(RUNTIME_SRCS) \
+OSM_ADDRESSES_SRCS := \
+	$(RUNTIME_SRCS) \
     src/shared/compression/zlib.c \
     src/shared/pbf.c \
-    src/tools/osmaddresses.c
+    src/tools/osm_addresses.c
 
-OSMBUILDINGS_SRCS := \
-    $(RUNTIME_SRCS) \
+OSM_BUILDINGS_SRCS := \
+	$(RUNTIME_SRCS) \
     src/platform/linux/fs.c \
     src/shared/compression/zlib.c \
     src/shared/osm_index.c \
     src/shared/pbf.c \
-    src/tools/osmbuildings.c
+    src/tools/osm_buildings.c
 
-OSMRENDERPACKV2_SRCS := \
-    $(RUNTIME_SRCS) \
+PBF_TO_RPACK_SRCS := \
+	$(RUNTIME_SRCS) \
     src/platform/linux/fs.c \
     src/platform/linux/thread.c \
     src/platform/linux/time.c \
     src/shared/compression/zlib.c \
     src/shared/pbf.c \
     src/shared/osmrpack.c \
-    src/tools/osmrenderpackv2.c
+    src/tools/pbf_to_rpack.c
 
-OSMRPACKINFO_SRCS := \
-    $(RUNTIME_SRCS) \
+RPACK_INFO_SRCS := \
+	$(RUNTIME_SRCS) \
     src/platform/linux/fs.c \
     src/shared/osmrpack.c \
-    src/tools/osmrpackinfo.c
+    src/tools/rpack_info.c
 
-OSMRENDER_RPACK_SRCS := \
-    $(RUNTIME_SRCS) \
+RPACK_RENDER_SRCS := \
+	$(RUNTIME_SRCS) \
     src/platform/linux/fs.c \
     src/platform/linux/time.c \
     src/shared/compression/crc32.c \
@@ -144,59 +138,51 @@ OSMRENDER_RPACK_SRCS := \
     src/shared/pbf.c \
     src/shared/osmrpack.c \
     src/shared/simple_config.c \
-    src/tools/osmrender_rpack.c
+    src/tools/rpack_render.c
 
-OSMWALKROUTE_SRCS := \
-    $(RUNTIME_SRCS) \
-    src/platform/linux/thread.c \
-    src/shared/compression/zlib.c \
-    src/shared/pbf.c \
-    src/tools/osmwalkroute.c
-
-OSMROUTEPACK_SRCS := \
-    $(RUNTIME_SRCS) \
+PBF_TO_RTE_SRCS := \
+	$(RUNTIME_SRCS) \
     src/platform/linux/thread.c \
     src/platform/linux/time.c \
     src/shared/compression/zlib.c \
     src/shared/pbf.c \
-    src/tools/osmroutepack.c
+    src/tools/pbf_to_rte.c
 
-OSMRTEINFO_SRCS := \
-    $(RUNTIME_SRCS) \
-    src/tools/osmrteinfo.c
+RTE_INFO_SRCS := \
+	$(RUNTIME_SRCS) \
+    src/tools/rte_info.c
 
-RTEWALKROUTE_SRCS := \
-    $(RUNTIME_SRCS) \
+RTE_ROUTE_SRCS := \
+	$(RUNTIME_SRCS) \
     src/platform/linux/time.c \
-    src/tools/rtewalkroute.c
+    src/tools/rte_route.c
 
-THREADTEST_SRCS := \
-    $(RUNTIME_SRCS) \
+TEST_THREAD_SRCS := \
+	$(RUNTIME_SRCS) \
     src/platform/linux/thread.c \
-    src/tools/threadtest.c
+    src/tools/test_thread.c
 
-FONTTEST_SRCS := \
-    $(RUNTIME_SRCS) \
+TEST_FONT_SRCS := \
+	$(RUNTIME_SRCS) \
     src/platform/linux/fs.c \
-    $(FONTRENDER_SRCS) \
-    src/tools/fonttest.c
+	$(FONTRENDER_SRCS) \
+    src/tools/test_font.c
 
 LINUX_TOOLS := \
-    $(BUILD_DIR)/pbfinfo \
-    $(BUILD_DIR)/osmlookup \
-    $(BUILD_DIR)/osmaddresses \
-    $(BUILD_DIR)/osmbuildings \
-    $(BUILD_DIR)/osmrenderpackv2 \
-    $(BUILD_DIR)/osmrpackinfo \
-    $(BUILD_DIR)/osmrender-rpack \
-    $(BUILD_DIR)/osmwalkroute \
-    $(BUILD_DIR)/osmroutepack \
-    $(BUILD_DIR)/osmrteinfo \
-    $(BUILD_DIR)/rtewalkroute \
-    $(BUILD_DIR)/threadtest \
-    $(BUILD_DIR)/fonttest
+	$(BUILD_DIR)/pbf-info \
+	$(BUILD_DIR)/osm-lookup \
+	$(BUILD_DIR)/osm-addresses \
+	$(BUILD_DIR)/osm-buildings \
+	$(BUILD_DIR)/pbf-to-rpack \
+	$(BUILD_DIR)/rpack-info \
+	$(BUILD_DIR)/rpack-render \
+	$(BUILD_DIR)/pbf-to-rte \
+	$(BUILD_DIR)/rte-info \
+	$(BUILD_DIR)/rte-route \
+	$(BUILD_DIR)/test-thread \
+	$(BUILD_DIR)/test-font
 
-.PHONY: all clean check-static threadtest macos-rpack-tools macos-threadtest
+.PHONY: all clean check-static test-thread macos-rpack-tools macos-test-thread
 
 all: $(LINUX_TOOLS)
 
@@ -209,11 +195,11 @@ check-static: all
 	done; \
 	echo "all Linux tools are static freestanding ELF binaries"
 
-threadtest: $(BUILD_DIR)/threadtest
+test-thread: $(BUILD_DIR)/test-thread
 
-macos-rpack-tools: $(MACOS_BUILD_DIR)/osmrenderpackv2 $(MACOS_BUILD_DIR)/osmrpackinfo $(MACOS_BUILD_DIR)/osmrender-rpack $(MACOS_BUILD_DIR)/osmwalkroute $(MACOS_BUILD_DIR)/osmroutepack $(MACOS_BUILD_DIR)/osmrteinfo $(MACOS_BUILD_DIR)/rtewalkroute
+macos-rpack-tools: $(MACOS_BUILD_DIR)/pbf-to-rpack $(MACOS_BUILD_DIR)/rpack-info $(MACOS_BUILD_DIR)/rpack-render $(MACOS_BUILD_DIR)/pbf-to-rte $(MACOS_BUILD_DIR)/rte-info $(MACOS_BUILD_DIR)/rte-route
 
-macos-threadtest: $(MACOS_BUILD_DIR)/threadtest
+macos-test-thread: $(MACOS_BUILD_DIR)/test-thread
 
 $(BUILD_DIR):
 	mkdir -p $@
@@ -221,68 +207,62 @@ $(BUILD_DIR):
 $(MACOS_BUILD_DIR):
 	mkdir -p $@
 
-$(BUILD_DIR)/pbfinfo: $(PBFINFO_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(PBFINFO_SRCS) $(LDFLAGS) -o $@
+$(BUILD_DIR)/pbf-info: $(PBF_INFO_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(PBF_INFO_SRCS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/osmlookup: $(OSMLOOKUP_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMLOOKUP_SRCS) $(LDFLAGS) -o $@
+$(BUILD_DIR)/osm-lookup: $(OSM_LOOKUP_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(OSM_LOOKUP_SRCS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/osmaddresses: $(OSMADDRESSES_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMADDRESSES_SRCS) $(LDFLAGS) -o $@
+$(BUILD_DIR)/osm-addresses: $(OSM_ADDRESSES_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(OSM_ADDRESSES_SRCS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/osmbuildings: $(OSMBUILDINGS_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMBUILDINGS_SRCS) $(LDFLAGS) -o $@
+$(BUILD_DIR)/osm-buildings: $(OSM_BUILDINGS_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(OSM_BUILDINGS_SRCS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/osmrenderpackv2: $(OSMRENDERPACKV2_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMRENDERPACKV2_SRCS) $(LDFLAGS) -o $@
+$(BUILD_DIR)/pbf-to-rpack: $(PBF_TO_RPACK_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(PBF_TO_RPACK_SRCS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/osmrpackinfo: $(OSMRPACKINFO_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMRPACKINFO_SRCS) $(LDFLAGS) -o $@
+$(BUILD_DIR)/rpack-info: $(RPACK_INFO_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(RPACK_INFO_SRCS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/osmrender-rpack: $(OSMRENDER_RPACK_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMRENDER_RPACK_SRCS) $(LDFLAGS) -o $@
+$(BUILD_DIR)/rpack-render: $(RPACK_RENDER_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(RPACK_RENDER_SRCS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/osmwalkroute: $(OSMWALKROUTE_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMWALKROUTE_SRCS) $(LDFLAGS) -o $@
+$(BUILD_DIR)/pbf-to-rte: $(PBF_TO_RTE_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(PBF_TO_RTE_SRCS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/osmroutepack: $(OSMROUTEPACK_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMROUTEPACK_SRCS) $(LDFLAGS) -o $@
+$(BUILD_DIR)/rte-info: $(RTE_INFO_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(RTE_INFO_SRCS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/osmrteinfo: $(OSMRTEINFO_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(OSMRTEINFO_SRCS) $(LDFLAGS) -o $@
+$(BUILD_DIR)/rte-route: $(RTE_ROUTE_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(RTE_ROUTE_SRCS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/rtewalkroute: $(RTEWALKROUTE_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(RTEWALKROUTE_SRCS) $(LDFLAGS) -o $@
+$(BUILD_DIR)/test-thread: $(TEST_THREAD_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_THREAD_SRCS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/threadtest: $(THREADTEST_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(THREADTEST_SRCS) $(LDFLAGS) -o $@
+$(BUILD_DIR)/test-font: $(TEST_FONT_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(TEST_FONT_SRCS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/fonttest: $(FONTTEST_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(FONTTEST_SRCS) $(LDFLAGS) -o $@
+$(MACOS_BUILD_DIR)/pbf-to-rpack: $(MACOS_PBF_TO_RPACK_SRCS) | $(MACOS_BUILD_DIR)
+	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_PBF_TO_RPACK_SRCS) $(MACOS_LDFLAGS) -o $@
 
-$(MACOS_BUILD_DIR)/osmrenderpackv2: $(MACOS_OSMRENDERPACKV2_SRCS) | $(MACOS_BUILD_DIR)
-	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_OSMRENDERPACKV2_SRCS) $(MACOS_LDFLAGS) -o $@
+$(MACOS_BUILD_DIR)/rpack-info: $(MACOS_RPACK_INFO_SRCS) | $(MACOS_BUILD_DIR)
+	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_RPACK_INFO_SRCS) $(MACOS_LDFLAGS) -o $@
 
-$(MACOS_BUILD_DIR)/osmrpackinfo: $(MACOS_OSMRPACKINFO_SRCS) | $(MACOS_BUILD_DIR)
-	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_OSMRPACKINFO_SRCS) $(MACOS_LDFLAGS) -o $@
+$(MACOS_BUILD_DIR)/rpack-render: $(MACOS_RPACK_RENDER_SRCS) | $(MACOS_BUILD_DIR)
+	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_RPACK_RENDER_SRCS) $(MACOS_LDFLAGS) -o $@
 
-$(MACOS_BUILD_DIR)/osmrender-rpack: $(MACOS_OSMRENDER_RPACK_SRCS) | $(MACOS_BUILD_DIR)
-	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_OSMRENDER_RPACK_SRCS) $(MACOS_LDFLAGS) -o $@
+$(MACOS_BUILD_DIR)/pbf-to-rte: $(MACOS_PBF_TO_RTE_SRCS) | $(MACOS_BUILD_DIR)
+	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_PBF_TO_RTE_SRCS) $(MACOS_LDFLAGS) -o $@
 
-$(MACOS_BUILD_DIR)/osmwalkroute: $(MACOS_OSMWALKROUTE_SRCS) | $(MACOS_BUILD_DIR)
-	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_OSMWALKROUTE_SRCS) $(MACOS_LDFLAGS) -o $@
+$(MACOS_BUILD_DIR)/rte-info: $(MACOS_RTE_INFO_SRCS) | $(MACOS_BUILD_DIR)
+	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_RTE_INFO_SRCS) $(MACOS_LDFLAGS) -o $@
 
-$(MACOS_BUILD_DIR)/osmroutepack: $(MACOS_OSMROUTEPACK_SRCS) | $(MACOS_BUILD_DIR)
-	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_OSMROUTEPACK_SRCS) $(MACOS_LDFLAGS) -o $@
+$(MACOS_BUILD_DIR)/rte-route: $(MACOS_RTE_ROUTE_SRCS) | $(MACOS_BUILD_DIR)
+	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_RTE_ROUTE_SRCS) $(MACOS_LDFLAGS) -o $@
 
-$(MACOS_BUILD_DIR)/osmrteinfo: $(MACOS_OSMRTEINFO_SRCS) | $(MACOS_BUILD_DIR)
-	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_OSMRTEINFO_SRCS) $(MACOS_LDFLAGS) -o $@
-
-$(MACOS_BUILD_DIR)/rtewalkroute: $(MACOS_RTEWALKROUTE_SRCS) | $(MACOS_BUILD_DIR)
-	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_RTEWALKROUTE_SRCS) $(MACOS_LDFLAGS) -o $@
-
-$(MACOS_BUILD_DIR)/threadtest: $(MACOS_THREADTEST_SRCS) | $(MACOS_BUILD_DIR)
-	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_THREADTEST_SRCS) $(MACOS_LDFLAGS) -o $@
+$(MACOS_BUILD_DIR)/test-thread: $(MACOS_TEST_THREAD_SRCS) | $(MACOS_BUILD_DIR)
+	$(MACOS_CC) $(MACOS_CFLAGS) $(MACOS_TEST_THREAD_SRCS) $(MACOS_LDFLAGS) -o $@
 
 clean:
 	rm -rf build

@@ -218,7 +218,7 @@ Version 1 required global section types:
 0x0505 stop-to-pattern index, when public transport profile is present
 ```
 
-Current implementation note: `osmroutepack --gtfs DIR` writes a compact first transit payload in section `0x0500`. The section is named `GTFSLEG1` and is intentionally narrower than the final route-pattern model: it supports one scheduled vehicle leg plus walking access/egress, which lets `rtewalkroute --depart` and `--arrive` suggest bus, tram, subway, or train options without reading GTFS CSV files at query time. Future sections `0x0501..0x0505` can be added alongside it for multi-transfer routing.
+Current implementation note: `pbf-to-rte --gtfs DIR` writes a compact first transit payload in section `0x0500`. The section is named `GTFSLEG1` and is intentionally narrower than the final route-pattern model: it supports one scheduled vehicle leg plus walking access/egress, which lets `rte-route --depart` and `--arrive` suggest bus, tram, subway, or train options without reading GTFS CSV files at query time. Future sections `0x0501..0x0505` can be added alongside it for multi-transfer routing.
 
 ### GTFSLEG1 Transit Section
 
@@ -612,7 +612,7 @@ The graph stores directed edges. A bidirectional OSM way segment becomes two dir
 
 Normal directed walking edges are tile-local: `to_local_node` always names a node in the same tile payload. Cross-tile movement is represented by portal records, not by direct adjacency into another tile payload. Query engines that search multiple tiles insert portal records as additional edges in their temporary search state.
 
-Implementation note: the first `osmroutepack` walking-graph writer keeps `to_local_node` tile-local, but represents cross-tile OSM way segments by duplicating that segment into both endpoint tile payloads. `rtewalkroute` then merges duplicate coordinates while loading a small tile neighborhood. This is an interim compatibility path until explicit portal payloads and overlay routing are written.
+Implementation note: the first `pbf-to-rte` walking-graph writer keeps `to_local_node` tile-local, but represents cross-tile OSM way segments by duplicating that segment into both endpoint tile payloads. `rte-route` then merges duplicate coordinates while loading a small tile neighborhood. This is an interim compatibility path until explicit portal payloads and overlay routing are written.
 
 ## Snapping Index
 
@@ -1209,19 +1209,19 @@ The first version should prefer one extra byte per hot record over a decode bran
 Builder:
 
 ```sh
-osmroutepack [--tile-size-m 4000] [--threads N] FILE.osm.pbf GTFS_DIR OUT.rte
+pbf-to-rte [--tile-size-m 4000] [--threads N] FILE.osm.pbf GTFS_DIR OUT.rte
 ```
 
 Inspector:
 
 ```sh
-osmroutepackinfo OUT.rte
+rte-info OUT.rte
 ```
 
 Router:
 
 ```sh
-osmroute OUT.rte "Friedrich-Engels-Straße 22" "Hermann-Mattern-Promenade 25" --depart 2026-05-27T11:00
+rte-route OUT.rte "Friedrich-Engels-Straße 22" "Hermann-Mattern-Promenade 25" --depart 2026-05-27T11:00
 ```
 
 ## Version 1 Minimum Viable Pack
@@ -1233,7 +1233,7 @@ The smallest useful `OSMRTE01` implementation should include:
 - metric tile coordinate metadata
 - global string table
 - tiled walking graph CSR arrays
-- tiled snap grid
+rte-route OUT.rte "Friedrich-Engels-Straße 22" "Hermann-Mattern-Promenade 25" --depart 2026-05-27T11:00
 - tiled address records
 - global transit stops
 - stop-to-walk links

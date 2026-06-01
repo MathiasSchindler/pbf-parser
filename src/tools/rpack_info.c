@@ -94,7 +94,7 @@ static int try_write_v2_info(const char *path, int *handled) {
 }
 
 int main(int argc, char **argv) {
-    const char *program = argc > 0 ? argv[0] : "osmrpackinfo";
+    const char *program = argc > 0 ? argv[0] : "rpack-info";
     OsmrPackHeader header;
     char error[OSMRPACK_ERROR_CAPACITY];
     int handled_v2 = 0;
@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
     if (try_write_v2_info(argv[1], &handled_v2) == 0 && handled_v2) return 0;
     error[0] = '\0';
     if (osmrpack_read_header(argv[1], &header, error, sizeof(error)) != 0) {
-        rt_write_cstr(2, "osmrpackinfo: ");
+        rt_write_cstr(2, "rpack-info: ");
         rt_write_cstr(2, error[0] == '\0' ? "could not read pack" : error);
         rt_write_char(2, '\n');
         return 1;

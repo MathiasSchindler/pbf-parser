@@ -803,7 +803,7 @@ static int query_address_section(int fd, const OsmrteAddressSection *section, co
 }
 
 int main(int argc, char **argv) {
-    const char *program = argc > 0 ? argv[0] : "osmrteinfo";
+    const char *program = argc > 0 ? argv[0] : "rte-info";
     const char *path;
     OsmrteInfoOptions options;
     OsmrteHeader header;
@@ -834,20 +834,20 @@ int main(int argc, char **argv) {
     }
 
     fd = platform_open_read(path);
-    if (fd < 0) { rt_write_cstr(2, "osmrteinfo: could not open route pack\n"); return 1; }
+    if (fd < 0) { rt_write_cstr(2, "rte-info: could not open route pack\n"); return 1; }
     if (read_exact(fd, header_bytes, sizeof(header_bytes)) != 0 || parse_header(header_bytes, &header) != 0) {
         (void)platform_close(fd);
-        rt_write_cstr(2, "osmrteinfo: invalid or unsupported OSMRTE01 header\n");
+        rt_write_cstr(2, "rte-info: invalid or unsupported OSMRTE01 header\n");
         return 1;
     }
     if (header.header_size != OSMRTE_HEADER_SIZE || header.section_record_size != OSMRTE_SECTION_RECORD_SIZE || header.tile_record_size != OSMRTE_TILE_RECORD_SIZE) {
         (void)platform_close(fd);
-        rt_write_cstr(2, "osmrteinfo: unsupported OSMRTE01 record layout\n");
+        rt_write_cstr(2, "rte-info: unsupported OSMRTE01 record layout\n");
         return 1;
     }
     if (read_sections(fd, &header, options.show_sections, &address_section, &addresses_present, &gtfs_present) != 0) {
         (void)platform_close(fd);
-        rt_write_cstr(2, "osmrteinfo: could not read section directory\n");
+        rt_write_cstr(2, "rte-info: could not read section directory\n");
         return 1;
     }
 
@@ -865,7 +865,7 @@ int main(int argc, char **argv) {
         rt_write_cstr(1, "query_tile_y: "); rt_write_int(1, tile_y); rt_write_char(1, '\n');
         rt_write_cstr(1, "query_tile_id: "); write_hex_u64(tile_id); rt_write_char(1, '\n');
         result = find_tile_by_id(fd, &header, tile_id, &tile, &tile_index);
-        if (result < 0) { (void)platform_close(fd); rt_write_cstr(2, "osmrteinfo: could not read tile directory\n"); return 1; }
+        if (result < 0) { (void)platform_close(fd); rt_write_cstr(2, "rte-info: could not read tile directory\n"); return 1; }
         if (result == 0) rt_write_cstr(1, "tile_found: no\n");
         else write_tile_info(&tile, tile_index);
     }
@@ -877,7 +877,7 @@ int main(int argc, char **argv) {
         } else {
             if (query_address_section(fd, &address_section, options.address_query) != 0) {
                 (void)platform_close(fd);
-                rt_write_cstr(2, "osmrteinfo: could not query address section\n");
+                rt_write_cstr(2, "rte-info: could not query address section\n");
                 return 1;
             }
         }

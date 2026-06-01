@@ -42,7 +42,7 @@ int pbf_stream_entities_parallel(const char *path,
 
 Each callback receives data that is valid only for the duration of the callback. Consumers that need to keep tags, refs, members, or text must copy them.
 
-`PBF_STREAM_SKIP_NODE_TAGS` lets node-only consumers skip dense-node tag decoding. When this flag is set, dense-node streaming decodes IDs and coordinates directly from the packed protobuf fields instead of first materializing temporary arrays. `osmrenderpackv2` and `osmroutepack` use this in phases that only need node IDs and coordinates.
+`PBF_STREAM_SKIP_NODE_TAGS` lets node-only consumers skip dense-node tag decoding. When this flag is set, dense-node streaming decodes IDs and coordinates directly from the packed protobuf fields instead of first materializing temporary arrays. `pbf-to-rpack` and `pbf-to-rte` use this in phases that only need node IDs and coordinates.
 
 `way_tags` is an optional prefilter. It receives decoded way tags before packed node refs are decoded. Returning `0` rejects the way and skips ref decoding; returning non-zero continues to the normal `way` callback. Renderers use this to avoid ref work for ways that do not match any visible style rule.
 
@@ -64,9 +64,9 @@ degrees = nano / 1000000000
 
 Parallel entity streaming does not preserve source entity order. It is intended for order-independent consumers such as render-pack construction phases that collect worker-local ways or fill a prebuilt node lookup. If `worker_count` is `1`, the parallel API still uses one worker-local buffer and then calls `merge_worker`; this keeps serial and threaded code paths consistent.
 
-## osmlookup
+## osm-lookup
 
-`osmlookup` is the first stream consumer. It filters entities while scanning the PBF file and prints matching records.
+`osm-lookup` is the first stream consumer. It filters entities while scanning the PBF file and prints matching records.
 
 Build:
 
@@ -77,7 +77,7 @@ make all
 Usage:
 
 ```sh
-./build/freestanding-linux-x86_64/osmlookup FILE.osm.pbf [options]
+./build/freestanding-linux-x86_64/osm-lookup FILE.osm.pbf [options]
 ```
 
 Options:
@@ -95,19 +95,19 @@ Multiple tag filters are combined with AND semantics.
 Examples:
 
 ```sh
-./build/freestanding-linux-x86_64/osmlookup data/brandenburg-260524.osm.pbf --type node --tag amenity --limit 3
-./build/freestanding-linux-x86_64/osmlookup data/brandenburg-260524.osm.pbf --type way --tag highway --limit 3
-./build/freestanding-linux-x86_64/osmlookup data/brandenburg-260524.osm.pbf --type relation --tag type=multipolygon --limit 3
-./build/freestanding-linux-x86_64/osmlookup data/brandenburg-260524.osm.pbf --name Alexanderplatz --limit 10
-./build/freestanding-linux-x86_64/osmlookup data/brandenburg-260524.osm.pbf --id node:16541597
-./build/freestanding-linux-x86_64/osmlookup data/brandenburg-260524.osm.pbf --type node --bbox 13.30,52.50,13.40,52.60 --tag amenity --limit 3
+./build/freestanding-linux-x86_64/osm-lookup data/brandenburg-260524.osm.pbf --type node --tag amenity --limit 3
+./build/freestanding-linux-x86_64/osm-lookup data/brandenburg-260524.osm.pbf --type way --tag highway --limit 3
+./build/freestanding-linux-x86_64/osm-lookup data/brandenburg-260524.osm.pbf --type relation --tag type=multipolygon --limit 3
+./build/freestanding-linux-x86_64/osm-lookup data/brandenburg-260524.osm.pbf --name Alexanderplatz --limit 10
+./build/freestanding-linux-x86_64/osm-lookup data/brandenburg-260524.osm.pbf --id node:16541597
+./build/freestanding-linux-x86_64/osm-lookup data/brandenburg-260524.osm.pbf --type node --bbox 13.30,52.50,13.40,52.60 --tag amenity --limit 3
 ```
 
 Output is line-oriented text. Nodes include coordinates; ways include decoded ref counts; relations include member counts.
 
-## osmaddresses
+## osm-addresses
 
-`osmaddresses` extracts address tags from nodes, ways, and relations and writes tab-separated output. By default it emits only complete records that contain all three tags:
+`osm-addresses` extracts address tags from nodes, ways, and relations and writes tab-separated output. By default it emits only complete records that contain all three tags:
 
 ```text
 addr:street
@@ -119,7 +119,7 @@ Build and run:
 
 ```sh
 make all
-./build/freestanding-linux-x86_64/osmaddresses data/germany-060524.osm.pbf build/germany-addresses.tsv
+./build/freestanding-linux-x86_64/osm-addresses data/germany-060524.osm.pbf build/germany-addresses.tsv
 ```
 
 Output columns:
@@ -141,7 +141,7 @@ The tool uses buffered TSV output and the `way_tags` / `relation_tags` prefilter
 Smoke validation on `data/hamburg-260524.osm.pbf`:
 
 ```sh
-./build/freestanding-linux-x86_64/osmaddresses data/hamburg-260524.osm.pbf build/hamburg-addresses-sample.tsv --limit 5
+./build/freestanding-linux-x86_64/osm-addresses data/hamburg-260524.osm.pbf build/hamburg-addresses-sample.tsv --limit 5
 ```
 
 Small bounded validation result:
@@ -170,7 +170,7 @@ output: 14 MB
 Validated on `data/brandenburg-260524.osm.pbf`:
 
 ```sh
-./build/freestanding-linux-x86_64/osmlookup data/brandenburg-260524.osm.pbf --type node --tag amenity --limit 1
+./build/freestanding-linux-x86_64/osm-lookup data/brandenburg-260524.osm.pbf --type node --tag amenity --limit 1
 ```
 
 produced a decoded node with coordinates and tags:
@@ -182,11 +182,11 @@ node 16541597 lat=52.546314700 lon=13.345599000 amenity=fuel ...
 Way and relation decoding was checked with:
 
 ```sh
-./build/freestanding-linux-x86_64/osmlookup data/brandenburg-260524.osm.pbf --type way --tag highway --limit 3
-./build/freestanding-linux-x86_64/osmlookup data/brandenburg-260524.osm.pbf --type relation --tag type=multipolygon --limit 3
+./build/freestanding-linux-x86_64/osm-lookup data/brandenburg-260524.osm.pbf --type way --tag highway --limit 3
+./build/freestanding-linux-x86_64/osm-lookup data/brandenburg-260524.osm.pbf --type relation --tag type=multipolygon --limit 3
 ```
 
-The `pbfinfo` regression check still reports the known Brandenburg/Berlin totals:
+The `pbf-info` regression check still reports the known Brandenburg/Berlin totals:
 
 ```text
 dense_node_groups: 3348
@@ -200,8 +200,8 @@ relations: 59572
 Map rendering now goes through `OSMRPK02` render packs instead of rendering directly from `.osm.pbf` files:
 
 ```sh
-./build/freestanding-linux-x86_64/osmrenderpackv2 data/brandenburg-260524.osm.pbf build/brandenburg.rpack
-./build/freestanding-linux-x86_64/osmrender-rpack build/brandenburg.rpack build/potsdam.png --city Potsdam
+./build/freestanding-linux-x86_64/pbf-to-rpack data/brandenburg-260524.osm.pbf build/brandenburg.rpack
+./build/freestanding-linux-x86_64/rpack-render build/brandenburg.rpack build/potsdam.png --city Potsdam
 ```
 
-`osmrenderpackv2` is the PBF stream consumer. It classifies renderable ways, collects the needed node coordinates, builds the place and tile directories, and writes the `.rpack`. `osmrender-rpack` reads only the pack at render time, so map output no longer requires scanning the source PBF. Render colors and stroke widths come from `styles/osmrender-default.conf` by default, or from `--style FILE`.
+`pbf-to-rpack` is the PBF stream consumer. It classifies renderable ways, collects the needed node coordinates, builds the place and tile directories, and writes the `.rpack`. `rpack-render` reads only the pack at render time, so map output no longer requires scanning the source PBF. Render colors and stroke widths come from `styles/osmrender-default.conf` by default, or from `--style FILE`.

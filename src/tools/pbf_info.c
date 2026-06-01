@@ -62,7 +62,7 @@ static int parse_uint_arg(const char *text, unsigned int *value_out) {
 int main(int argc, char **argv) {
     PbfSummary summary;
     char error[PBF_ERROR_CAPACITY];
-    const char *program = argc > 0 ? argv[0] : "pbfinfo";
+    const char *program = argc > 0 ? argv[0] : "pbf-info";
     const char *path;
     unsigned int threads = 1U;
     int argi = 1;
@@ -91,7 +91,7 @@ int main(int argc, char **argv) {
 
     error[0] = '\0';
     if (pbf_read_summary_parallel(path, threads, &summary, error, sizeof(error)) != 0) {
-        rt_write_cstr(2, "pbfinfo: ");
+        rt_write_cstr(2, "pbf-info: ");
         rt_write_cstr(2, error[0] == '\0' ? "failed to read PBF" : error);
         rt_write_char(2, '\n');
         return 1;

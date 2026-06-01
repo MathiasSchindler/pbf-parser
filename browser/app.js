@@ -129,7 +129,7 @@ async function fetchXzBytes(path, label, outputName) {
 async function ensureRouteModule() {
   if (!state.routeModule) {
     setStatus('Starting routing WebAssembly...', null);
-    state.routeModule = await createRteWalkRouteModule({
+    state.routeModule = await createRteRouteModule({
       locateFile: (path) => `wasm/${path}`,
       print: (line) => state.routeStdout.push(line),
       printErr: (line) => state.routeStderr.push(line),
@@ -147,7 +147,7 @@ async function ensureRouteModule() {
 async function ensureRenderModule() {
   if (!state.renderModule) {
     setStatus('Starting rendering WebAssembly...', null);
-    state.renderModule = await createOsmRenderRpackModule({
+    state.renderModule = await createRpackRenderModule({
       locateFile: (path) => `wasm/${path}`,
       print: (line) => state.renderStdout.push(line),
       printErr: (line) => state.renderStderr.push(line),

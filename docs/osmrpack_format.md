@@ -24,24 +24,24 @@ make
 Build a version 2 pack:
 
 ```sh
-./build/freestanding-linux-x86_64/osmrenderpackv2 [--tile-zoom N] [--tile-halo N] [--threads N] [--way-threads N] [--buildings] FILE.osm.pbf OUT.rpack
+./build/freestanding-linux-x86_64/pbf-to-rpack [--tile-zoom N] [--tile-halo N] [--threads N] [--way-threads N] [--buildings] FILE.osm.pbf OUT.rpack
 ```
 
 Inspect a pack header:
 
 ```sh
-./build/freestanding-linux-x86_64/osmrpackinfo OUT.rpack
+./build/freestanding-linux-x86_64/rpack-info OUT.rpack
 ```
 
 Render from a pack:
 
 ```sh
-./build/freestanding-linux-x86_64/osmrender-rpack OUT.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--style FILE] [--route-polyline FILE] [--exclave-insets] [--no-boundary-fade] [--png-rgb] [--profile]
+./build/freestanding-linux-x86_64/rpack-render OUT.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--style FILE] [--route-polyline FILE] [--exclave-insets] [--no-boundary-fade] [--png-rgb] [--profile]
 ```
 
 If only `--width` or only `--height` is supplied, the renderer derives the missing dimension from the resolved bbox aspect ratio. Supplying both dimensions keeps the exact requested image size.
 
-By default, `osmrender-rpack` loads `styles/osmrender-default.conf` when that file exists. Pass `--style FILE` to use another render style. Style keys are `background`, plus `STYLE.line`, `STYLE.fill`, `STYLE.casing`, `STYLE.width`, and `STYLE.casing_width` for the style names listed below.
+By default, `rpack-render` loads `styles/osmrender-default.conf` when that file exists. Pass `--style FILE` to use another render style. Style keys are `background`, plus `STYLE.line`, `STYLE.fill`, `STYLE.casing`, `STYLE.width`, and `STYLE.casing_width` for the style names listed below.
 
 `--route-polyline FILE` draws a route overlay after the normal map and optional GTFS layers. The file is a plain text polyline with one `lon,lat` WGS84 decimal-degree point per line. The overlay is rendered as a single red route stroke.
 
@@ -331,7 +331,7 @@ The string table contains the concatenated UTF-8 names referenced by place recor
 
 ## Builder Behavior
 
-`osmrenderpackv2` streams the source PBF in phases:
+`pbf-to-rpack` streams the source PBF in phases:
 
 ```text
 collect_places
@@ -372,7 +372,7 @@ All three runs produced matching high-level pack counts: `places_written=2912`, 
 
 ## Renderer Behavior
 
-`osmrender-rpack` detects `OSMRPK02` before falling back to other pack readers. For version 2 packs it:
+`rpack-render` detects `OSMRPK02` before falling back to other pack readers. For version 2 packs it:
 
 1. resolves `--bbox` directly or scans the place directory for `--city NAME`
 2. applies bbox padding for place-derived renders

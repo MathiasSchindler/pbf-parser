@@ -4219,7 +4219,7 @@ static void write_render_summary(const char *out_path, const RenderContext *cont
 }
 
 int main(int argc, char **argv) {
-    const char *program = argc > 0 ? argv[0] : "osmrender-rpack";
+    const char *program = argc > 0 ? argv[0] : "rpack-render";
     const char *pack_path;
     const char *out_path;
     const char *style_path = 0;
@@ -4347,13 +4347,13 @@ int main(int argc, char **argv) {
     }
     if (style_path == 0 && path_exists("styles/osmrender-default.conf")) style_path = "styles/osmrender-default.conf";
     if (style_path != 0 && load_style_config(style_path, &context) != 0) {
-        rt_write_cstr(2, "osmrender-rpack: could not parse style file: ");
+        rt_write_cstr(2, "rpack-render: could not parse style file: ");
         rt_write_cstr(2, style_path);
         rt_write_char(2, '\n');
         return 1;
     }
     if (!bbox_set && !context.city_enabled) {
-        rt_write_cstr(2, "osmrender-rpack: missing --bbox or --city\n");
+        rt_write_cstr(2, "rpack-render: missing --bbox or --city\n");
         return 1;
     }
     if (bbox_set && !context.city_enabled) freeze_render_viewport(&context);
@@ -4361,7 +4361,7 @@ int main(int argc, char **argv) {
     phase_start_ns = platform_get_monotonic_time_ns();
     v2_header_result = read_v2_header_path(pack_path, &v2_header);
     if (v2_header_result < 0) {
-        rt_write_cstr(2, "osmrender-rpack: could not read pack header\n");
+        rt_write_cstr(2, "rpack-render: could not read pack header\n");
         return 1;
     }
     if (v2_header_result > 0) {
@@ -4372,14 +4372,14 @@ int main(int argc, char **argv) {
         phase_start_ns = platform_get_monotonic_time_ns();
         fd = platform_open_read(pack_path);
         if (fd < 0) {
-            rt_write_cstr(2, "osmrender-rpack: could not open pack\n");
+            rt_write_cstr(2, "rpack-render: could not open pack\n");
             return 1;
         }
         if (context.city_enabled) {
             int place_bbox_result = apply_v2_place_bbox(fd, &v2_header, &context);
             if (place_bbox_result < 0) {
                 (void)platform_close(fd);
-                rt_write_cstr(2, "osmrender-rpack: failed while resolving v2 place bbox\n");
+                rt_write_cstr(2, "rpack-render: failed while resolving v2 place bbox\n");
                 return 1;
             }
             if (place_bbox_result > 0 && render_bbox_is_valid(&context)) bbox_set = 1;
@@ -4388,14 +4388,14 @@ int main(int argc, char **argv) {
             int viewport_result = compute_v2_boundary_viewports(&context, fd);
             if (viewport_result < 0) {
                 (void)platform_close(fd);
-                rt_write_cstr(2, "osmrender-rpack: failed while resolving boundary viewports\n");
+                rt_write_cstr(2, "rpack-render: failed while resolving boundary viewports\n");
                 return 1;
             }
             if (viewport_result > 0 && render_bbox_is_valid(&context)) bbox_set = 1;
         }
         if (!bbox_set) {
             (void)platform_close(fd);
-            rt_write_cstr(2, "osmrender-rpack: could not resolve city bbox\n");
+            rt_write_cstr(2, "rpack-render: could not resolve city bbox\n");
             return 1;
         }
         if (!context.view_frozen) freeze_render_viewport(&context);
@@ -4404,7 +4404,7 @@ int main(int argc, char **argv) {
         phase_start_ns = platform_get_monotonic_time_ns();
         if (fill_background(&context) != 0) {
             (void)platform_close(fd);
-            rt_write_cstr(2, "osmrender-rpack: could not allocate framebuffer\n");
+            rt_write_cstr(2, "rpack-render: could not allocate framebuffer\n");
             return 1;
         }
         fill_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
@@ -4412,7 +4412,7 @@ int main(int argc, char **argv) {
         if (collect_visible_features_v2(fd, &v2_header, &context, &selected_tile_count, &selected_tile_features) != 0) {
             rt_free(context.pixels);
             (void)platform_close(fd);
-            rt_write_cstr(2, "osmrender-rpack: failed while collecting visible v2 pack features\n");
+            rt_write_cstr(2, "rpack-render: failed while collecting visible v2 pack features\n");
             return 1;
         }
         collect_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
@@ -4422,7 +4422,7 @@ int main(int argc, char **argv) {
             rt_free(context.points);
             rt_free(context.pixels);
             (void)platform_close(fd);
-            rt_write_cstr(2, "osmrender-rpack: failed while collecting city boundary\n");
+            rt_write_cstr(2, "rpack-render: failed while collecting city boundary\n");
             return 1;
         }
         boundary_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
@@ -4433,7 +4433,7 @@ int main(int argc, char **argv) {
             rt_free(context.points);
             rt_free(context.pixels);
             (void)platform_close(fd);
-            rt_write_cstr(2, "osmrender-rpack: failed while rendering exclave insets\n");
+            rt_write_cstr(2, "rpack-render: failed while rendering exclave insets\n");
             return 1;
         }
         if (render_gtfs_overlay(&context) != 0) {
@@ -4441,7 +4441,7 @@ int main(int argc, char **argv) {
             rt_free(context.points);
             rt_free(context.pixels);
             (void)platform_close(fd);
-            rt_write_cstr(2, "osmrender-rpack: failed while rendering GTFS overlay\n");
+            rt_write_cstr(2, "rpack-render: failed while rendering GTFS overlay\n");
             return 1;
         }
         if (render_route_polyline_overlay(&context) != 0) {
@@ -4449,7 +4449,7 @@ int main(int argc, char **argv) {
             rt_free(context.points);
             rt_free(context.pixels);
             (void)platform_close(fd);
-            rt_write_cstr(2, "osmrender-rpack: failed while rendering route overlay\n");
+            rt_write_cstr(2, "rpack-render: failed while rendering route overlay\n");
             return 1;
         }
         draw_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
@@ -4460,7 +4460,7 @@ int main(int argc, char **argv) {
             rt_free(context.features);
             rt_free(context.points);
             rt_free(context.pixels);
-            rt_write_cstr(2, "osmrender-rpack: could not write PNG\n");
+            rt_write_cstr(2, "rpack-render: could not write PNG\n");
             return 1;
         }
         png_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
@@ -4473,17 +4473,17 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (osmrpack_read_header(pack_path, &pack_header, error, sizeof(error)) != 0) {
-        rt_write_cstr(2, "osmrender-rpack: ");
+        rt_write_cstr(2, "rpack-render: ");
         rt_write_cstr(2, error[0] == '\0' ? "could not read pack" : error);
         rt_write_char(2, '\n');
         return 1;
     }
     if (pack_header.tile_count == 0ULL || pack_header.feature_data_size == 0ULL) {
-        rt_write_cstr(2, "osmrender-rpack: pack contains no render tiles yet\n");
+        rt_write_cstr(2, "rpack-render: pack contains no render tiles yet\n");
         return 2;
     }
     if (!bbox_set) {
-        rt_write_cstr(2, "osmrender-rpack: could not resolve city bbox\n");
+        rt_write_cstr(2, "rpack-render: could not resolve city bbox\n");
         return 1;
     }
     if (!context.view_frozen) freeze_render_viewport(&context);
@@ -4492,19 +4492,19 @@ int main(int argc, char **argv) {
     phase_start_ns = platform_get_monotonic_time_ns();
     fd = platform_open_read(pack_path);
     if (fd < 0) {
-        rt_write_cstr(2, "osmrender-rpack: could not open pack\n");
+        rt_write_cstr(2, "rpack-render: could not open pack\n");
         return 1;
     }
     if (platform_seek(fd, (long long)pack_header.tile_directory_offset, PLATFORM_SEEK_SET) < 0 || osmrpack_read_tile_record_fd(fd, &tile_record) != 0) {
         (void)platform_close(fd);
-        rt_write_cstr(2, "osmrender-rpack: could not read tile directory\n");
+        rt_write_cstr(2, "rpack-render: could not read tile directory\n");
         return 1;
     }
     open_tile_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
     phase_start_ns = platform_get_monotonic_time_ns();
     if (fill_background(&context) != 0) {
         (void)platform_close(fd);
-        rt_write_cstr(2, "osmrender-rpack: could not allocate framebuffer\n");
+        rt_write_cstr(2, "rpack-render: could not allocate framebuffer\n");
         return 1;
     }
     fill_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
@@ -4512,7 +4512,7 @@ int main(int argc, char **argv) {
     if (collect_visible_features(fd, &pack_header, &context) != 0) {
         rt_free(context.pixels);
         (void)platform_close(fd);
-        rt_write_cstr(2, "osmrender-rpack: failed while collecting visible pack features\n");
+        rt_write_cstr(2, "rpack-render: failed while collecting visible pack features\n");
         return 1;
     }
     collect_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
@@ -4524,7 +4524,7 @@ int main(int argc, char **argv) {
         rt_free(context.points);
         rt_free(context.pixels);
         (void)platform_close(fd);
-        rt_write_cstr(2, "osmrender-rpack: failed while rendering GTFS overlay\n");
+        rt_write_cstr(2, "rpack-render: failed while rendering GTFS overlay\n");
         return 1;
     }
     if (render_route_polyline_overlay(&context) != 0) {
@@ -4532,7 +4532,7 @@ int main(int argc, char **argv) {
         rt_free(context.points);
         rt_free(context.pixels);
         (void)platform_close(fd);
-        rt_write_cstr(2, "osmrender-rpack: failed while rendering route overlay\n");
+        rt_write_cstr(2, "rpack-render: failed while rendering route overlay\n");
         return 1;
     }
     draw_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;
@@ -4541,7 +4541,7 @@ int main(int argc, char **argv) {
     phase_start_ns = platform_get_monotonic_time_ns();
     if (write_png(out_path, &context) != 0) {
         rt_free(context.pixels);
-        rt_write_cstr(2, "osmrender-rpack: could not write PNG\n");
+        rt_write_cstr(2, "rpack-render: could not write PNG\n");
         return 1;
     }
     png_elapsed_ms = (platform_get_monotonic_time_ns() - phase_start_ns) / 1000000ULL;

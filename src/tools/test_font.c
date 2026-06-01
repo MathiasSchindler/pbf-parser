@@ -22,7 +22,7 @@ static int parse_codepoint(const char *text, unsigned int *codepoint_out) {
 }
 
 int main(int argc, char **argv) {
-    const char *program = argc > 0 ? argv[0] : "fonttest";
+    const char *program = argc > 0 ? argv[0] : "test-font";
     FrFont *font = 0;
     const FrGlyph *glyph;
     unsigned int codepoint = 'A';
@@ -45,12 +45,12 @@ int main(int argc, char **argv) {
     }
     pixel_size = (int)size_value;
     if (fontrender_runtime_install() != 0 || fr_font_open(&font, argv[1]) != 0) {
-        rt_write_cstr(2, "fonttest: could not open font\n");
+        rt_write_cstr(2, "test-font: could not open font\n");
         return 1;
     }
     glyph = fr_font_get_glyph(font, codepoint, pixel_size, 0U);
     if (glyph == 0) {
-        rt_write_cstr(2, "fonttest: could not render glyph\n");
+        rt_write_cstr(2, "test-font: could not render glyph\n");
         fr_font_close(font);
         return 1;
     }

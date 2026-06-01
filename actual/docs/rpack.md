@@ -1,6 +1,6 @@
 # RPACK Render Pack Format
 
-Status: future stable-format design. This is not the `.rpack` format currently written by the repository tools. The active implemented render-pack format is `OSMRPK02`, documented in `../../docs/osmrpack_format.md`, built by `../../src/tools/osmrenderpackv2.c`, and rendered by `../../src/tools/osmrender_rpack.c`.
+Status: future stable-format design. This is not the `.rpack` format currently written by the repository tools. The active implemented render-pack format is `OSMRPK02`, documented in `../../docs/osmrpack_format.md`, built by `../../src/tools/pbf_to_rpack.c`, and rendered by `../../src/tools/rpack_render.c`.
 
 `RPACK` is a binary, seekable, tile-oriented map render format built from OpenStreetMap PBF source data. It is optimized for fast repeated rendering in native tools, servers, and browser runtimes where a renderer should open a small set of directories and then read only the map payloads required for the requested viewport.
 

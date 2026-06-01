@@ -432,7 +432,7 @@ static void json_write_cstr_escaped(int fd, const char *text) {
 
 static void json_event_begin(RteOutput *output, int fd, const char *event) {
     output->json_seq += 1ULL;
-    rt_write_cstr(fd, "{\"schema\":\"newos.tool.v1\",\"tool\":\"rtewalkroute\",\"stream\":\"");
+    rt_write_cstr(fd, "{\"schema\":\"newos.tool.v1\",\"tool\":\"rte-route\",\"stream\":\"");
     rt_write_cstr(fd, fd == 2 ? "stderr" : "stdout");
     rt_write_cstr(fd, "\",\"event\":");
     json_write_cstr_escaped(fd, event);
@@ -2183,7 +2183,7 @@ static int render_route_map(
     update_bbox_e7(to->record.lat_e7, to->record.lon_e7, &min_lat, &min_lon, &max_lat, &max_lon);
     for (index = 0U; index < path_count; ++index) update_bbox_e7(graph->nodes[path[index]].lat_e7, graph->nodes[path[index]].lon_e7, &min_lat, &min_lon, &max_lat, &max_lon);
     if (build_bbox_arg(min_lat, min_lon, max_lat, max_lon, bbox_arg, sizeof(bbox_arg)) != 0 ||
-        path_join_sibling_tool(program, "osmrender-rpack", renderer_path, sizeof(renderer_path)) != 0 ||
+        path_join_sibling_tool(program, "rpack-render", renderer_path, sizeof(renderer_path)) != 0 ||
         derive_temp_polyline_path(output->map_path, temp_path, sizeof(temp_path)) != 0 ||
         (output->json && derive_temp_render_log_path(output->map_path, render_log_path, sizeof(render_log_path)) != 0)) {
         rt_free(path);
@@ -2193,7 +2193,7 @@ static int render_route_map(
     if (rpack_path == 0) {
         rt_free(path);
         if (output->json) json_diagnostic(output, "error", "--map needs --rpack FILE.rpack; no default render pack was found", 0);
-        else rt_write_cstr(2, "rtewalkroute: --map needs --rpack FILE.rpack; no default render pack was found\n");
+        else rt_write_cstr(2, "rte-route: --map needs --rpack FILE.rpack; no default render pack was found\n");
         return -1;
     }
     if (address_fields_equal(strings, strings_size, from->record.city_offset, from->record.city_size, to->record.city_offset, to->record.city_size) &&
@@ -2255,7 +2255,7 @@ static int render_route_map(
             json_write_cstr_escaped(1, output->map_path);
             rt_write_cstr(1, "}}\n");
         } else {
-            rt_write_cstr(2, "rtewalkroute: map renderer failed\n");
+            rt_write_cstr(2, "rte-route: map renderer failed\n");
         }
         return -1;
     }
@@ -2312,13 +2312,13 @@ static int render_route_map(
     (void)to;
     (void)strings;
     (void)strings_size;
-    rt_write_cstr(2, "rtewalkroute: --map is currently implemented for the macOS freestanding build\n");
+    rt_write_cstr(2, "rte-route: --map is currently implemented for the macOS freestanding build\n");
     return -1;
 #endif
 }
 
 int main(int argc, char **argv) {
-    const char *program = argc > 0 ? argv[0] : "rtewalkroute";
+    const char *program = argc > 0 ? argv[0] : "rte-route";
     const char *path;
     const char *from_query;
     const char *to_query;
@@ -2379,32 +2379,32 @@ int main(int argc, char **argv) {
     if (output.json) output.use_color = 0;
 
     fd = platform_open_read(path);
-    if (fd < 0) { if (output.json) json_diagnostic(&output, "error", "could not open route pack", path); else rt_write_cstr(2, "rtewalkroute: could not open route pack\n"); return 1; }
+    if (fd < 0) { if (output.json) json_diagnostic(&output, "error", "could not open route pack", path); else rt_write_cstr(2, "rte-route: could not open route pack\n"); return 1; }
     if (read_exact(fd, header_bytes, sizeof(header_bytes)) != 0 || parse_header(header_bytes, &header) != 0 || read_sections(fd, &header, &address_section, &transit_section) != 0) {
         (void)platform_close(fd);
         if (output.json) json_diagnostic(&output, "error", "invalid or unsupported route pack", path);
-        else rt_write_cstr(2, "rtewalkroute: invalid or unsupported route pack\n");
+        else rt_write_cstr(2, "rte-route: invalid or unsupported route pack\n");
         return 1;
     }
     if (!output.have_depart && !output.have_arrive && transit_section.present && set_depart_now(&output) != 0) {
         if (output.json) json_diagnostic(&output, "warning", "could not determine current departure time", 0);
-        else rt_write_cstr(2, "rtewalkroute: could not determine current departure time; transit suggestions unavailable\n");
+        else rt_write_cstr(2, "rte-route: could not determine current departure time; transit suggestions unavailable\n");
     }
     if (!address_section.present || read_address_strings(fd, &address_section, &strings, &strings_size) != 0) {
         (void)platform_close(fd);
         if (output.json) json_diagnostic(&output, "error", "route pack has no readable address section", path);
-        else rt_write_cstr(2, "rtewalkroute: route pack has no readable address section\n");
+        else rt_write_cstr(2, "rte-route: route pack has no readable address section\n");
         return 1;
     }
     if ((output.have_depart || output.have_arrive) && (!transit_section.present || read_transit_section(fd, &transit_section, &transit_store) != 0)) {
         if (output.json) json_diagnostic(&output, "warning", "route pack has no readable GTFS transit section", path);
-        else rt_write_cstr(2, "rtewalkroute: route pack has no readable GTFS transit section; transit suggestions unavailable\n");
+        else rt_write_cstr(2, "rte-route: route pack has no readable GTFS transit section; transit suggestions unavailable\n");
     }
     if (resolve_query(fd, &header, &address_section, from_query, strings, strings_size, &from) != 0 || resolve_query(fd, &header, &address_section, to_query, strings, strings_size, &to) != 0) {
         rt_free(strings);
         (void)platform_close(fd);
         if (output.json) json_diagnostic(&output, "error", "address lookup failed", 0);
-        else rt_write_cstr(2, "rtewalkroute: address lookup failed\n");
+        else rt_write_cstr(2, "rte-route: address lookup failed\n");
         return 1;
     }
 

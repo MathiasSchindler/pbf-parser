@@ -26,18 +26,18 @@ The x86_64 clone entry shim is in `src/arch/x86_64/linux/syscall_stubs.S`; it st
 Build and run:
 
 ```sh
-make threadtest
-./build/freestanding-linux-x86_64/threadtest
-./build/freestanding-linux-x86_64/threadtest 16
-./build/freestanding-linux-x86_64/threadtest 24
+make test-thread
+./build/freestanding-linux-x86_64/test-thread
+./build/freestanding-linux-x86_64/test-thread 16
+./build/freestanding-linux-x86_64/test-thread 24
 ```
 
 The test starts worker threads, uses the mutex to update a shared counter, joins each thread, validates each return value, and checks the final counter. Optional arguments are `workers` and `iterations`; the defaults are 4 workers and 25,000 iterations per worker. The worker limit is 256.
 
-`pbfinfo` can use the same threading layer for parallel PBF fileblock inflation and parsing:
+`pbf-info` can use the same threading layer for parallel PBF fileblock inflation and parsing:
 
 ```sh
-./build/freestanding-linux-x86_64/pbfinfo --threads 16 data/germany-060524.osm.pbf
+./build/freestanding-linux-x86_64/pbf-info --threads 16 data/germany-060524.osm.pbf
 ```
 
 The reader stays serial and feeds a bounded queue. Worker threads decode and parse independent fileblocks, then merge per-worker summaries.
@@ -62,10 +62,10 @@ Useful experiments:
 - Stack-backed zlib Huffman tables reduced allocator traffic and improved Germany `--threads 8` from about 8.35s to about 7.78s.
 - One slot per worker reduced memory use, but did not beat two slots per worker on Germany.
 
-`osmrenderpackv2` also uses the threaded PBF fileblock stream for selected entity phases:
+`pbf-to-rpack` also uses the threaded PBF fileblock stream for selected entity phases:
 
 ```sh
-./build/freestanding-linux-x86_64/osmrenderpackv2 --tile-zoom 10 --threads 8 data/brandenburg-260524.osm.pbf build/brandenburg.rpack
+./build/freestanding-linux-x86_64/pbf-to-rpack --tile-zoom 10 --threads 8 data/brandenburg-260524.osm.pbf build/brandenburg.rpack
 ```
 
 `--threads` controls the node-coordinate collection pass. That pass scales well because workers decode dense nodes independently, probe a shared read-only node hash, and merge only source-node counters. On Brandenburg at tile zoom 10, `collect_nodes` dropped from 6419 ms with `--threads 1` to 943 ms with `--threads 8`, and full conversion dropped from 17.97s to 12.38s.

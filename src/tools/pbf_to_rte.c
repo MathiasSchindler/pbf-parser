@@ -2889,7 +2889,7 @@ static int write_route_pack(
 }
 
 int main(int argc, char **argv) {
-    const char *program = argc > 0 ? argv[0] : "osmroutepack";
+    const char *program = argc > 0 ? argv[0] : "pbf-to-rte";
     const char *pbf_path;
     const char *output_path;
     const char *gtfs_path = 0;
@@ -2944,45 +2944,45 @@ int main(int argc, char **argv) {
 
     error[0] = '\0';
     if (pbf_read_summary_parallel(pbf_path, threads, &summary, error, sizeof(error)) != 0) {
-        rt_write_cstr(2, "osmroutepack: ");
+        rt_write_cstr(2, "pbf-to-rte: ");
         rt_write_cstr(2, error[0] == '\0' ? "failed to read PBF summary" : error);
         rt_write_char(2, '\n');
         return 1;
     }
     error[0] = '\0';
     if (collect_bounds(pbf_path, &bounds, error, sizeof(error)) != 0) {
-        rt_write_cstr(2, "osmroutepack: ");
+        rt_write_cstr(2, "pbf-to-rte: ");
         rt_write_cstr(2, error[0] == '\0' ? "failed to scan PBF bounds" : error);
         rt_write_char(2, '\n');
         return 1;
     }
     error[0] = '\0';
     if (collect_tiles(pbf_path, &tile_store, &bounds, tile_size_m, error, sizeof(error)) != 0) {
-        rt_write_cstr(2, "osmroutepack: ");
+        rt_write_cstr(2, "pbf-to-rte: ");
         rt_write_cstr(2, error[0] == '\0' ? "failed to collect route tiles" : error);
         rt_write_char(2, '\n');
         return 1;
     }
     error[0] = '\0';
     if (collect_walking_graph(pbf_path, &tile_store, &bounds, tile_size_m, error, sizeof(error)) != 0) {
-        rt_write_cstr(2, "osmroutepack: ");
+        rt_write_cstr(2, "pbf-to-rte: ");
         rt_write_cstr(2, error[0] == '\0' ? "failed to collect walking graph" : error);
         rt_write_char(2, '\n');
         return 1;
     }
     error[0] = '\0';
     if (collect_addresses(pbf_path, &address_store, &tile_store, &bounds, tile_size_m, error, sizeof(error)) != 0) {
-        rt_write_cstr(2, "osmroutepack: ");
+        rt_write_cstr(2, "pbf-to-rte: ");
         rt_write_cstr(2, error[0] == '\0' ? "failed to collect addresses" : error);
         rt_write_char(2, '\n');
         return 1;
     }
     if (gtfs_path != 0 && collect_transit(gtfs_path, &transit_store, &tile_store, &bounds, tile_size_m) != 0) {
-        rt_write_cstr(2, "osmroutepack: failed to collect GTFS data\n");
+        rt_write_cstr(2, "pbf-to-rte: failed to collect GTFS data\n");
         return 1;
     }
     if (write_route_pack(output_path, &summary, &bounds, &tile_store, &address_store, &transit_store, tile_size_m) != 0) {
-        rt_write_cstr(2, "osmroutepack: failed to write output route pack\n");
+        rt_write_cstr(2, "pbf-to-rte: failed to write output route pack\n");
         return 1;
     }
 

@@ -448,7 +448,7 @@ static int on_relation(void *user, const PbfRelation *relation) {
 }
 
 int main(int argc, char **argv) {
-    const char *program = argc > 0 ? argv[0] : "osmlookup";
+    const char *program = argc > 0 ? argv[0] : "osm-lookup";
     const char *path;
     OsmLookupContext context;
     PbfStreamCallbacks callbacks;
@@ -534,12 +534,12 @@ int main(int argc, char **argv) {
     }
 
     if (((context.show_geometry || context.has_bbox) && (context.types & OSMLOOKUP_TYPE_WAY) != 0U) && context.node_index_path == 0) {
-        rt_write_cstr(2, "osmlookup: way bbox and geometry output require --node-index\n");
+        rt_write_cstr(2, "osm-lookup: way bbox and geometry output require --node-index\n");
         return 1;
     }
     if (context.node_index_path != 0) {
         if (osm_node_index_open(&context.node_index, context.node_index_path, context.error, sizeof(context.error)) != 0) {
-            rt_write_cstr(2, "osmlookup: ");
+            rt_write_cstr(2, "osm-lookup: ");
             rt_write_cstr(2, context.error[0] == '\0' ? "could not open node index" : context.error);
             rt_write_char(2, '\n');
             return 1;
@@ -553,14 +553,14 @@ int main(int argc, char **argv) {
     error[0] = '\0';
     if (pbf_stream_entities(path, &callbacks, &context, error, sizeof(error)) != 0) {
         if (context.node_index_open) osm_node_index_close(&context.node_index);
-        rt_write_cstr(2, "osmlookup: ");
+        rt_write_cstr(2, "osm-lookup: ");
         rt_write_cstr(2, error[0] == '\0' ? "failed to read PBF" : error);
         rt_write_char(2, '\n');
         return 1;
     }
     if (context.failed) {
         if (context.node_index_open) osm_node_index_close(&context.node_index);
-        rt_write_cstr(2, "osmlookup: ");
+        rt_write_cstr(2, "osm-lookup: ");
         rt_write_cstr(2, context.error[0] == '\0' ? "node index lookup failed" : context.error);
         rt_write_char(2, '\n');
         return 1;

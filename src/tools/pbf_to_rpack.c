@@ -1586,7 +1586,7 @@ fail_buffered:
 }
 
 int main(int argc, char **argv) {
-    const char *program = argc > 0 ? argv[0] : "osmrenderpackv2";
+    const char *program = argc > 0 ? argv[0] : "pbf-to-rpack";
     const char *pbf_path;
     const char *pack_path;
     int argi = 1;
@@ -1658,7 +1658,7 @@ int main(int argc, char **argv) {
     callbacks.relation = v2_on_relation;
     error[0] = '\0';
     if (pbf_stream_entities(pbf_path, &callbacks, &context, error, sizeof(error)) != 0 || context.failed) {
-        rt_write_cstr(2, "osmrenderpackv2: ");
+        rt_write_cstr(2, "pbf-to-rpack: ");
         rt_write_cstr(2, context.failed ? "out of memory while collecting places" : (error[0] == '\0' ? "could not collect places" : error));
         rt_write_char(2, '\n');
         return 1;
@@ -1683,7 +1683,7 @@ int main(int argc, char **argv) {
         options.destroy_worker = v2_way_worker_destroy;
         options.shared_user = &context;
         if (pbf_stream_entities_parallel(pbf_path, context.way_worker_count, &options, error, sizeof(error)) != 0 || context.failed || context.pack.failed) {
-            rt_write_cstr(2, "osmrenderpackv2: ");
+            rt_write_cstr(2, "pbf-to-rpack: ");
             rt_write_cstr(2, (context.failed || context.pack.failed) ? "out of memory while collecting ways" : (error[0] == '\0' ? "could not collect ways" : error));
             rt_write_char(2, '\n');
             return 1;
@@ -1693,11 +1693,11 @@ int main(int argc, char **argv) {
     rt_write_cstr(1, "phase: build_node_lookup\n");
     phase_start_ns = platform_get_monotonic_time_ns();
     if (v2_build_unique_nodes(&context.pack) != 0) {
-        rt_write_cstr(2, "osmrenderpackv2: out of memory while building node lookup\n");
+        rt_write_cstr(2, "pbf-to-rpack: out of memory while building node lookup\n");
         return 1;
     }
     if (build_node_hash(&context.pack) != 0) {
-        rt_write_cstr(2, "osmrenderpackv2: out of memory while building node hash\n");
+        rt_write_cstr(2, "pbf-to-rpack: out of memory while building node hash\n");
         return 1;
     }
     v2_write_phase_elapsed("build_node_lookup", phase_start_ns);
@@ -1717,7 +1717,7 @@ int main(int argc, char **argv) {
         options.merge_worker = v2_node_worker_merge;
         options.shared_user = &context;
         if (pbf_stream_entities_parallel(pbf_path, context.node_worker_count, &options, error, sizeof(error)) != 0) {
-            rt_write_cstr(2, "osmrenderpackv2: ");
+            rt_write_cstr(2, "pbf-to-rpack: ");
             rt_write_cstr(2, error[0] == '\0' ? "could not collect node coordinates" : error);
             rt_write_char(2, '\n');
             return 1;
@@ -1727,7 +1727,7 @@ int main(int argc, char **argv) {
     rt_write_cstr(1, "phase: assign_tiles\n");
     phase_start_ns = platform_get_monotonic_time_ns();
     if (v2_compute_places(&context) != 0 || v2_materialize_features_and_assign_tiles(&context) != 0) {
-        rt_write_cstr(2, "osmrenderpackv2: could not materialize v2 tile data\n");
+        rt_write_cstr(2, "pbf-to-rpack: could not materialize v2 tile data\n");
         return 1;
     }
     v2_write_phase_elapsed("assign_tiles", phase_start_ns);
@@ -1735,7 +1735,7 @@ int main(int argc, char **argv) {
     rt_write_cstr(1, "phase: write_pack\n");
     phase_start_ns = platform_get_monotonic_time_ns();
     if (v2_write_pack(pack_path, &context, elapsed_ms) != 0) {
-        rt_write_cstr(2, "osmrenderpackv2: could not write rpack v2\n");
+        rt_write_cstr(2, "pbf-to-rpack: could not write rpack v2\n");
         return 1;
     }
     v2_write_phase_elapsed("write_pack", phase_start_ns);
