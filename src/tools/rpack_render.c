@@ -405,13 +405,13 @@ static void choose_missing_dimension(RenderContext *context, int width_explicit,
     unsigned long long lat_span;
     unsigned long long scaled_lon_span;
 
-    if (width_explicit == height_explicit) return;
+    if (width_explicit && height_explicit) return;
     if (render_max_lon_nano(context) <= render_min_lon_nano(context) || render_max_lat_nano(context) <= render_min_lat_nano(context)) return;
     lon_span = (unsigned long long)(render_max_lon_nano(context) - render_min_lon_nano(context));
     lat_span = (unsigned long long)(render_max_lat_nano(context) - render_min_lat_nano(context));
     scaled_lon_span = (lon_span * 3ULL + 2ULL) / 5ULL;
     if (scaled_lon_span == 0ULL) scaled_lon_span = 1ULL;
-    if (width_explicit) {
+    if (width_explicit || !height_explicit) {
         unsigned long long height = (lat_span * (unsigned long long)context->width + scaled_lon_span / 2ULL) / scaled_lon_span;
         context->height = clamp_dimension(height);
     } else {

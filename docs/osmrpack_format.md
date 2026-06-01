@@ -39,7 +39,7 @@ Render from a pack:
 ./build/freestanding-linux-x86_64/rpack-render OUT.rpack OUT.png (--bbox MINLON,MINLAT,MAXLON,MAXLAT | --city NAME) [--width N] [--height N] [--style FILE] [--route-polyline FILE] [--exclave-insets] [--no-boundary-fade] [--png-rgb] [--profile]
 ```
 
-If only `--width` or only `--height` is supplied, the renderer derives the missing dimension from the resolved bbox aspect ratio. Supplying both dimensions keeps the exact requested image size.
+If neither `--width` nor `--height` is supplied, the renderer uses its default width and derives height from the resolved bbox aspect ratio. If only `--width` or only `--height` is supplied, the renderer derives the missing dimension from that same aspect ratio. Supplying both dimensions keeps the exact requested image size, even when that stretches the map.
 
 By default, `rpack-render` loads `styles/osmrender-default.conf` when that file exists. Pass `--style FILE` to use another render style. Style keys are `background`, plus `STYLE.line`, `STYLE.fill`, `STYLE.casing`, `STYLE.width`, and `STYLE.casing_width` for the style names listed below.
 

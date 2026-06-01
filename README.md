@@ -92,7 +92,7 @@ For map rendering, build a render pack once and render from it:
 ./build/freestanding-linux-x86_64/rpack-render build/germany.rpack city.png --city Berlin --width 1600 --height 1200 --profile
 ```
 
-`rpack-render` renders directly from the pack-contained place directory, tile payloads, and embedded per-place boundary payloads. It loads `styles/osmrender-default.conf` when present, and `--style FILE` can override the map colors and stroke widths for one render. For `--city`, it draws the matching administrative boundary and fades pixels outside it from the `.rpack` data; distant exclave components are excluded from the default viewport and can be shown with `--exclave-insets`. A route overlay can be drawn with `--route-polyline FILE`, where the file contains one `lon,lat` point per line. The pack format is documented in `docs/osmrpack_format.md`.
+`rpack-render` renders directly from the pack-contained place directory, tile payloads, and embedded per-place boundary payloads. It loads `styles/osmrender-default.conf` when present, and `--style FILE` can override the map colors and stroke widths for one render. When no dimensions are supplied, or when only `--width` or `--height` is supplied, it derives the missing image size from the resolved map aspect ratio. For `--city`, it draws the matching administrative boundary and fades pixels outside it from the `.rpack` data; distant exclave components are excluded from the default viewport and can be shown with `--exclave-insets`. A route overlay can be drawn with `--route-polyline FILE`, where the file contains one `lon,lat` point per line. The pack format is documented in `docs/osmrpack_format.md`.
 
 ## Routing
 
@@ -120,9 +120,9 @@ Inspect a generated route pack:
 make -B build/freestanding-macos-arm64/rte-info
 build/freestanding-macos-arm64/rte-info build/brandenburg-tiles.rte --sections
 build/freestanding-macos-arm64/rte-info build/brandenburg-tiles.rte \
-	--address "Friedrich-Engels-Strasse 22"
+	--address "Friedrich-Engels-Straße 22"
 build/freestanding-macos-arm64/rte-info build/brandenburg-tiles.rte \
-	--address "Hermann-Mattern-Promenade 25, Potsdam"
+	--address "Friedrich-Ebert-Straße 4, Potsdam"
 build/freestanding-macos-arm64/rte-info build/brandenburg-tiles.rte \
 	--tile 52.3906,13.0645
 ```
@@ -135,7 +135,7 @@ The first route-pack walking CLI resolves endpoints from `.rte` data:
 make -B build/freestanding-macos-arm64/rte-route
 build/freestanding-macos-arm64/rte-route data/brandenburg.rte \
 	"Friedrich-Engels-Straße 22, Potsdam" \
-	"Hermann-Mattern-Promenade 25, Potsdam"
+	"Friedrich-Ebert-Straße 4, Potsdam"
 ```
 
 When the pack was built with GTFS, `rte-route` also asks for a single public-transport leg with walking access at both ends. If neither `--depart` nor `--arrive` is provided, the query uses the current time as `--depart now`:
@@ -143,7 +143,7 @@ When the pack was built with GTFS, `rte-route` also asks for a single public-tra
 ```sh
 build/freestanding-macos-arm64/rte-route build/brandenburg-gtfs.rte \
 	"Friedrich-Engels-Straße 22, Potsdam" \
-	"Hermann-Mattern-Promenade 25, Potsdam" \
+	"Friedrich-Ebert-Straße 4, Potsdam" \
 	--depart 2026-05-27T11:00
 ```
 
@@ -156,7 +156,7 @@ Use `--json` to emit newline-delimited JSON events instead of the human/key-valu
 ```sh
 build/freestanding-macos-arm64/rte-route data/brandenburg.rte \
 	"Friedrich-Engels-Straße 22, Potsdam" \
-	"Hermann-Mattern-Promenade 25, Potsdam" \
+	"Friedrich-Ebert-Straße 4, Potsdam" \
 	--json
 ```
 
@@ -165,7 +165,7 @@ The macOS route CLI can also render a PNG map for a successful route:
 ```sh
 build/freestanding-macos-arm64/rte-route data/brandenburg.rte \
 	"Friedrich-Engels-Straße 22, Potsdam" \
-	"Hermann-Mattern-Promenade 25, Potsdam" \
+	"Friedrich-Ebert-Straße 4, Potsdam" \
 	--map build/route.png
 ```
 
