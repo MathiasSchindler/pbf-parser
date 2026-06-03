@@ -1,8 +1,11 @@
 CC := gcc-16
+HOST_CXX ?= g++
+NVCC ?= nvcc
 OS := linux
 ARCH := x86_64
 .DEFAULT_GOAL := all
 BUILD_DIR := build/freestanding-$(OS)-$(ARCH)
+CUDA_BUILD_DIR := build/cuda-$(OS)-$(ARCH)
 MAKE_JOBS ?= $(shell nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
 ifeq ($(filter -j%,$(MAKEFLAGS)),)
 MAKEFLAGS += -j$(MAKE_JOBS)
@@ -16,6 +19,8 @@ MACOS_SDKROOT := $(shell xcrun --sdk macosx --show-sdk-path 2>/dev/null)
 # headers, no C runtime startup files, no libc link, and no dynamic loader.
 CFLAGS := -std=c11 -Os -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fdata-sections -ffunction-sections -fno-asynchronous-unwind-tables -fno-unwind-tables -nostdinc -Isrc/shared -Isrc/shared/fontrender -Isrc/platform/linux -Isrc/platform/common -DNEWOS_DISABLE_STACK_GUARD_INIT -DFR_RASTER_DISABLE_SIMD
 LDFLAGS := -nostdlib -static -no-pie -Wl,--gc-sections
+HOST_CXXFLAGS := -std=c++17 -O2 -D_FILE_OFFSET_BITS=64 -Isrc/tools
+NVCCFLAGS := -std=c++17 -O2 -D_FILE_OFFSET_BITS=64 -Isrc/tools
 MACOS_CFLAGS := -target arm64-apple-macos11 -std=c11 -Os -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fdata-sections -ffunction-sections -fno-asynchronous-unwind-tables -fno-unwind-tables -nostdinc -Isrc/shared -Isrc/shared/fontrender -Isrc/platform/macos -Isrc/platform/common -Isrc/arch/aarch64/macos -DNEWOS_DISABLE_STACK_GUARD_INIT -DFR_RASTER_DISABLE_SIMD
 MACOS_LDFLAGS := -nostdlib -Wl,-syslibroot,$(MACOS_SDKROOT) -Wl,-e,_start -Wl,-dead_strip -lSystem
 
@@ -185,7 +190,7 @@ LINUX_TOOLS := \
 	$(BUILD_DIR)/test-thread \
 	$(BUILD_DIR)/test-font
 
-.PHONY: all clean check-static test-thread macos-rpack-tools macos-test-thread
+.PHONY: all clean check-static test-thread macos-rpack-tools macos-test-thread rte-gpu-tools
 
 all: $(LINUX_TOOLS)
 
@@ -209,6 +214,20 @@ $(BUILD_DIR):
 
 $(MACOS_BUILD_DIR):
 	mkdir -p $@
+
+$(CUDA_BUILD_DIR):
+	mkdir -p $@
+
+rte-gpu-tools: $(CUDA_BUILD_DIR)/rte-to-rtegpu $(CUDA_BUILD_DIR)/rte-gpu-info $(CUDA_BUILD_DIR)/rte-gpu-route
+
+$(CUDA_BUILD_DIR)/rte-to-rtegpu: src/tools/rte_to_rtegpu.cpp src/tools/rtegpu_common.h | $(CUDA_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) src/tools/rte_to_rtegpu.cpp -o $@
+
+$(CUDA_BUILD_DIR)/rte-gpu-info: src/tools/rte_gpu_info.cpp src/tools/rtegpu_common.h | $(CUDA_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) src/tools/rte_gpu_info.cpp -o $@
+
+$(CUDA_BUILD_DIR)/rte-gpu-route: src/tools/rte_gpu_route.cu src/tools/rtegpu_common.h | $(CUDA_BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) src/tools/rte_gpu_route.cu -o $@
 
 $(BUILD_DIR)/pbf-info: $(PBF_INFO_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(PBF_INFO_SRCS) $(LDFLAGS) -o $@
