@@ -185,6 +185,14 @@ typedef struct {
 } RoutePackWalkMaterializeContext;
 
 typedef struct {
+    RoutePackTileStore *tiles;
+    const RoutePackWalkCoordStore *coords;
+    RoutePackTileSegmentStore *segments;
+    volatile unsigned int next_tile;
+    volatile int failed;
+} RoutePackTileGraphBuildContext;
+
+typedef struct {
     RoutePackTileStore *store;
     int origin_lat_e7;
     int origin_lon_e7;
@@ -280,8 +288,18 @@ typedef struct {
     int used;
 } RoutePackStringMapEntry;
 
+typedef struct RoutePackStringMapChunk RoutePackStringMapChunk;
+
+struct RoutePackStringMapChunk {
+    RoutePackStringMapChunk *next;
+    size_t used;
+    size_t capacity;
+    char data[];
+};
+
 typedef struct {
     RoutePackStringMapEntry *entries;
+    RoutePackStringMapChunk *chunks;
     unsigned int capacity;
     unsigned int count;
 } RoutePackStringMap;
@@ -359,6 +377,14 @@ typedef struct {
     unsigned int string_size;
     unsigned int string_capacity;
 } RoutePackTransitStore;
+
+typedef struct {
+    RoutePackTransitEvent *events;
+    const unsigned int *offsets;
+    unsigned int trip_count;
+    volatile unsigned int next_trip;
+    volatile int failed;
+} RoutePackTransitEventSortContext;
 
 static void write_usage(const char *program) {
     rt_write_cstr(2, "Usage: ");
@@ -1239,6 +1265,26 @@ static unsigned int string_map_get(const RoutePackStringMap *map, CsvField key) 
     }
 }
 
+static char *string_map_alloc_key(RoutePackStringMap *map, size_t key_size) {
+    size_t needed = key_size + 1U;
+    RoutePackStringMapChunk *chunk = map->chunks;
+    if (chunk == 0 || chunk->capacity - chunk->used < needed) {
+        size_t capacity = 1048576U;
+        RoutePackStringMapChunk *new_chunk;
+        if (needed > capacity) capacity = needed;
+        if (capacity > ((size_t)-1) - sizeof(*new_chunk)) return 0;
+        new_chunk = (RoutePackStringMapChunk *)rt_malloc(sizeof(*new_chunk) + capacity);
+        if (new_chunk == 0) return 0;
+        new_chunk->next = chunk;
+        new_chunk->used = 0U;
+        new_chunk->capacity = capacity;
+        map->chunks = new_chunk;
+        chunk = new_chunk;
+    }
+    chunk->used += needed;
+    return chunk->data + chunk->used - needed;
+}
+
 static int string_map_put(RoutePackStringMap *map, CsvField key, unsigned int value) {
     unsigned int slot;
     if (key.size == 0U) return 0;
@@ -1246,7 +1292,7 @@ static int string_map_put(RoutePackStringMap *map, CsvField key, unsigned int va
     slot = gtfs_hash_bytes(key.data, key.size) & (map->capacity - 1U);
     for (;;) {
         if (!map->entries[slot].used) {
-            map->entries[slot].key = (char *)rt_malloc(key.size + 1U);
+            map->entries[slot].key = string_map_alloc_key(map, key.size);
             if (map->entries[slot].key == 0) return -1;
             memcpy(map->entries[slot].key, key.data, key.size);
             map->entries[slot].key[key.size] = '\0';
@@ -1265,8 +1311,12 @@ static int string_map_put(RoutePackStringMap *map, CsvField key, unsigned int va
 }
 
 static void string_map_destroy(RoutePackStringMap *map) {
-    unsigned int index;
-    for (index = 0U; index < map->capacity; ++index) if (map->entries[index].used) rt_free(map->entries[index].key);
+    RoutePackStringMapChunk *chunk = map->chunks;
+    while (chunk != 0) {
+        RoutePackStringMapChunk *next = chunk->next;
+        rt_free(chunk);
+        chunk = next;
+    }
     rt_free(map->entries);
     rt_memset(map, 0, sizeof(*map));
 }
@@ -1378,16 +1428,6 @@ static int transit_find_or_add_service(RoutePackTransitStore *store, RoutePackSt
     return 0;
 }
 
-static int compare_transit_event(const void *left_ptr, const void *right_ptr) {
-    const RoutePackTransitEvent *left = (const RoutePackTransitEvent *)left_ptr;
-    const RoutePackTransitEvent *right = (const RoutePackTransitEvent *)right_ptr;
-    if (left->trip_index < right->trip_index) return -1;
-    if (left->trip_index > right->trip_index) return 1;
-    if (left->sequence < right->sequence) return -1;
-    if (left->sequence > right->sequence) return 1;
-    return 0;
-}
-
 static int compare_transit_exception(const void *left_ptr, const void *right_ptr) {
     const RoutePackTransitException *left = (const RoutePackTransitException *)left_ptr;
     const RoutePackTransitException *right = (const RoutePackTransitException *)right_ptr;
@@ -1395,6 +1435,139 @@ static int compare_transit_exception(const void *left_ptr, const void *right_ptr
     if (left->service_index > right->service_index) return 1;
     if (left->date < right->date) return -1;
     if (left->date > right->date) return 1;
+    return 0;
+}
+
+static void transit_sort_event_range_by_sequence(RoutePackTransitEvent *events, unsigned int begin, unsigned int end) {
+    unsigned int index;
+    int sorted = 1;
+    if (end <= begin + 1U) return;
+    for (index = begin + 1U; index < end; ++index) {
+        if (events[index - 1U].sequence > events[index].sequence) { sorted = 0; break; }
+    }
+    if (sorted) return;
+    for (index = begin + 1U; index < end; ++index) {
+        RoutePackTransitEvent value = events[index];
+        unsigned int cursor = index;
+        while (cursor > begin && events[cursor - 1U].sequence > value.sequence) {
+            events[cursor] = events[cursor - 1U];
+            cursor -= 1U;
+        }
+        events[cursor] = value;
+    }
+}
+
+static int transit_event_sequence_sort_worker_main(void *arg) {
+    RoutePackTransitEventSortContext *context = (RoutePackTransitEventSortContext *)arg;
+
+    for (;;) {
+        unsigned int trip_index;
+        if (__atomic_load_n(&context->failed, __ATOMIC_ACQUIRE)) return -1;
+        trip_index = __atomic_fetch_add(&context->next_trip, 1U, __ATOMIC_RELAXED);
+        if (trip_index >= context->trip_count) break;
+        transit_sort_event_range_by_sequence(context->events, context->offsets[trip_index], context->offsets[trip_index + 1U]);
+    }
+    return 0;
+}
+
+static int transit_sort_event_sequences(RoutePackTransitEvent *events, const unsigned int *offsets, unsigned int trip_count, unsigned int thread_count) {
+    RoutePackTransitEventSortContext context;
+    PlatformThread *threads;
+    unsigned int worker_index;
+    unsigned int started_threads = 0U;
+    int failed = 0;
+
+    rt_memset(&context, 0, sizeof(context));
+    context.events = events;
+    context.offsets = offsets;
+    context.trip_count = trip_count;
+    if (thread_count == 0U) thread_count = 1U;
+    if (thread_count > trip_count) thread_count = trip_count;
+    if (thread_count <= 1U) return transit_event_sequence_sort_worker_main(&context);
+
+    threads = (PlatformThread *)rt_malloc(sizeof(*threads) * thread_count);
+    if (threads == 0) return -1;
+    for (worker_index = 0U; worker_index < thread_count; ++worker_index) {
+        if (platform_thread_start(threads + worker_index, transit_event_sequence_sort_worker_main, &context, 0U) != 0) {
+            __atomic_store_n(&context.failed, 1, __ATOMIC_RELEASE);
+            failed = 1;
+            break;
+        }
+        started_threads += 1U;
+    }
+    for (worker_index = 0U; worker_index < started_threads; ++worker_index) {
+        int worker_result = 0;
+        if (platform_thread_join(threads + worker_index, &worker_result) != 0 || worker_result != 0) failed = 1;
+    }
+    if (__atomic_load_n(&context.failed, __ATOMIC_ACQUIRE)) failed = 1;
+    rt_free(threads);
+    return failed ? -1 : 0;
+}
+
+static int transit_order_events_by_trip(RoutePackTransitStore *store, unsigned int thread_count) {
+    unsigned int *offsets;
+    unsigned int *cursors;
+    RoutePackTransitEvent *ordered_events;
+    unsigned int event_index;
+    unsigned int trip_index;
+    unsigned int running_total = 0U;
+
+    if (store->event_count < 2U) return 0;
+    offsets = (unsigned int *)rt_malloc(sizeof(*offsets) * (size_t)(store->trip_count + 1U));
+    cursors = (unsigned int *)rt_malloc(sizeof(*cursors) * (size_t)store->trip_count);
+    ordered_events = (RoutePackTransitEvent *)rt_malloc(sizeof(*ordered_events) * (size_t)store->event_count);
+    if (offsets == 0 || cursors == 0 || ordered_events == 0) {
+        rt_free(offsets);
+        rt_free(cursors);
+        rt_free(ordered_events);
+        return -1;
+    }
+    rt_memset(offsets, 0, sizeof(*offsets) * (size_t)(store->trip_count + 1U));
+    for (event_index = 0U; event_index < store->event_count; ++event_index) {
+        trip_index = store->events[event_index].trip_index;
+        if (trip_index >= store->trip_count || offsets[trip_index + 1U] == 0xffffffffU) {
+            rt_free(offsets);
+            rt_free(cursors);
+            rt_free(ordered_events);
+            return -1;
+        }
+        offsets[trip_index + 1U] += 1U;
+    }
+    for (trip_index = 0U; trip_index < store->trip_count; ++trip_index) {
+        unsigned int trip_event_count = offsets[trip_index + 1U];
+        if (running_total > 0xffffffffU - trip_event_count) {
+            rt_free(offsets);
+            rt_free(cursors);
+            rt_free(ordered_events);
+            return -1;
+        }
+        offsets[trip_index] = running_total;
+        cursors[trip_index] = running_total;
+        running_total += trip_event_count;
+    }
+    offsets[store->trip_count] = running_total;
+    if (running_total != store->event_count) {
+        rt_free(offsets);
+        rt_free(cursors);
+        rt_free(ordered_events);
+        return -1;
+    }
+    for (event_index = 0U; event_index < store->event_count; ++event_index) {
+        trip_index = store->events[event_index].trip_index;
+        ordered_events[cursors[trip_index]] = store->events[event_index];
+        cursors[trip_index] += 1U;
+    }
+    if (transit_sort_event_sequences(ordered_events, offsets, store->trip_count, thread_count) != 0) {
+        rt_free(offsets);
+        rt_free(cursors);
+        rt_free(ordered_events);
+        return -1;
+    }
+    rt_free(store->events);
+    store->events = ordered_events;
+    store->event_capacity = store->event_count;
+    rt_free(offsets);
+    rt_free(cursors);
     return 0;
 }
 
@@ -1465,6 +1638,7 @@ static int load_gtfs_stops(const char *gtfs_path, RoutePackTransitStore *store, 
     GtfsLineReader reader;
     char line[OSMRTE_TRANSIT_LINE_CAPACITY];
     int read_result;
+    unsigned int next_progress_stop_count = 100000U;
     int origin_lat_e7 = 0;
     int origin_lon_e7 = 0;
     unsigned int meters_per_degree_lon;
@@ -1507,6 +1681,12 @@ static int load_gtfs_stops(const char *gtfs_path, RoutePackTransitStore *store, 
         stop->tile_id = tile_id;
         if (string_map_put(stop_map, fields[0], store->stop_count + 1U) != 0) { (void)platform_close(fd); return -1; }
         store->stop_count += 1U;
+        if (store->stop_count >= next_progress_stop_count) {
+            rt_write_cstr(1, "gtfs_stops_loaded: ");
+            rt_write_uint(1, store->stop_count);
+            rt_write_char(1, '\n');
+            next_progress_stop_count += 100000U;
+        }
     }
     (void)platform_close(fd);
     return 0;
@@ -1552,6 +1732,7 @@ static int load_gtfs_trips(const char *gtfs_path, RoutePackTransitStore *store, 
     GtfsLineReader reader;
     char line[OSMRTE_TRANSIT_LINE_CAPACITY];
     int read_result;
+    unsigned int next_progress_trip_count = 250000U;
     if (fd < 0) return -1;
     gtfs_line_reader_init(&reader, fd);
     read_result = gtfs_read_line(&reader, line, sizeof(line));
@@ -1575,6 +1756,12 @@ static int load_gtfs_trips(const char *gtfs_path, RoutePackTransitStore *store, 
         trip->mode = store->routes[route_index - 1U].mode;
         if (string_map_put(trip_map, fields[2], store->trip_count + 1U) != 0) { (void)platform_close(fd); return -1; }
         store->trip_count += 1U;
+        if (store->trip_count >= next_progress_trip_count) {
+            rt_write_cstr(1, "gtfs_trips_loaded: ");
+            rt_write_uint(1, store->trip_count);
+            rt_write_char(1, '\n');
+            next_progress_trip_count += 250000U;
+        }
     }
     (void)platform_close(fd);
     return 0;
@@ -1587,6 +1774,7 @@ static int load_gtfs_stop_times(const char *gtfs_path, RoutePackTransitStore *st
     GtfsLineReader reader;
     char line[OSMRTE_TRANSIT_LINE_CAPACITY];
     int read_result;
+    unsigned int next_progress_event_count = 5000000U;
     if (fd < 0) return -1;
     gtfs_line_reader_init(&reader, fd);
     read_result = gtfs_read_line(&reader, line, sizeof(line));
@@ -1609,13 +1797,18 @@ static int load_gtfs_stop_times(const char *gtfs_path, RoutePackTransitStore *st
         if (gtfs_parse_time_field(fields[1], &event->arrival_sec) != 0 || gtfs_parse_time_field(fields[2], &event->departure_sec) != 0 || gtfs_parse_uint_field(fields[4], &event->sequence) != 0) continue;
         store->stops[event->stop_index].mode_mask |= gtfs_mode_mask(store->trips[event->trip_index].mode);
         store->event_count += 1U;
+        if (store->event_count >= next_progress_event_count) {
+            rt_write_cstr(1, "gtfs_stop_events_loaded: ");
+            rt_write_uint(1, store->event_count);
+            rt_write_char(1, '\n');
+            next_progress_event_count += 5000000U;
+        }
     }
     (void)platform_close(fd);
-    rt_sort(store->events, store->event_count, sizeof(*store->events), compare_transit_event);
     return 0;
 }
 
-static int collect_transit(const char *gtfs_path, RoutePackTransitStore *store, RoutePackTileStore *tiles, const RoutePackBounds *bounds, unsigned int tile_size_m) {
+static int collect_transit(const char *gtfs_path, RoutePackTransitStore *store, RoutePackTileStore *tiles, const RoutePackBounds *bounds, unsigned int tile_size_m, unsigned int thread_count) {
     RoutePackStringMap stop_map;
     RoutePackStringMap route_map;
     RoutePackStringMap service_map;
@@ -1626,17 +1819,71 @@ static int collect_transit(const char *gtfs_path, RoutePackTransitStore *store, 
     rt_memset(&route_map, 0, sizeof(route_map));
     rt_memset(&service_map, 0, sizeof(service_map));
     rt_memset(&trip_map, 0, sizeof(trip_map));
-    if (load_gtfs_services(gtfs_path, store, &service_map) != 0 ||
-        load_gtfs_stops(gtfs_path, store, &stop_map, tiles, bounds, tile_size_m) != 0 ||
-        load_gtfs_routes(gtfs_path, store, &route_map) != 0 ||
-        load_gtfs_trips(gtfs_path, store, &route_map, &service_map, &trip_map) != 0 ||
-        load_gtfs_stop_times(gtfs_path, store, &trip_map, &stop_map) != 0) {
+    rt_write_cstr(1, "gtfs_phase: services\n");
+    if (load_gtfs_services(gtfs_path, store, &service_map) != 0) {
         string_map_destroy(&trip_map);
         string_map_destroy(&service_map);
         string_map_destroy(&route_map);
         string_map_destroy(&stop_map);
         return -1;
     }
+    rt_write_cstr(1, "gtfs_services: ");
+    rt_write_uint(1, store->service_count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "gtfs_phase: stops\n");
+    if (load_gtfs_stops(gtfs_path, store, &stop_map, tiles, bounds, tile_size_m) != 0) {
+        string_map_destroy(&trip_map);
+        string_map_destroy(&service_map);
+        string_map_destroy(&route_map);
+        string_map_destroy(&stop_map);
+        return -1;
+    }
+    rt_write_cstr(1, "gtfs_stops_loaded: ");
+    rt_write_uint(1, store->stop_count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "gtfs_phase: routes\n");
+    if (load_gtfs_routes(gtfs_path, store, &route_map) != 0) {
+        string_map_destroy(&trip_map);
+        string_map_destroy(&service_map);
+        string_map_destroy(&route_map);
+        string_map_destroy(&stop_map);
+        return -1;
+    }
+    rt_write_cstr(1, "gtfs_routes_loaded: ");
+    rt_write_uint(1, store->route_count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "gtfs_phase: trips\n");
+    if (load_gtfs_trips(gtfs_path, store, &route_map, &service_map, &trip_map) != 0) {
+        string_map_destroy(&trip_map);
+        string_map_destroy(&service_map);
+        string_map_destroy(&route_map);
+        string_map_destroy(&stop_map);
+        return -1;
+    }
+    rt_write_cstr(1, "gtfs_trips_loaded: ");
+    rt_write_uint(1, store->trip_count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "gtfs_phase: stop_times\n");
+    if (load_gtfs_stop_times(gtfs_path, store, &trip_map, &stop_map) != 0) {
+        string_map_destroy(&trip_map);
+        string_map_destroy(&service_map);
+        string_map_destroy(&route_map);
+        string_map_destroy(&stop_map);
+        return -1;
+    }
+    rt_write_cstr(1, "gtfs_stop_events_loaded: ");
+    rt_write_uint(1, store->event_count);
+    rt_write_char(1, '\n');
+    rt_write_cstr(1, "gtfs_phase: order_events\n");
+    if (transit_order_events_by_trip(store, thread_count) != 0) {
+        string_map_destroy(&trip_map);
+        string_map_destroy(&service_map);
+        string_map_destroy(&route_map);
+        string_map_destroy(&stop_map);
+        return -1;
+    }
+    rt_write_cstr(1, "gtfs_phase: order_events_done\n");
+    rt_write_cstr(1, "gtfs_phase: finalize\n");
     rt_sort(store->exceptions, store->exception_count, sizeof(*store->exceptions), compare_transit_exception);
     for (index = 0U; index < store->service_count; ++index) {
         store->services[index].exception_offset = 0U;
@@ -1649,10 +1896,12 @@ static int collect_transit(const char *gtfs_path, RoutePackTransitStore *store, 
     }
     rt_sort(tiles->tiles, tiles->count, sizeof(*tiles->tiles), compare_tile_by_id);
     (void)tile_store_rehash(tiles, tiles->slot_capacity == 0U ? 1024U : tiles->slot_capacity);
+    rt_write_cstr(1, "gtfs_phase: release_maps\n");
     string_map_destroy(&trip_map);
     string_map_destroy(&service_map);
     string_map_destroy(&route_map);
     string_map_destroy(&stop_map);
+    rt_write_cstr(1, "gtfs_phase: release_maps_done\n");
     return 0;
 }
 
@@ -1710,6 +1959,11 @@ static unsigned int next_power_of_two_u32(unsigned int value) {
     return result < value ? value : result;
 }
 
+static unsigned int tile_graph_slot_capacity_for_node_capacity(unsigned int node_capacity) {
+    if (node_capacity > 0x7ffffffdU) return 0xffffffffU;
+    return next_power_of_two_u32(node_capacity * 2U + 2U);
+}
+
 static int tile_graph_preallocate(RoutePackTile *tile) {
     RoutePackTileGraph *graph;
     unsigned int node_capacity;
@@ -1726,7 +1980,7 @@ static int tile_graph_preallocate(RoutePackTile *tile) {
     edge_capacity = tile->graph_segment_count > 0x7fffffffU ? 0xffffffffU : tile->graph_segment_count * 2U;
     node_capacity = tile->graph_segment_count + 1U;
     if (node_capacity < 512U) node_capacity = 512U;
-    slot_capacity = next_power_of_two_u32(node_capacity * 2U);
+    slot_capacity = tile_graph_slot_capacity_for_node_capacity(node_capacity);
     if (tile_graph_reserve_edges(graph, edge_capacity) != 0 || tile_graph_reserve_nodes(graph, node_capacity) != 0 || tile_graph_node_rehash(graph, slot_capacity) != 0) return -1;
     return 0;
 }
@@ -1882,11 +2136,52 @@ static int on_walk_way_graph(void *user, const PbfWay *way) {
     return 0;
 }
 
-static int build_tile_graphs_from_segments(RoutePackTileStore *tiles, const RoutePackWalkCoordStore *coords, RoutePackTileSegmentStore *segments) {
+static int build_tile_graph_worker_main(void *arg) {
+    RoutePackTileGraphBuildContext *context = (RoutePackTileGraphBuildContext *)arg;
+
+    for (;;) {
+        unsigned int tile_index;
+        unsigned int group_begin;
+        unsigned int group_count;
+        unsigned int group_end;
+        RoutePackTileGraph *graph;
+        unsigned int index;
+
+        if (__atomic_load_n(&context->failed, __ATOMIC_ACQUIRE)) return -1;
+        tile_index = __atomic_fetch_add(&context->next_tile, 1U, __ATOMIC_RELAXED);
+        if (tile_index >= context->tiles->count) break;
+        group_count = context->tiles->tiles[tile_index].graph_segment_count;
+        if (group_count == 0U) continue;
+        group_begin = context->tiles->tiles[tile_index].graph_segment_offset;
+        group_end = group_begin + group_count;
+        if (group_end < group_begin || group_end > context->segments->count) {
+            __atomic_store_n(&context->failed, 1, __ATOMIC_RELEASE);
+            return -1;
+        }
+        graph = (RoutePackTileGraph *)context->tiles->tiles[tile_index].graph;
+        rt_memset(graph->slots, 0, sizeof(*graph->slots) * graph->slot_capacity);
+        graph->node_count = 0U;
+        graph->edge_count = 0U;
+        for (index = group_begin; index < group_end; ++index) {
+            RoutePackWalkCoord *left = context->coords->items + context->segments->items[index].left_coord_index;
+            RoutePackWalkCoord *right = context->coords->items + context->segments->items[index].right_coord_index;
+            if (tile_graph_add_segment(context->tiles->tiles + tile_index, left, right) != 0) {
+                __atomic_store_n(&context->failed, 1, __ATOMIC_RELEASE);
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int build_tile_graphs_from_segments(RoutePackTileStore *tiles, const RoutePackWalkCoordStore *coords, RoutePackTileSegmentStore *segments, unsigned int thread_count) {
     RoutePackTileGraph *graph_pool;
     RoutePackTileGraphNode *node_pool;
     RoutePackTileGraphNodeSlot *slot_pool;
     RoutePackTileGraphEdge *edge_pool;
+    RoutePackTileGraphBuildContext context;
+    PlatformThread *threads = 0;
     unsigned long long total_node_capacity = 0ULL;
     unsigned long long total_slot_capacity = 0ULL;
     unsigned long long total_edge_capacity = 0ULL;
@@ -1894,15 +2189,20 @@ static int build_tile_graphs_from_segments(RoutePackTileStore *tiles, const Rout
     unsigned int slot_cursor = 0U;
     unsigned int edge_cursor = 0U;
     unsigned int tile_index;
+    unsigned int worker_index;
+    unsigned int started_threads = 0U;
+    int failed = 0;
 
     if (segments->count == 0U) return 0;
+    if (thread_count == 0U) thread_count = 1U;
+    if (thread_count > tiles->count) thread_count = tiles->count;
     for (tile_index = 0U; tile_index < tiles->count; ++tile_index) {
         unsigned int group_count = tiles->tiles[tile_index].graph_segment_count;
         unsigned int node_capacity;
         unsigned int slot_capacity;
         if (group_count == 0U) continue;
         node_capacity = group_count > 0x7fffffffU ? 0xffffffffU : group_count * 2U;
-        slot_capacity = next_power_of_two_u32(node_capacity > 0x3fffffffU ? 0xffffffffU : node_capacity * 4U);
+        slot_capacity = tile_graph_slot_capacity_for_node_capacity(node_capacity);
         total_node_capacity += node_capacity;
         total_edge_capacity += (unsigned long long)group_count * 2ULL;
         total_slot_capacity += slot_capacity;
@@ -1915,20 +2215,17 @@ static int build_tile_graphs_from_segments(RoutePackTileStore *tiles, const Rout
     if (graph_pool == 0 || node_pool == 0 || slot_pool == 0 || edge_pool == 0) return -1;
     rt_memset(graph_pool, 0, sizeof(*graph_pool) * tiles->count);
     for (tile_index = 0U; tile_index < tiles->count; ++tile_index) {
-        unsigned int group_begin = tiles->tiles[tile_index].graph_segment_offset;
         unsigned int group_count;
-        unsigned int group_end;
         RoutePackTileGraph *graph;
         unsigned int node_capacity;
         unsigned int slot_capacity;
-        unsigned int index;
+        unsigned int edge_capacity;
 
         group_count = tiles->tiles[tile_index].graph_segment_count;
-        group_end = group_begin + group_count;
         if (group_count == 0U) continue;
-        if (group_end > segments->count) return -1;
         node_capacity = group_count > 0x7fffffffU ? 0xffffffffU : group_count * 2U;
-        slot_capacity = next_power_of_two_u32(node_capacity > 0x3fffffffU ? 0xffffffffU : node_capacity * 4U);
+        slot_capacity = tile_graph_slot_capacity_for_node_capacity(node_capacity);
+        edge_capacity = group_count * 2U;
         graph = graph_pool + tile_index;
         tiles->tiles[tile_index].graph = graph;
         graph->nodes = node_pool + node_cursor;
@@ -1936,20 +2233,35 @@ static int build_tile_graphs_from_segments(RoutePackTileStore *tiles, const Rout
         graph->slots = slot_pool + slot_cursor;
         graph->slot_capacity = slot_capacity;
         graph->edges = edge_pool + edge_cursor;
-        graph->edge_capacity = group_count * 2U;
-        rt_memset(graph->slots, 0, sizeof(*graph->slots) * slot_capacity);
+        graph->edge_capacity = edge_capacity;
         node_cursor += node_capacity;
         slot_cursor += slot_capacity;
-        edge_cursor += group_count * 2U;
-        graph->node_count = 0U;
-        graph->edge_count = 0U;
-        for (index = group_begin; index < group_end; ++index) {
-            RoutePackWalkCoord *left = coords->items + segments->items[index].left_coord_index;
-            RoutePackWalkCoord *right = coords->items + segments->items[index].right_coord_index;
-            if (tile_graph_add_segment(tiles->tiles + tile_index, left, right) != 0) return -1;
-        }
+        edge_cursor += edge_capacity;
     }
-    return 0;
+
+    rt_memset(&context, 0, sizeof(context));
+    context.tiles = tiles;
+    context.coords = coords;
+    context.segments = segments;
+    if (thread_count <= 1U) return build_tile_graph_worker_main(&context);
+
+    threads = (PlatformThread *)rt_malloc(sizeof(*threads) * thread_count);
+    if (threads == 0) return -1;
+    for (worker_index = 0U; worker_index < thread_count; ++worker_index) {
+        if (platform_thread_start(threads + worker_index, build_tile_graph_worker_main, &context, 0U) != 0) {
+            __atomic_store_n(&context.failed, 1, __ATOMIC_RELEASE);
+            failed = 1;
+            break;
+        }
+        started_threads += 1U;
+    }
+    for (worker_index = 0U; worker_index < started_threads; ++worker_index) {
+        int worker_result = 0;
+        if (platform_thread_join(threads + worker_index, &worker_result) != 0 || worker_result != 0) failed = 1;
+    }
+    if (__atomic_load_n(&context.failed, __ATOMIC_ACQUIRE)) failed = 1;
+    rt_free(threads);
+    return failed ? -1 : 0;
 }
 
 static int on_walk_node_coord(void *user, const PbfNode *node) {
@@ -1962,7 +2274,7 @@ static int on_walk_node_coord(void *user, const PbfNode *node) {
     return 0;
 }
 
-static int collect_walking_graph(const char *pbf_path, RoutePackTileStore *tiles, const RoutePackBounds *bounds, unsigned int tile_size_m, char *error, size_t error_capacity) {
+static int collect_walking_graph(const char *pbf_path, RoutePackTileStore *tiles, const RoutePackBounds *bounds, unsigned int tile_size_m, unsigned int thread_count, char *error, size_t error_capacity) {
     RoutePackWalkCoordStore coords;
     RoutePackTileSegmentStore tile_segments;
     RoutePackWalkCollectContext context;
@@ -2057,7 +2369,8 @@ static int collect_walking_graph(const char *pbf_path, RoutePackTileStore *tiles
     rt_write_uint(1, materialize_context.inserted_segment_count);
     rt_write_char(1, '\n');
     rt_write_cstr(1, "walking_graph_phase: build_tile_graphs\n");
-    if (build_tile_graphs_from_segments(tiles, &coords, &tile_segments) != 0) return -1;
+    if (build_tile_graphs_from_segments(tiles, &coords, &tile_segments, thread_count) != 0) return -1;
+    rt_write_cstr(1, "walking_graph_phase: done\n");
     rt_free(coords.items);
     rt_free(coords.slots);
     rt_free(tile_segments.items);
@@ -2256,6 +2569,49 @@ static int write_zero_padding(int fd, unsigned long long size) {
     return 0;
 }
 
+typedef struct {
+    int fd;
+    size_t used;
+    unsigned char data[262144];
+} RoutePackOutputWriter;
+
+static void route_pack_output_writer_init(RoutePackOutputWriter *writer, int fd) {
+    writer->fd = fd;
+    writer->used = 0U;
+}
+
+static int route_pack_output_flush(RoutePackOutputWriter *writer) {
+    if (writer->used == 0U) return 0;
+    if (rt_write_all(writer->fd, writer->data, writer->used) != 0) return -1;
+    writer->used = 0U;
+    return 0;
+}
+
+static int route_pack_output_write(RoutePackOutputWriter *writer, const void *data, size_t count) {
+    const unsigned char *cursor = (const unsigned char *)data;
+    if (count == 0U) return 0;
+    if (count >= sizeof(writer->data)) {
+        if (route_pack_output_flush(writer) != 0) return -1;
+        return rt_write_all(writer->fd, data, count);
+    }
+    if (writer->used + count > sizeof(writer->data) && route_pack_output_flush(writer) != 0) return -1;
+    memcpy(writer->data + writer->used, cursor, count);
+    writer->used += count;
+    return 0;
+}
+
+static int route_pack_output_zero_padding(RoutePackOutputWriter *writer, unsigned long long size) {
+    unsigned char zeros[4096];
+
+    rt_memset(zeros, 0, sizeof(zeros));
+    while (size != 0ULL) {
+        size_t chunk = size > sizeof(zeros) ? sizeof(zeros) : (size_t)size;
+        if (route_pack_output_write(writer, zeros, chunk) != 0) return -1;
+        size -= (unsigned long long)chunk;
+    }
+    return 0;
+}
+
 static void write_tile_payload_directory_record(unsigned char *out, unsigned int type, unsigned long long relative_offset, unsigned long long size, unsigned int record_count, unsigned int record_size) {
     rt_memset(out, 0, OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE);
     write_u32_le(out + 0U, type);
@@ -2288,7 +2644,7 @@ static unsigned long long tile_payload_size_for_counts(unsigned int node_count, 
     return align_u64(offset, 64ULL);
 }
 
-static int write_tile_payload(int fd, const RoutePackTile *tile) {
+static int write_tile_payload(RoutePackOutputWriter *writer, const RoutePackTile *tile) {
     RoutePackTileGraph *graph = (RoutePackTileGraph *)tile->graph;
     unsigned int node_count = graph == 0 ? 0U : graph->node_count;
     unsigned int edge_count = graph == 0 ? 0U : graph->edge_count;
@@ -2321,7 +2677,7 @@ static int write_tile_payload(int fd, const RoutePackTile *tile) {
     write_tile_payload_directory_record(header + OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 1U * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE, OSMRTE_TILE_TYPE_WALKING_OFFSETS, offsets_offset, offsets_size, node_count + 1U, 4U);
     write_tile_payload_directory_record(header + OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 2U * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE, OSMRTE_TILE_TYPE_WALKING_EDGES, edges_offset, edges_size, edge_count, 20U);
     write_tile_payload_directory_record(header + OSMRTE_TILE_PAYLOAD_HEADER_SIZE + 3U * OSMRTE_TILE_PAYLOAD_DIRECTORY_RECORD_SIZE, OSMRTE_TILE_TYPE_SNAP_GRID, snap_offset, 64ULL, 1U, 64U);
-    if (rt_write_all(fd, header, sizeof(header)) != 0) return -1;
+    if (route_pack_output_write(writer, header, sizeof(header)) != 0) return -1;
     current_offset = sizeof(header);
 
     if (node_count != 0U) {
@@ -2346,24 +2702,24 @@ static int write_tile_payload(int fd, const RoutePackTile *tile) {
         write_i32_le(node_record + 0U, graph->nodes[index].lat_e7);
         write_i32_le(node_record + 4U, graph->nodes[index].lon_e7);
         write_u32_le(node_record + 8U, 0xffffffffU);
-        if (rt_write_all(fd, node_record, sizeof(node_record)) != 0) return -1;
+        if (route_pack_output_write(writer, node_record, sizeof(node_record)) != 0) return -1;
     }
     current_offset += nodes_size;
-    if (current_offset < offsets_offset && write_zero_padding(fd, offsets_offset - current_offset) != 0) return -1;
+    if (current_offset < offsets_offset && route_pack_output_zero_padding(writer, offsets_offset - current_offset) != 0) return -1;
     current_offset = offsets_offset;
     if (node_count == 0U) {
         unsigned char zero_offset[4];
         rt_memset(zero_offset, 0, sizeof(zero_offset));
-        if (rt_write_all(fd, zero_offset, sizeof(zero_offset)) != 0) return -1;
+        if (route_pack_output_write(writer, zero_offset, sizeof(zero_offset)) != 0) return -1;
     } else {
         for (index = 0U; index <= node_count; ++index) {
             unsigned char offset_record[4];
             write_u32_le(offset_record, offsets[index]);
-            if (rt_write_all(fd, offset_record, sizeof(offset_record)) != 0) return -1;
+            if (route_pack_output_write(writer, offset_record, sizeof(offset_record)) != 0) return -1;
         }
     }
     current_offset += offsets_size;
-    if (current_offset < edges_offset && write_zero_padding(fd, edges_offset - current_offset) != 0) return -1;
+    if (current_offset < edges_offset && route_pack_output_zero_padding(writer, edges_offset - current_offset) != 0) return -1;
     current_offset = edges_offset;
     for (index = 0U; index < edge_count; ++index) {
         rt_memset(edge_record, 0, sizeof(edge_record));
@@ -2372,10 +2728,10 @@ static int write_tile_payload(int fd, const RoutePackTile *tile) {
         write_u32_le(edge_record + 8U, ordered_edges[index].meters);
         write_u32_le(edge_record + 12U, 0U);
         write_u32_le(edge_record + 16U, 0U);
-        if (rt_write_all(fd, edge_record, sizeof(edge_record)) != 0) return -1;
+        if (route_pack_output_write(writer, edge_record, sizeof(edge_record)) != 0) return -1;
     }
     current_offset += edges_size;
-    if (current_offset < snap_offset && write_zero_padding(fd, snap_offset - current_offset) != 0) return -1;
+    if (current_offset < snap_offset && route_pack_output_zero_padding(writer, snap_offset - current_offset) != 0) return -1;
     current_offset = snap_offset;
     rt_memset(snap_header, 0, sizeof(snap_header));
     write_u32_le(snap_header + 0U, 1U);
@@ -2384,9 +2740,9 @@ static int write_tile_payload(int fd, const RoutePackTile *tile) {
     write_u32_le(snap_header + 12U, 1U);
     write_u32_le(snap_header + 16U, 0U);
     write_u32_le(snap_header + 20U, 0U);
-    if (rt_write_all(fd, snap_header, sizeof(snap_header)) != 0) return -1;
+    if (route_pack_output_write(writer, snap_header, sizeof(snap_header)) != 0) return -1;
     current_offset += sizeof(snap_header);
-    if (current_offset < payload_size && write_zero_padding(fd, payload_size - current_offset) != 0) return -1;
+    if (current_offset < payload_size && route_pack_output_zero_padding(writer, payload_size - current_offset) != 0) return -1;
     rt_free(counts);
     rt_free(offsets);
     rt_free(cursor);
@@ -2615,14 +2971,50 @@ static int on_node_bounds(void *user, const PbfNode *node) {
     return 0;
 }
 
-static int collect_bounds(const char *pbf_path, RoutePackBounds *bounds, char *error, size_t error_capacity) {
+static int init_bounds_worker(void *worker_user, unsigned int worker_index, void *shared_user) {
+    (void)worker_index;
+    (void)shared_user;
+    rt_memset(worker_user, 0, sizeof(RoutePackBounds));
+    return 0;
+}
+
+static int merge_bounds_worker(void *shared_user, void *worker_user) {
+    RoutePackBounds *bounds = (RoutePackBounds *)shared_user;
+    RoutePackBounds *worker = (RoutePackBounds *)worker_user;
+
+    if (worker->have_bounds) {
+        if (!bounds->have_bounds) {
+            bounds->min_lat_nano = worker->min_lat_nano;
+            bounds->max_lat_nano = worker->max_lat_nano;
+            bounds->min_lon_nano = worker->min_lon_nano;
+            bounds->max_lon_nano = worker->max_lon_nano;
+            bounds->have_bounds = 1;
+        } else {
+            if (worker->min_lat_nano < bounds->min_lat_nano) bounds->min_lat_nano = worker->min_lat_nano;
+            if (worker->max_lat_nano > bounds->max_lat_nano) bounds->max_lat_nano = worker->max_lat_nano;
+            if (worker->min_lon_nano < bounds->min_lon_nano) bounds->min_lon_nano = worker->min_lon_nano;
+            if (worker->max_lon_nano > bounds->max_lon_nano) bounds->max_lon_nano = worker->max_lon_nano;
+        }
+    }
+    bounds->nodes_seen += worker->nodes_seen;
+    return 0;
+}
+
+static int collect_bounds(const char *pbf_path, RoutePackBounds *bounds, unsigned int thread_count, char *error, size_t error_capacity) {
     PbfStreamCallbacks callbacks;
+    PbfStreamParallelOptions options;
 
     rt_memset(bounds, 0, sizeof(*bounds));
     rt_memset(&callbacks, 0, sizeof(callbacks));
     callbacks.flags = PBF_STREAM_SKIP_NODE_TAGS | PBF_STREAM_SKIP_WAY_TAGS | PBF_STREAM_SKIP_RELATION_ROLES;
     callbacks.node = on_node_bounds;
-    return pbf_stream_entities(pbf_path, &callbacks, bounds, error, error_capacity);
+    rt_memset(&options, 0, sizeof(options));
+    options.callbacks = &callbacks;
+    options.worker_user_size = sizeof(RoutePackBounds);
+    options.init_worker = init_bounds_worker;
+    options.merge_worker = merge_bounds_worker;
+    options.shared_user = bounds;
+    return pbf_stream_entities_parallel(pbf_path, thread_count, &options, error, error_capacity);
 }
 
 static int write_route_pack(
@@ -2665,6 +3057,7 @@ static int write_route_pack(
     unsigned long long string_table_size = 1ULL;
     unsigned long long file_size;
     unsigned long long current_offset;
+    RoutePackOutputWriter writer;
     int output_fd;
     unsigned int tile_index;
     unsigned int address_index;
@@ -2749,26 +3142,27 @@ static int write_route_pack(
 
     output_fd = platform_open_write(output_path, 0644U);
     if (output_fd < 0) return -1;
-    if (rt_write_all(output_fd, header, sizeof(header)) != 0 ||
-        rt_write_all(output_fd, section_records, (size_t)section_count * OSMRTE_SECTION_RECORD_SIZE) != 0) {
+    route_pack_output_writer_init(&writer, output_fd);
+    if (route_pack_output_write(&writer, header, sizeof(header)) != 0 ||
+        route_pack_output_write(&writer, section_records, (size_t)section_count * OSMRTE_SECTION_RECORD_SIZE) != 0) {
         (void)platform_close(output_fd);
         return -1;
     }
     for (tile_index = 0U; tile_index < tile_store->count; ++tile_index) {
         write_tile_record(tile_record, tile_store->tiles + tile_index);
-        if (rt_write_all(output_fd, tile_record, sizeof(tile_record)) != 0) {
+        if (route_pack_output_write(&writer, tile_record, sizeof(tile_record)) != 0) {
             (void)platform_close(output_fd);
             return -1;
         }
     }
     for (tile_index = 0U; tile_index < tile_store->count; ++tile_index) {
-        if (write_tile_payload(output_fd, tile_store->tiles + tile_index) != 0) {
+        if (write_tile_payload(&writer, tile_store->tiles + tile_index) != 0) {
             (void)platform_close(output_fd);
             return -1;
         }
     }
     current_offset = tile_payload_offset;
-    if (current_offset < address_section_offset && write_zero_padding(output_fd, address_section_offset - current_offset) != 0) {
+    if (current_offset < address_section_offset && route_pack_output_zero_padding(&writer, address_section_offset - current_offset) != 0) {
         (void)platform_close(output_fd);
         return -1;
     }
@@ -2781,24 +3175,24 @@ static int write_route_pack(
         write_u32_le(address_header + 24U, OSMRTE_ADDRESS_RECORD_SIZE);
         write_u32_le(address_header + 28U, address_store->string_size);
         write_u64_le(address_header + 32U, OSMRTE_ADDRESS_SECTION_HEADER_SIZE + address_records_size);
-        if (rt_write_all(output_fd, address_header, sizeof(address_header)) != 0) {
+        if (route_pack_output_write(&writer, address_header, sizeof(address_header)) != 0) {
             (void)platform_close(output_fd);
             return -1;
         }
         for (address_index = 0U; address_index < address_store->count; ++address_index) {
             write_address_record(address_record, address_store->records + address_index);
-            if (rt_write_all(output_fd, address_record, sizeof(address_record)) != 0) {
+            if (route_pack_output_write(&writer, address_record, sizeof(address_record)) != 0) {
                 (void)platform_close(output_fd);
                 return -1;
             }
         }
-        if (address_store->string_size != 0U && rt_write_all(output_fd, address_store->strings, address_store->string_size) != 0) {
+        if (address_store->string_size != 0U && route_pack_output_write(&writer, address_store->strings, address_store->string_size) != 0) {
             (void)platform_close(output_fd);
             return -1;
         }
         current_offset = address_section_offset + address_section_size;
     }
-    if (current_offset < transit_section_offset && write_zero_padding(output_fd, transit_section_offset - current_offset) != 0) {
+    if (current_offset < transit_section_offset && route_pack_output_zero_padding(&writer, transit_section_offset - current_offset) != 0) {
         (void)platform_close(output_fd);
         return -1;
     }
@@ -2822,65 +3216,65 @@ static int write_route_pack(
         write_u64_le(transit_header + 104U, transit_trips_offset);
         write_u64_le(transit_header + 112U, transit_events_offset);
         write_u64_le(transit_header + 120U, transit_strings_offset);
-        if (rt_write_all(output_fd, transit_header, sizeof(transit_header)) != 0) { (void)platform_close(output_fd); return -1; }
+        if (route_pack_output_write(&writer, transit_header, sizeof(transit_header)) != 0) { (void)platform_close(output_fd); return -1; }
         section_cursor = sizeof(transit_header);
         for (transit_index = 0U; transit_index < transit_store->stop_count; ++transit_index) {
             unsigned char record[OSMRTE_TRANSIT_STOP_RECORD_SIZE];
             write_transit_stop_record(record, transit_store->stops + transit_index);
-            if (rt_write_all(output_fd, record, sizeof(record)) != 0) { (void)platform_close(output_fd); return -1; }
+            if (route_pack_output_write(&writer, record, sizeof(record)) != 0) { (void)platform_close(output_fd); return -1; }
         }
         section_cursor += (unsigned long long)transit_store->stop_count * OSMRTE_TRANSIT_STOP_RECORD_SIZE;
-        if (section_cursor < transit_routes_offset && write_zero_padding(output_fd, transit_routes_offset - section_cursor) != 0) { (void)platform_close(output_fd); return -1; }
+        if (section_cursor < transit_routes_offset && route_pack_output_zero_padding(&writer, transit_routes_offset - section_cursor) != 0) { (void)platform_close(output_fd); return -1; }
         section_cursor = transit_routes_offset;
         for (transit_index = 0U; transit_index < transit_store->route_count; ++transit_index) {
             unsigned char record[OSMRTE_TRANSIT_ROUTE_RECORD_SIZE];
             write_transit_route_record(record, transit_store->routes + transit_index);
-            if (rt_write_all(output_fd, record, sizeof(record)) != 0) { (void)platform_close(output_fd); return -1; }
+            if (route_pack_output_write(&writer, record, sizeof(record)) != 0) { (void)platform_close(output_fd); return -1; }
         }
         section_cursor += (unsigned long long)transit_store->route_count * OSMRTE_TRANSIT_ROUTE_RECORD_SIZE;
-        if (section_cursor < transit_services_offset && write_zero_padding(output_fd, transit_services_offset - section_cursor) != 0) { (void)platform_close(output_fd); return -1; }
+        if (section_cursor < transit_services_offset && route_pack_output_zero_padding(&writer, transit_services_offset - section_cursor) != 0) { (void)platform_close(output_fd); return -1; }
         section_cursor = transit_services_offset;
         for (transit_index = 0U; transit_index < transit_store->service_count; ++transit_index) {
             unsigned char record[OSMRTE_TRANSIT_SERVICE_RECORD_SIZE];
             write_transit_service_record(record, transit_store->services + transit_index);
-            if (rt_write_all(output_fd, record, sizeof(record)) != 0) { (void)platform_close(output_fd); return -1; }
+            if (route_pack_output_write(&writer, record, sizeof(record)) != 0) { (void)platform_close(output_fd); return -1; }
         }
         section_cursor += (unsigned long long)transit_store->service_count * OSMRTE_TRANSIT_SERVICE_RECORD_SIZE;
-        if (section_cursor < transit_exceptions_offset && write_zero_padding(output_fd, transit_exceptions_offset - section_cursor) != 0) { (void)platform_close(output_fd); return -1; }
+        if (section_cursor < transit_exceptions_offset && route_pack_output_zero_padding(&writer, transit_exceptions_offset - section_cursor) != 0) { (void)platform_close(output_fd); return -1; }
         section_cursor = transit_exceptions_offset;
         for (transit_index = 0U; transit_index < transit_store->exception_count; ++transit_index) {
             unsigned char record[OSMRTE_TRANSIT_EXCEPTION_RECORD_SIZE];
             write_transit_exception_record(record, transit_store->exceptions + transit_index);
-            if (rt_write_all(output_fd, record, sizeof(record)) != 0) { (void)platform_close(output_fd); return -1; }
+            if (route_pack_output_write(&writer, record, sizeof(record)) != 0) { (void)platform_close(output_fd); return -1; }
         }
         section_cursor += (unsigned long long)transit_store->exception_count * OSMRTE_TRANSIT_EXCEPTION_RECORD_SIZE;
-        if (section_cursor < transit_trips_offset && write_zero_padding(output_fd, transit_trips_offset - section_cursor) != 0) { (void)platform_close(output_fd); return -1; }
+        if (section_cursor < transit_trips_offset && route_pack_output_zero_padding(&writer, transit_trips_offset - section_cursor) != 0) { (void)platform_close(output_fd); return -1; }
         section_cursor = transit_trips_offset;
         for (transit_index = 0U; transit_index < transit_store->trip_count; ++transit_index) {
             unsigned char record[OSMRTE_TRANSIT_TRIP_RECORD_SIZE];
             write_transit_trip_record(record, transit_store->trips + transit_index);
-            if (rt_write_all(output_fd, record, sizeof(record)) != 0) { (void)platform_close(output_fd); return -1; }
+            if (route_pack_output_write(&writer, record, sizeof(record)) != 0) { (void)platform_close(output_fd); return -1; }
         }
         section_cursor += (unsigned long long)transit_store->trip_count * OSMRTE_TRANSIT_TRIP_RECORD_SIZE;
-        if (section_cursor < transit_events_offset && write_zero_padding(output_fd, transit_events_offset - section_cursor) != 0) { (void)platform_close(output_fd); return -1; }
+        if (section_cursor < transit_events_offset && route_pack_output_zero_padding(&writer, transit_events_offset - section_cursor) != 0) { (void)platform_close(output_fd); return -1; }
         section_cursor = transit_events_offset;
         for (transit_index = 0U; transit_index < transit_store->event_count; ++transit_index) {
             unsigned char record[OSMRTE_TRANSIT_EVENT_RECORD_SIZE];
             write_transit_event_record(record, transit_store->events + transit_index);
-            if (rt_write_all(output_fd, record, sizeof(record)) != 0) { (void)platform_close(output_fd); return -1; }
+            if (route_pack_output_write(&writer, record, sizeof(record)) != 0) { (void)platform_close(output_fd); return -1; }
         }
         section_cursor += (unsigned long long)transit_store->event_count * OSMRTE_TRANSIT_EVENT_RECORD_SIZE;
-        if (section_cursor < transit_strings_offset && write_zero_padding(output_fd, transit_strings_offset - section_cursor) != 0) { (void)platform_close(output_fd); return -1; }
-        if (transit_store->string_size != 0U && rt_write_all(output_fd, transit_store->strings, transit_store->string_size) != 0) { (void)platform_close(output_fd); return -1; }
+        if (section_cursor < transit_strings_offset && route_pack_output_zero_padding(&writer, transit_strings_offset - section_cursor) != 0) { (void)platform_close(output_fd); return -1; }
+        if (transit_store->string_size != 0U && route_pack_output_write(&writer, transit_store->strings, transit_store->string_size) != 0) { (void)platform_close(output_fd); return -1; }
         section_cursor = transit_strings_offset + transit_store->string_size;
-        if (section_cursor < transit_section_size && write_zero_padding(output_fd, transit_section_size - section_cursor) != 0) { (void)platform_close(output_fd); return -1; }
+        if (section_cursor < transit_section_size && route_pack_output_zero_padding(&writer, transit_section_size - section_cursor) != 0) { (void)platform_close(output_fd); return -1; }
         current_offset = transit_section_offset + transit_section_size;
     }
-    if (current_offset < string_table_offset && write_zero_padding(output_fd, string_table_offset - current_offset) != 0) {
+    if (current_offset < string_table_offset && route_pack_output_zero_padding(&writer, string_table_offset - current_offset) != 0) {
         (void)platform_close(output_fd);
         return -1;
     }
-    if (rt_write_all(output_fd, &empty_string, sizeof(empty_string)) != 0) {
+    if (route_pack_output_write(&writer, &empty_string, sizeof(empty_string)) != 0 || route_pack_output_flush(&writer) != 0) {
         (void)platform_close(output_fd);
         return -1;
     }
@@ -2943,48 +3337,60 @@ int main(int argc, char **argv) {
     rt_memset(&transit_store, 0, sizeof(transit_store));
 
     error[0] = '\0';
+    rt_write_cstr(1, "route_pack_phase: read_summary\n");
     if (pbf_read_summary_parallel(pbf_path, threads, &summary, error, sizeof(error)) != 0) {
         rt_write_cstr(2, "pbf-to-rte: ");
         rt_write_cstr(2, error[0] == '\0' ? "failed to read PBF summary" : error);
         rt_write_char(2, '\n');
         return 1;
     }
+    rt_write_cstr(1, "route_pack_phase: read_summary_done\n");
     error[0] = '\0';
-    if (collect_bounds(pbf_path, &bounds, error, sizeof(error)) != 0) {
+    rt_write_cstr(1, "route_pack_phase: collect_bounds\n");
+    if (collect_bounds(pbf_path, &bounds, threads, error, sizeof(error)) != 0) {
         rt_write_cstr(2, "pbf-to-rte: ");
         rt_write_cstr(2, error[0] == '\0' ? "failed to scan PBF bounds" : error);
         rt_write_char(2, '\n');
         return 1;
     }
+    rt_write_cstr(1, "route_pack_phase: collect_bounds_done\n");
     error[0] = '\0';
+    rt_write_cstr(1, "route_pack_phase: collect_tiles\n");
     if (collect_tiles(pbf_path, &tile_store, &bounds, tile_size_m, error, sizeof(error)) != 0) {
         rt_write_cstr(2, "pbf-to-rte: ");
         rt_write_cstr(2, error[0] == '\0' ? "failed to collect route tiles" : error);
         rt_write_char(2, '\n');
         return 1;
     }
+    rt_write_cstr(1, "route_pack_phase: collect_tiles_done\n");
     error[0] = '\0';
-    if (collect_walking_graph(pbf_path, &tile_store, &bounds, tile_size_m, error, sizeof(error)) != 0) {
+    if (collect_walking_graph(pbf_path, &tile_store, &bounds, tile_size_m, threads, error, sizeof(error)) != 0) {
         rt_write_cstr(2, "pbf-to-rte: ");
         rt_write_cstr(2, error[0] == '\0' ? "failed to collect walking graph" : error);
         rt_write_char(2, '\n');
         return 1;
     }
     error[0] = '\0';
+    rt_write_cstr(1, "route_pack_phase: collect_addresses\n");
     if (collect_addresses(pbf_path, &address_store, &tile_store, &bounds, tile_size_m, error, sizeof(error)) != 0) {
         rt_write_cstr(2, "pbf-to-rte: ");
         rt_write_cstr(2, error[0] == '\0' ? "failed to collect addresses" : error);
         rt_write_char(2, '\n');
         return 1;
     }
-    if (gtfs_path != 0 && collect_transit(gtfs_path, &transit_store, &tile_store, &bounds, tile_size_m) != 0) {
+    rt_write_cstr(1, "route_pack_phase: collect_addresses_done\n");
+    if (gtfs_path != 0) rt_write_cstr(1, "route_pack_phase: collect_gtfs\n");
+    if (gtfs_path != 0 && collect_transit(gtfs_path, &transit_store, &tile_store, &bounds, tile_size_m, threads) != 0) {
         rt_write_cstr(2, "pbf-to-rte: failed to collect GTFS data\n");
         return 1;
     }
+    if (gtfs_path != 0) rt_write_cstr(1, "route_pack_phase: collect_gtfs_done\n");
+    rt_write_cstr(1, "route_pack_phase: write_pack\n");
     if (write_route_pack(output_path, &summary, &bounds, &tile_store, &address_store, &transit_store, tile_size_m) != 0) {
         rt_write_cstr(2, "pbf-to-rte: failed to write output route pack\n");
         return 1;
     }
+    rt_write_cstr(1, "route_pack_phase: write_pack_done\n");
 
     rt_write_cstr(1, "format: OSMRTE01\n");
     rt_write_cstr(1, gtfs_path != 0 ? "mode: tiled-walking-graph-addresses-gtfs\n" : "mode: tiled-walking-graph-addresses\n");

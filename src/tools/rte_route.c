@@ -23,8 +23,9 @@
 #define RTE_TILE_TYPE_WALKING_EDGES 0x1002U
 #define RTE_TRANSIT_NO_INDEX 0xffffffffU
 #define RTE_TRANSIT_INF_TIME 0xffffffffU
-#define RTE_TRANSIT_ACCESS_WALK_M 5000U
-#define RTE_TRANSIT_EGRESS_WALK_M 5000U
+#define RTE_TRANSIT_ACCESS_WALK_M 800U
+#define RTE_TRANSIT_EGRESS_WALK_M 1500U
+#define RTE_TRANSIT_EGRESS_WALK_SCORE_WEIGHT 2U
 #define RTE_TRANSIT_TRANSFER_WALK_M 800U
 #define RTE_TRANSIT_MAX_ROUNDS 6U
 #define RTE_TRANSIT_MAX_PLAN_LEGS 16U
@@ -1387,6 +1388,11 @@ static unsigned int walking_seconds_for_meters(unsigned int meters) {
     return (unsigned int)(((unsigned long long)meters * 3600ULL + 4799ULL) / 4800ULL);
 }
 
+static unsigned int transit_finish_score(unsigned int arrival_sec, unsigned int egress_walk_sec) {
+    unsigned long long score = (unsigned long long)arrival_sec + (unsigned long long)egress_walk_sec * (unsigned long long)RTE_TRANSIT_EGRESS_WALK_SCORE_WEIGHT;
+    return score > 0xffffffffULL ? 0xffffffffU : (unsigned int)score;
+}
+
 static int transit_cell_for_e7(int value) {
     if (value >= 0) return value / RTE_TRANSIT_STOP_GRID_CELL_E7;
     return -(((-value) + RTE_TRANSIT_STOP_GRID_CELL_E7 - 1) / RTE_TRANSIT_STOP_GRID_CELL_E7);
@@ -1555,6 +1561,7 @@ static int transit_build_plan_from_arrivals(
     unsigned int stop_index;
     unsigned int best_stop_index = RTE_TRANSIT_NO_INDEX;
     unsigned int best_arrival = RTE_TRANSIT_INF_TIME;
+    unsigned int best_score = RTE_TRANSIT_INF_TIME;
     unsigned int best_egress_m = 0U;
 
     for (stop_index = 0U; stop_index < store->stop_count; ++stop_index) {
@@ -1563,9 +1570,15 @@ static int transit_build_plan_from_arrivals(
         if (rides_used[stop_index] == 0U || arrival[stop_index] == RTE_TRANSIT_INF_TIME || walk_m > RTE_TRANSIT_EGRESS_WALK_M) continue;
         {
             unsigned int walk_sec = walking_seconds_for_meters(walk_m);
-            if (arrival[stop_index] <= RTE_TRANSIT_INF_TIME - walk_sec && arrival[stop_index] + walk_sec < best_arrival) {
+            unsigned int finish_arrival;
+            unsigned int finish_score;
+            if (arrival[stop_index] > RTE_TRANSIT_INF_TIME - walk_sec) continue;
+            finish_arrival = arrival[stop_index] + walk_sec;
+            finish_score = transit_finish_score(arrival[stop_index], walk_sec);
+            if (finish_score < best_score || (finish_score == best_score && finish_arrival < best_arrival)) {
                 best_stop_index = stop_index;
-                best_arrival = arrival[stop_index] + walk_sec;
+                best_arrival = finish_arrival;
+                best_score = finish_score;
                 best_egress_m = walk_m;
             }
         }
