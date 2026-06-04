@@ -171,11 +171,12 @@ one CUDA block or warp per trip
   for event in trip_event_range:
     if board_state is set:
       relax event.stop at event.arrival_sec
-    if base_arrival[event.stop] <= event.departure_sec:
+    if base_arrival[event.stop] + boarding_slack <= event.departure_sec:
       board_state = this stop/event
 ```
 
 This keeps the sequential dependency inside one trip local, while parallelizing across 1.6M Germany-wide trips.
+The current prototype uses a 120 second boarding slack so address access walks and stop-to-stop transfers do not create itineraries that depend on sub-minute boardings.
 
 ## Expected Memory Shape
 
@@ -238,6 +239,7 @@ FILE.rtegpu --from-latlon LAT,LON --to-latlon LAT,LON
 FILE.rtegpu --rte FILE.rte --from ADDRESS --to ADDRESS
 FILE.rtegpu --rte FILE.rte --interactive
 FILE.rtegpu --rte FILE.rte --tui
+FILE.rtegpu --rte FILE.rte --api
 ```
 
 Address mode resolves addresses from the existing `OSMRTE01` address dictionary on the CPU, then runs the transit arrival search on the GPU-shaped pack. Address resolution scans the fixed address records in parallel by default, capped at 16 worker threads; use `--address-threads N` to override this for benchmarks.
@@ -252,13 +254,13 @@ rte-gpu-route data/germany-gtfs.rtegpu --rte data/germany-gtfs.rte --build-addre
 
 The default sidecar path is `FILE.rte.addridx`; override it with `--address-index FILE`. Normal address queries automatically use the sidecar when it is present and current, then fall back to the threaded full scan if the index is missing, stale, or cannot resolve the query exactly. Text and JSON output report `address_index_status`, `address_index_used`, and the sidecar entry count.
 
-Address matching is intentionally tolerant of common German input variants. The resolver treats umlaut spellings and ASCII spellings as aliases (`Lübeck`/`Luebeck`, `Königstraße`/`Koenigstrasse`), accepts shortened place prefixes such as `Oldenburg` for longer stored place names, and has a relaxed fallback for `place house, larger-place` input when the exact place part does not match the stored administrative fields. Rebuild `.rte.addridx` after this change if the TUI should get the same tolerant aliases without falling back to the full scan:
+Address matching is intentionally tolerant of common German input variants. The resolver treats umlaut spellings and ASCII spellings as aliases (`Lübeck`/`Luebeck`, `Königstraße`/`Koenigstrasse`), accepts shortened place prefixes such as `Oldenburg` for longer stored place names, matches house-number lists such as `18,20` when the user asks for `18`, and has a relaxed fallback for `place house, larger-place` input when the exact place part does not match the stored administrative fields. Rebuild `.rte.addridx` after this change if the TUI should get the same tolerant aliases without falling back to the full scan:
 
 ```text
 rte-gpu-route data/germany-gtfs.rtegpu --rte data/germany-gtfs.rte --build-address-index
 ```
 
-`--plan` enables GPU predecessor capture and prints reconstructed route legs. Text plan output uses color by default, matching the CPU tool's opt-out style: route modes/numbers are highlighted in yellow, stop/station names in cyan, and the plan header in magenta. Use `--no-color` to suppress ANSI escapes, or `--color` to force them back on.
+`--plan` enables GPU predecessor capture and prints reconstructed route legs. Text plan output uses color by default, matching the CPU tool's opt-out style: route modes/numbers are highlighted in yellow, stop/station names in cyan, and the plan header in magenta. The text and TUI views compact adjacent same-trip ride fragments and chained walking transfers so the displayed itinerary is closer to what a rider expects. Use `--no-color` to suppress ANSI escapes, or `--color` to force them back on.
 
 `--json` emits one structured JSON object instead of text. JSON mode implies `--plan`, disables color, and includes query metadata, counts, best arrival, optional verification details, route legs, and timing fields. `--verify` runs the CPU mirror and should be used for validation, but normal route queries skip it to avoid the extra CPU scan.
 
@@ -363,6 +365,9 @@ printf 'FROM\tTO\n' | rte-gpu-route data/germany-gtfs.rtegpu --rte data/germany-
 
 # Terminal form UI: editable from/to/depart fields and a live fastest-route pane
 rte-gpu-route data/germany-gtfs.rtegpu --rte data/germany-gtfs.rte --tui
+
+# Local web/API mode: resident GPU context, browser form, JSON route endpoint
+rte-gpu-route data/germany-gtfs.rtegpu --rte data/germany-gtfs.rte --api
 ```
 
 Resident `--interactive` mode keeps the `RTEGPU01` pack loaded and the hot arrays resident on the GPU. It prints a startup line on stderr with the one-time `load_ms` and `host_to_device_ms`; each query then reports `load_ms: 0.000` and `host_to_device_ms: 0.000`. Input is one `FROM<TAB>TO` address pair per line, with `quit` or `exit` ending the session.
@@ -392,6 +397,34 @@ real for two queries including startup: 0.73s
 Interactive JSON output is newline-delimited JSON: each input line produces one complete JSON object. With `--interactive --json`, the repeated benchmark produced two parse-valid rows with `address_index.status = hit`, `timing_ms.load = 0`, `timing_ms.host_to_device = 0`, `best_arrival_sec = 61992`, and 11 plan legs.
 
 `--tui` is a terminal form mode for live routing. It enters the alternate screen, provides editable `From`, `To`, and `Depart` fields, and renders the fastest route in the lower pane as soon as the current inputs resolve exactly through the address sidecar. The TUI deliberately uses sidecar-only address lookup while editing, so incomplete or misspelled addresses return quickly instead of falling back to the full 18M-record `.rte` scan. If the sidecar misses, press Enter to run one deliberate relaxed full-scan lookup; this can resolve cases such as `Thomasburg 18, Oldenburg` even before the sidecar has been rebuilt with the new alias keys. Use Tab, Up, or Down to move between fields; Ctrl-Q or Esc exits. When `Depart` is selected, Left and Right move the time backward or forward in 5-minute steps. Optional `--from`, `--to`, and `--depart` arguments prefill the form.
+
+`--api` starts a small local HTTP server after loading the `.rtegpu` pack and copying the hot arrays to the GPU. It binds to `127.0.0.1:8765` by default; override this with `--api-host HOST` and `--api-port PORT`. The root path serves a minimal browser form, `/health` returns pack counts, and `POST /route` or `POST /api/route` accepts a JSON route request and replies with the same structured JSON route shape as `--json`.
+
+Address request example:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8765/route \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "from": "Friedrich-Ebert-Straße 24, Potsdam",
+    "to": "Gassenwiesen 3, Villingendorf",
+    "depart": "2026-06-03T08:00:00"
+  }'
+```
+
+Stop-index request example:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8765/route \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "from_stop_index": 109476,
+    "to_stop_index": 304206,
+    "depart": "2026-06-03T18:00:00"
+  }'
+```
+
+Coordinate requests can use either integer e7 fields (`from_lat_e7`, `from_lon_e7`, `to_lat_e7`, `to_lon_e7`) or decimal degree fields (`from_lat`, `from_lon`, `to_lat`, `to_lon`). If `depart` is omitted, the API uses the current local date and time for that request. Normal API address requests use the sidecar when it resolves exactly and otherwise fall back to the tolerant full scan, just like the one-shot CLI.
 
 Pseudo-terminal smoke test on the same Potsdam -> Villingendorf query:
 

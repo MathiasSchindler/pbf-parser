@@ -4,13 +4,20 @@
 #include <chrono>
 #include <ctime>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <map>
+#include <sstream>
 #include <string>
 #include <thread>
 
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/stat.h>
@@ -22,6 +29,7 @@
 #define RTEGPU_ACCESS_WALK_M 800u
 #define RTEGPU_EGRESS_WALK_M 1500u
 #define RTEGPU_EGRESS_WALK_SCORE_WEIGHT 2u
+#define RTEGPU_BOARD_SLACK_SEC 120u
 #define RTEGPU_INF_STATE ((((unsigned long long)RTEGPU_INF_TIME) << 8u) | 255ull)
 #define RTEGPU_NO_INDEX 0xffffffffu
 #define RTEGPU_STATE_NONE 0u
@@ -40,6 +48,7 @@
 #define RTEGPU_ADDRESS_INDEX_HEADER_SIZE 128u
 #define RTEGPU_ADDRESS_INDEX_ENTRY_SIZE 32u
 #define RTEGPU_ADDRESS_INDEX_MAGIC "RTEAIDX1"
+#define RTEGPU_MAX_ADDRESS_CANDIDATES 64u
 
 static void cuda_check(cudaError_t err, const char *what) {
     if (err != cudaSuccess) {
@@ -58,6 +67,10 @@ __host__ __device__ static uint32_t rtegpu_state_arrival(unsigned long long stat
 
 __host__ __device__ static uint8_t rtegpu_state_rides(unsigned long long state) {
     return (uint8_t)(state & 255ull);
+}
+
+__host__ __device__ static int rtegpu_can_board(uint32_t arrival, uint32_t departure) {
+    return arrival != RTEGPU_INF_TIME && arrival <= departure && departure - arrival >= RTEGPU_BOARD_SLACK_SEC;
 }
 
 __global__ void rtegpu_trip_scan_kernel(
@@ -121,7 +134,7 @@ __global__ void rtegpu_trip_scan_kernel(
                 unsigned long long base = base_state[stop_index];
                 uint32_t base_time = rtegpu_state_arrival(base);
                 uint8_t base_ride_count = rtegpu_state_rides(base);
-                if (base_time != RTEGPU_INF_TIME && base_time <= event_dep && base_ride_count < RTEGPU_MAX_ROUNDS) {
+                if (rtegpu_can_board(base_time, event_dep) && base_ride_count < RTEGPU_MAX_ROUNDS) {
                     uint8_t candidate_rides = (uint8_t)(base_ride_count + 1u);
                     if (candidate_rides == round + 1u && (!have_board || event_dep < board_departure)) {
                         have_board = 1;
@@ -210,11 +223,18 @@ struct QueryOptions {
     bool use_color = true;
     bool interactive = false;
     bool tui = false;
+    bool api = false;
+    const char *api_host = "127.0.0.1";
+    uint32_t api_port = 8765;
     bool build_address_index = false;
     bool address_index_used = false;
     bool address_index_checked = false;
     bool address_index_only = false;
     std::string address_index_status = "not_used";
+    std::vector<int32_t> from_candidate_lat;
+    std::vector<int32_t> from_candidate_lon;
+    std::vector<int32_t> to_candidate_lat;
+    std::vector<int32_t> to_candidate_lon;
     uint64_t address_index_entries = 0;
     uint32_t from_match_count = 0;
     uint32_t to_match_count = 0;
@@ -254,6 +274,7 @@ struct RteGpuPredHost {
 struct RteGpuPlanLeg {
     uint32_t kind = RTEGPU_STATE_NONE;
     uint32_t mode = 0;
+    uint32_t trip = RTEGPU_NO_INDEX;
     uint32_t route = RTEGPU_NO_INDEX;
     uint32_t board = RTEGPU_NO_INDEX;
     uint32_t alight = RTEGPU_NO_INDEX;
@@ -261,6 +282,35 @@ struct RteGpuPlanLeg {
     uint32_t arrival = 0;
     uint32_t walk_m = 0;
 };
+
+static void compact_plan_legs(std::vector<RteGpuPlanLeg> &legs) {
+    std::vector<RteGpuPlanLeg> compact;
+    compact.reserve(legs.size());
+    for (const RteGpuPlanLeg &leg : legs) {
+        if (!compact.empty()) {
+            RteGpuPlanLeg &previous = compact.back();
+            if (previous.kind == RTEGPU_STATE_VEHICLE && leg.kind == RTEGPU_STATE_VEHICLE && previous.trip == leg.trip && previous.trip != RTEGPU_NO_INDEX && previous.alight == leg.board) {
+                previous.alight = leg.alight;
+                previous.arrival = leg.arrival;
+                continue;
+            }
+            if (previous.kind == RTEGPU_STATE_TRANSFER_WALK && leg.kind == RTEGPU_STATE_TRANSFER_WALK && previous.alight == leg.board) {
+                previous.alight = leg.alight;
+                previous.arrival = leg.arrival;
+                previous.walk_m += leg.walk_m;
+                continue;
+            }
+            if (previous.kind == RTEGPU_STATE_ORIGIN_WALK && leg.kind == RTEGPU_STATE_TRANSFER_WALK && previous.alight == leg.board) {
+                previous.alight = leg.alight;
+                previous.arrival = leg.arrival;
+                previous.walk_m += leg.walk_m;
+                continue;
+            }
+        }
+        compact.push_back(leg);
+    }
+    legs.swap(compact);
+}
 
 struct RteGpuDeviceContext {
     uint32_t *trip_service = nullptr;
@@ -344,13 +394,16 @@ struct OsmrteAddressRecord {
 
 struct OsmrteResolvedAddress {
     OsmrteAddressRecord record;
+    std::vector<OsmrteAddressRecord> candidates;
     uint32_t match_count = 0;
+    uint32_t match_score = 0;
     bool found = false;
 };
 
 struct OsmrteAddressNeedle {
     std::string main_norm;
     std::string place_norm;
+    std::string preferred_place_norm;
     std::string main_name_norm;
     std::string house_norm;
     OsmrteResolvedAddress resolved;
@@ -363,7 +416,9 @@ static void usage(const char *program) {
     "Usage: %s FILE.rtegpu ((--from-stop N | --from-latlon LAT,LON) (--to-stop N | --to-latlon LAT,LON) | --rte FILE.rte --from TEXT --to TEXT) [--depart YYYY-MM-DDTHH:MM[:SS]] [--iterations N] [--address-index FILE] [--address-threads N] [--verify] [--plan] [--color] [--no-color] [--json]\n"
     "       %s FILE.rtegpu --rte FILE.rte --tui [--address-index FILE] [--from TEXT] [--to TEXT] [--depart YYYY-MM-DDTHH:MM[:SS]]\n"
     "       %s FILE.rtegpu --rte FILE.rte --interactive [--address-index FILE] [--plan] [--json]    # stdin: FROM<TAB>TO\n"
+    "       %s FILE.rtegpu --rte FILE.rte --api [--api-host HOST] [--api-port PORT] [--address-index FILE]\n"
     "       %s FILE.rtegpu --rte FILE.rte --build-address-index [--address-index FILE]\n",
+        program,
         program,
         program,
         program,
@@ -418,6 +473,12 @@ static QueryOptions parse_args(int argc, char **argv) {
             options.interactive = true;
         } else if (std::strcmp(argv[i], "--tui") == 0) {
             options.tui = true;
+        } else if (std::strcmp(argv[i], "--api") == 0) {
+            options.api = true;
+        } else if (std::strcmp(argv[i], "--api-host") == 0 && i + 1 < argc) {
+            options.api_host = argv[++i];
+        } else if (std::strcmp(argv[i], "--api-port") == 0 && i + 1 < argc) {
+            if (!rtegpu_parse_u32_arg(argv[++i], &options.api_port) || options.api_port == 0 || options.api_port > 65535u) { usage(argv[0]); std::exit(1); }
         } else if (std::strcmp(argv[i], "--verify") == 0) {
             options.verify = true;
         } else if (std::strcmp(argv[i], "--plan") == 0) {
@@ -433,15 +494,16 @@ static QueryOptions parse_args(int argc, char **argv) {
             std::exit(1);
         }
     }
-    if ((options.build_address_index || options.interactive || options.tui) && options.rte_path == nullptr) { usage(argv[0]); std::exit(1); }
+    if ((options.build_address_index || options.interactive || options.tui || options.api) && options.rte_path == nullptr) { usage(argv[0]); std::exit(1); }
     if (options.tui && (options.json || options.verify || options.from_stop != UINT32_MAX || options.to_stop != UINT32_MAX || options.have_from_coord || options.have_to_coord)) { usage(argv[0]); std::exit(1); }
     if (options.interactive && (options.from_text != nullptr || options.to_text != nullptr || options.from_stop != UINT32_MAX || options.to_stop != UINT32_MAX || options.have_from_coord || options.have_to_coord)) { usage(argv[0]); std::exit(1); }
+    if (options.api && (options.from_text != nullptr || options.to_text != nullptr || options.from_stop != UINT32_MAX || options.to_stop != UINT32_MAX || options.have_from_coord || options.have_to_coord || options.verify)) { usage(argv[0]); std::exit(1); }
     bool has_address_query = options.rte_path != nullptr || options.from_text != nullptr || options.to_text != nullptr;
     if (has_address_query && !options.build_address_index &&
-        !options.interactive && !options.tui && !(options.rte_path != nullptr && options.from_text != nullptr && options.to_text != nullptr)) { usage(argv[0]); std::exit(1); }
+        !options.interactive && !options.tui && !options.api && !(options.rte_path != nullptr && options.from_text != nullptr && options.to_text != nullptr)) { usage(argv[0]); std::exit(1); }
     if (!options.tui && has_address_query && options.rte_path != nullptr && (options.from_text != nullptr || options.to_text != nullptr) &&
         !(options.from_text != nullptr && options.to_text != nullptr)) { usage(argv[0]); std::exit(1); }
-    if (options.rte_path == nullptr && !options.build_address_index && !options.interactive && !options.tui) {
+    if (options.rte_path == nullptr && !options.build_address_index && !options.interactive && !options.tui && !options.api) {
         if (options.from_stop == UINT32_MAX && !options.have_from_coord) { usage(argv[0]); std::exit(1); }
         if (options.to_stop == UINT32_MAX && !options.have_to_coord) { usage(argv[0]); std::exit(1); }
     }
@@ -451,6 +513,11 @@ static QueryOptions parse_args(int argc, char **argv) {
     }
     if (options.tui) {
         options.show_plan = true;
+    }
+    if (options.api) {
+        options.show_plan = true;
+        options.json = true;
+        options.use_color = false;
     }
     if (!options.depart_explicit) set_depart_now(options);
     return options;
@@ -677,6 +744,33 @@ static bool normalized_strings_match_fuzzy_cpp(const std::string &left, const st
     return false;
 }
 
+static std::vector<std::string> normalized_house_aliases_cpp(const std::string &house_norm) {
+    std::vector<std::string> values;
+    append_unique_string_cpp(values, house_norm);
+    size_t token_begin = 0;
+    for (size_t index = 0; index <= house_norm.size(); ++index) {
+        bool at_end = index == house_norm.size();
+        char ch = at_end ? ',' : house_norm[index];
+        if (ch == ',' || ch == ';' || ch == '/') {
+            size_t token_end = index;
+            while (token_begin < token_end && (house_norm[token_begin] == ' ' || house_norm[token_begin] == '\t')) token_begin += 1u;
+            while (token_end > token_begin && (house_norm[token_end - 1u] == ' ' || house_norm[token_end - 1u] == '\t')) token_end -= 1u;
+            std::string token(house_norm.data() + token_begin, token_end - token_begin);
+            append_unique_string_cpp(values, token);
+            token_begin = index + 1u;
+        }
+    }
+    return values;
+}
+
+static bool normalized_house_matches_cpp(const std::string &record_house_norm, const std::string &query_house_norm) {
+    if (record_house_norm.empty() || query_house_norm.empty()) return false;
+    std::vector<std::string> record_values = normalized_house_aliases_cpp(record_house_norm);
+    std::vector<std::string> query_values = normalized_house_aliases_cpp(query_house_norm);
+    for (const std::string &record_value : record_values) for (const std::string &query_value : query_values) if (record_value == query_value) return true;
+    return false;
+}
+
 static bool normalized_char_is_trim_cpp(char ch) {
     return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == ',';
 }
@@ -760,18 +854,21 @@ static void collect_record_place_norms_cpp(const std::vector<char> &strings, con
 static void append_address_index_key_variants(std::vector<RteGpuAddressIndexEntry> &entries, const OsmrteAddressRecord &record, const std::string &main_norm, const std::string &house_norm, const std::string &place_norm) {
     if (main_norm.empty() || house_norm.empty()) return;
     std::vector<std::string> main_aliases = normalized_aliases_cpp(main_norm);
+    std::vector<std::string> house_aliases = normalized_house_aliases_cpp(house_norm);
     std::vector<std::string> place_aliases;
     if (place_norm.empty()) place_aliases.push_back(std::string());
     else place_aliases = normalized_place_aliases_cpp(place_norm);
     for (const std::string &main_alias : main_aliases) {
-        for (const std::string &place_alias : place_aliases) {
-            RteGpuAddressIndexEntry entry;
-            address_key_hash(main_alias, house_norm, place_alias, &entry.hash1, &entry.hash2);
-            entry.lat_e7 = record.lat_e7;
-            entry.lon_e7 = record.lon_e7;
-            entry.flags = record.flags;
-            entry.count = 1;
-            entries.push_back(entry);
+        for (const std::string &house_alias : house_aliases) {
+            for (const std::string &place_alias : place_aliases) {
+                RteGpuAddressIndexEntry entry;
+                address_key_hash(main_alias, house_alias, place_alias, &entry.hash1, &entry.hash2);
+                entry.lat_e7 = record.lat_e7;
+                entry.lon_e7 = record.lon_e7;
+                entry.flags = record.flags;
+                entry.count = 1;
+                entries.push_back(entry);
+            }
         }
     }
 }
@@ -1005,14 +1102,42 @@ static bool normalized_record_has_place_cpp(const std::vector<char> &strings, co
     return false;
 }
 
-static bool normalized_street_house_matches_cpp(const std::vector<char> &strings, const OsmrteAddressRecord &record, const OsmrteAddressNeedle &needle) {
-    if (!needle.main_parsed) return false;
+static uint32_t normalized_street_house_match_score_cpp(const std::vector<char> &strings, const OsmrteAddressRecord &record, const OsmrteAddressNeedle &needle) {
+    if (!needle.main_parsed) return 0;
     std::string street_norm = normalized_field_cpp(strings, record.street_offset, record.street_size);
     std::string house_norm = normalized_field_cpp(strings, record.housenumber_offset, record.housenumber_size);
-    if (house_norm.empty() || house_norm != needle.house_norm) return false;
-    if (!street_norm.empty() && normalized_strings_match_fuzzy_cpp(street_norm, needle.main_name_norm)) return true;
-    if (normalized_record_has_place_cpp(strings, record, needle.main_name_norm)) return true;
-    return false;
+    if (!normalized_house_matches_cpp(house_norm, needle.house_norm)) return 0;
+    if (!street_norm.empty() && normalized_strings_match_tolerant_cpp(street_norm, needle.main_name_norm)) return 120;
+    if (!street_norm.empty() && normalized_strings_match_fuzzy_cpp(street_norm, needle.main_name_norm)) return 110;
+    if (normalized_record_has_place_cpp(strings, record, needle.main_name_norm)) return 60;
+    return 0;
+}
+
+static uint32_t normalized_record_place_affinity_score_cpp(const std::vector<char> &strings, const OsmrteAddressRecord &record, const std::string &place_norm) {
+    if (place_norm.empty()) return 0;
+    return normalized_record_has_place_cpp(strings, record, place_norm) ? 30u : 0u;
+}
+
+static void append_address_candidate(OsmrteResolvedAddress &resolved, const OsmrteAddressRecord &record) {
+    for (const OsmrteAddressRecord &candidate : resolved.candidates) {
+        if (candidate.lat_e7 == record.lat_e7 && candidate.lon_e7 == record.lon_e7) return;
+    }
+    if (resolved.candidates.size() < RTEGPU_MAX_ADDRESS_CANDIDATES) resolved.candidates.push_back(record);
+}
+
+static void update_resolved_address_candidate(OsmrteResolvedAddress &resolved, const OsmrteAddressRecord &record, uint32_t match_score) {
+    if (!resolved.found || match_score > resolved.match_score) {
+        resolved.record = record;
+        resolved.match_score = match_score;
+        resolved.found = true;
+        resolved.candidates.clear();
+        append_address_candidate(resolved, record);
+        return;
+    }
+    if (match_score == resolved.match_score) {
+        if ((record.flags & 1u) != 0u && (resolved.record.flags & 1u) == 0u) resolved.record = record;
+        append_address_candidate(resolved, record);
+    }
 }
 
 static void split_normalized_address_query_cpp(const std::string &query_norm, std::string &main_norm, std::string &place_norm) {
@@ -1029,18 +1154,18 @@ static void split_normalized_address_query_cpp(const std::string &query_norm, st
 static void init_osmrte_address_needle(OsmrteAddressNeedle &needle, const char *query) {
     std::string query_norm = normalize_text_copy_cpp(query, std::strlen(query));
     split_normalized_address_query_cpp(query_norm, needle.main_norm, needle.place_norm);
+    needle.preferred_place_norm = needle.place_norm;
     needle.main_parsed = parse_normalized_main_address_cpp(needle.main_norm, needle.main_name_norm, needle.house_norm);
     needle.active = true;
 }
 
 static void update_osmrte_address_match(const std::vector<char> &strings, const OsmrteAddressRecord &record, OsmrteAddressNeedle &needle) {
     if (!needle.active) return;
-    if (normalized_address_place_matches_cpp(strings, record, needle.place_norm) && normalized_street_house_matches_cpp(strings, record, needle)) {
+    uint32_t street_score = normalized_street_house_match_score_cpp(strings, record, needle);
+    if (street_score != 0 && normalized_address_place_matches_cpp(strings, record, needle.place_norm)) {
+        uint32_t match_score = street_score + normalized_record_place_affinity_score_cpp(strings, record, needle.preferred_place_norm);
         needle.resolved.match_count += 1;
-        if (!needle.resolved.found || ((record.flags & 1u) != 0u && (needle.resolved.record.flags & 1u) == 0u)) {
-            needle.resolved.record = record;
-            needle.resolved.found = true;
-        }
+        update_resolved_address_candidate(needle.resolved, record, match_score);
     }
 }
 
@@ -1071,9 +1196,29 @@ static uint32_t choose_osmrte_address_threads(uint64_t record_count, uint32_t re
 
 static void merge_osmrte_address_needle(OsmrteAddressNeedle &dst, const OsmrteAddressNeedle &src) {
     dst.resolved.match_count += src.resolved.match_count;
-    if (src.resolved.found && (!dst.resolved.found || ((src.resolved.record.flags & 1u) != 0u && (dst.resolved.record.flags & 1u) == 0u))) {
+    if (src.resolved.found && (!dst.resolved.found || src.resolved.match_score > dst.resolved.match_score)) {
         dst.resolved.record = src.resolved.record;
+        dst.resolved.match_score = src.resolved.match_score;
         dst.resolved.found = true;
+        dst.resolved.candidates = src.resolved.candidates;
+    } else if (src.resolved.found && src.resolved.match_score == dst.resolved.match_score) {
+        if ((src.resolved.record.flags & 1u) != 0u && (dst.resolved.record.flags & 1u) == 0u) dst.resolved.record = src.resolved.record;
+        for (const OsmrteAddressRecord &candidate : src.resolved.candidates) append_address_candidate(dst.resolved, candidate);
+    }
+}
+
+static void store_query_address_candidates(const OsmrteResolvedAddress &resolved, std::vector<int32_t> &latitudes, std::vector<int32_t> &longitudes) {
+    latitudes.clear();
+    longitudes.clear();
+    if (!resolved.found) return;
+    if (resolved.candidates.empty()) {
+        latitudes.push_back(resolved.record.lat_e7);
+        longitudes.push_back(resolved.record.lon_e7);
+        return;
+    }
+    for (const OsmrteAddressRecord &candidate : resolved.candidates) {
+        latitudes.push_back(candidate.lat_e7);
+        longitudes.push_back(candidate.lon_e7);
     }
 }
 
@@ -1164,12 +1309,14 @@ static void resolve_address_queries(QueryOptions &options) {
             options.from_match_count = from_index.match_count;
             options.from_lat = from_index.record.lat_e7;
             options.from_lon = from_index.record.lon_e7;
+            store_query_address_candidates(from_index, options.from_candidate_lat, options.from_candidate_lon);
             options.have_from_coord = true;
         }
         if (!options.have_to_coord) {
             options.to_match_count = to_index.match_count;
             options.to_lat = to_index.record.lat_e7;
             options.to_lon = to_index.record.lon_e7;
+            store_query_address_candidates(to_index, options.to_candidate_lat, options.to_candidate_lon);
             options.have_to_coord = true;
         }
         options.resolved_addresses = true;
@@ -1207,6 +1354,7 @@ static void resolve_address_queries(QueryOptions &options) {
         if (!from.found) throw std::runtime_error("from address not found in .rte address section");
         options.from_lat = from.record.lat_e7;
         options.from_lon = from.record.lon_e7;
+        store_query_address_candidates(from, options.from_candidate_lat, options.from_candidate_lon);
         options.have_from_coord = true;
     }
     if (!options.have_to_coord) {
@@ -1215,6 +1363,7 @@ static void resolve_address_queries(QueryOptions &options) {
         if (!to.found) throw std::runtime_error("to address not found in .rte address section");
         options.to_lat = to.record.lat_e7;
         options.to_lon = to.record.lon_e7;
+        store_query_address_candidates(to, options.to_candidate_lat, options.to_candidate_lon);
         options.have_to_coord = true;
     }
     options.resolved_addresses = true;
@@ -1231,12 +1380,21 @@ static void initialize_origin(const RteGpuPack &pack, const QueryOptions &option
         *candidate_origin_stops = 1;
         return;
     }
+    const std::vector<int32_t> *candidate_lat = options.from_candidate_lat.empty() ? nullptr : &options.from_candidate_lat;
+    const std::vector<int32_t> *candidate_lon = options.from_candidate_lon.empty() ? nullptr : &options.from_candidate_lon;
+    uint32_t candidate_count = candidate_lat != nullptr && candidate_lon != nullptr && candidate_lat->size() == candidate_lon->size() ? (uint32_t)candidate_lat->size() : 1u;
     for (uint32_t i = 0; i < stop_count; ++i) {
-        uint32_t meters = rtegpu_direct_distance_m(options.from_lat, options.from_lon, pack.stop_lat[i], pack.stop_lon[i]);
-        if (meters <= RTEGPU_ACCESS_WALK_M) {
+        for (uint32_t candidate = 0; candidate < candidate_count; ++candidate) {
+            int32_t from_lat = candidate_lat != nullptr ? (*candidate_lat)[candidate] : options.from_lat;
+            int32_t from_lon = candidate_lon != nullptr ? (*candidate_lon)[candidate] : options.from_lon;
+            uint32_t meters = rtegpu_direct_distance_m(from_lat, from_lon, pack.stop_lat[i], pack.stop_lon[i]);
+            if (meters > RTEGPU_ACCESS_WALK_M) continue;
             uint32_t walk_sec = rtegpu_walking_seconds(meters);
-            arrival[i] = options.depart_seconds + walk_sec;
-            *candidate_origin_stops += 1;
+            uint32_t candidate_arrival = options.depart_seconds + walk_sec;
+            if (candidate_arrival < arrival[i]) {
+                if (arrival[i] == RTEGPU_INF_TIME) *candidate_origin_stops += 1;
+                arrival[i] = candidate_arrival;
+            }
         }
     }
 }
@@ -1258,18 +1416,25 @@ static uint32_t select_destination(const RteGpuPack &pack, const QueryOptions &o
         *best_stop = options.to_stop;
         return arrival[options.to_stop];
     }
+    const std::vector<int32_t> *candidate_lat = options.to_candidate_lat.empty() ? nullptr : &options.to_candidate_lat;
+    const std::vector<int32_t> *candidate_lon = options.to_candidate_lon.empty() ? nullptr : &options.to_candidate_lon;
+    uint32_t candidate_count = candidate_lat != nullptr && candidate_lon != nullptr && candidate_lat->size() == candidate_lon->size() ? (uint32_t)candidate_lat->size() : 1u;
     for (uint32_t i = 0; i < stop_count; ++i) {
-        uint32_t meters = rtegpu_direct_distance_m(options.to_lat, options.to_lon, pack.stop_lat[i], pack.stop_lon[i]);
-        if (meters <= RTEGPU_EGRESS_WALK_M) *candidate_destination_stops += 1;
-        if (arrival[i] == RTEGPU_INF_TIME || meters > RTEGPU_EGRESS_WALK_M) continue;
-        uint32_t walk_sec = rtegpu_walking_seconds(meters);
-        uint32_t total_arrival = arrival[i] + walk_sec;
-        uint32_t score = finish_score(arrival[i], walk_sec);
-        if (score < best_score || (score == best_score && total_arrival < best_arrival)) {
-            best_score = score;
-            best_arrival = total_arrival;
-            *best_stop = i;
-            *best_walk_m = meters;
+        for (uint32_t candidate = 0; candidate < candidate_count; ++candidate) {
+            int32_t to_lat = candidate_lat != nullptr ? (*candidate_lat)[candidate] : options.to_lat;
+            int32_t to_lon = candidate_lon != nullptr ? (*candidate_lon)[candidate] : options.to_lon;
+            uint32_t meters = rtegpu_direct_distance_m(to_lat, to_lon, pack.stop_lat[i], pack.stop_lon[i]);
+            if (meters <= RTEGPU_EGRESS_WALK_M) *candidate_destination_stops += 1;
+            if (arrival[i] == RTEGPU_INF_TIME || meters > RTEGPU_EGRESS_WALK_M) continue;
+            uint32_t walk_sec = rtegpu_walking_seconds(meters);
+            uint32_t total_arrival = arrival[i] + walk_sec;
+            uint32_t score = finish_score(arrival[i], walk_sec);
+            if (score < best_score || (score == best_score && total_arrival < best_arrival)) {
+                best_score = score;
+                best_arrival = total_arrival;
+                *best_stop = i;
+                *best_walk_m = meters;
+            }
         }
     }
     return best_arrival;
@@ -1291,10 +1456,23 @@ static void pred_host_init(RteGpuPredHost &pred, uint32_t stop_count) {
 static void initialize_origin_predecessors(const RteGpuPack &pack, const QueryOptions &options, const std::vector<uint32_t> &initial_arrival, RteGpuPredHost &pred) {
     uint32_t stop_count = (uint32_t)pack.header.stop_count;
     pred_host_init(pred, stop_count);
+    const std::vector<int32_t> *candidate_lat = options.from_candidate_lat.empty() ? nullptr : &options.from_candidate_lat;
+    const std::vector<int32_t> *candidate_lon = options.from_candidate_lon.empty() ? nullptr : &options.from_candidate_lon;
+    uint32_t candidate_count = candidate_lat != nullptr && candidate_lon != nullptr && candidate_lat->size() == candidate_lon->size() ? (uint32_t)candidate_lat->size() : 1u;
     for (uint32_t i = 0; i < stop_count; ++i) {
         if (initial_arrival[i] == RTEGPU_INF_TIME) continue;
         uint32_t walk_m = 0;
-        if (options.from_stop == UINT32_MAX) walk_m = rtegpu_direct_distance_m(options.from_lat, options.from_lon, pack.stop_lat[i], pack.stop_lon[i]);
+        if (options.from_stop == UINT32_MAX) {
+            walk_m = UINT32_MAX;
+            for (uint32_t candidate = 0; candidate < candidate_count; ++candidate) {
+                int32_t from_lat = candidate_lat != nullptr ? (*candidate_lat)[candidate] : options.from_lat;
+                int32_t from_lon = candidate_lon != nullptr ? (*candidate_lon)[candidate] : options.from_lon;
+                uint32_t meters = rtegpu_direct_distance_m(from_lat, from_lon, pack.stop_lat[i], pack.stop_lon[i]);
+                uint32_t walk_sec = rtegpu_walking_seconds(meters);
+                if (meters <= RTEGPU_ACCESS_WALK_M && options.depart_seconds + walk_sec == initial_arrival[i] && meters < walk_m) walk_m = meters;
+            }
+            if (walk_m == UINT32_MAX) walk_m = rtegpu_direct_distance_m(options.from_lat, options.from_lon, pack.stop_lat[i], pack.stop_lon[i]);
+        }
         pred.kind[i] = RTEGPU_STATE_ORIGIN_WALK;
         pred.previous[i] = RTEGPU_NO_INDEX;
         pred.trip[i] = RTEGPU_NO_INDEX;
@@ -1311,9 +1489,9 @@ static void initialize_origin_predecessors(const RteGpuPack &pack, const QueryOp
 static const char *mode_name(uint32_t mode) {
     if (mode == 1u) return "tram";
     if (mode == 2u) return "subway";
-    if (mode == 4u) return "rail";
-    if (mode == 8u) return "bus";
-    if (mode == 16u) return "ferry";
+    if (mode == 3u) return "rail";
+    if (mode == 4u) return "bus";
+    if (mode == 5u) return "transit";
     return "transit";
 }
 
@@ -1423,6 +1601,7 @@ static bool build_plan_legs(const RteGpuPack &pack, const RteGpuPredHost &pred, 
         RteGpuPlanLeg leg;
         leg.kind = kind;
         leg.mode = pred.mode[current];
+        leg.trip = pred.trip[current];
         leg.route = pred.route[current];
         leg.board = pred.board[current];
         leg.alight = pred.alight[current];
@@ -1434,6 +1613,7 @@ static bool build_plan_legs(const RteGpuPack &pack, const RteGpuPredHost &pred, 
     }
     if (reverse.empty() || reverse.back().kind != RTEGPU_STATE_ORIGIN_WALK) return false;
     legs.assign(reverse.rbegin(), reverse.rend());
+    compact_plan_legs(legs);
     return true;
 }
 
@@ -1442,11 +1622,14 @@ static void print_plan_text(const RteGpuPack &pack, const QueryOptions &options,
         std::printf("plan_status: unavailable\n");
         return;
     }
+    bool combine_final_walk = egress_walk_m != 0 && !legs.empty() && legs.back().kind == RTEGPU_STATE_TRANSFER_WALK;
+    uint32_t display_leg_count = (uint32_t)legs.size() + ((egress_walk_m != 0 || options.to_stop == RTEGPU_NO_INDEX) ? 1u : 0u) - (combine_final_walk ? 1u : 0u);
     std::printf("plan_status: found\n");
-    std::printf("plan_leg_count: %u\n", (uint32_t)(legs.size() + ((egress_walk_m != 0 || options.to_stop == RTEGPU_NO_INDEX) ? 1u : 0u)));
+    std::printf("plan_leg_count: %u\n", display_leg_count);
     print_colored_cstr(options, "\033[1;35m", "GPU transit plan");
     std::printf("\n");
-    for (uint32_t i = 0; i < legs.size(); ++i) {
+    uint32_t visible_legs = (uint32_t)legs.size() - (combine_final_walk ? 1u : 0u);
+    for (uint32_t i = 0; i < visible_legs; ++i) {
         const RteGpuPlanLeg &leg = legs[i];
         char dep[16];
         char arr[16];
@@ -1474,13 +1657,23 @@ static void print_plan_text(const RteGpuPack &pack, const QueryOptions &options,
             std::printf(" arrive %s\n", arr);
         }
     }
+    if (combine_final_walk) {
+        const RteGpuPlanLeg &leg = legs.back();
+        char arr[16];
+        char dep[16];
+        rtegpu_format_time(best_arrival, arr);
+        rtegpu_format_time(leg.departure, dep);
+        std::printf("plan_%u: walk %u m from ", visible_legs + 1u, leg.walk_m + egress_walk_m);
+        print_stop_name_colored(pack, options, leg.board);
+        std::printf(" at %s to destination arrive %s\n", dep, arr);
+        return;
+    }
     if (egress_walk_m != 0 || options.to_stop == RTEGPU_NO_INDEX) {
         char arr[16];
         rtegpu_format_time(best_arrival, arr);
         std::printf("plan_%u: walk %u m to destination arrive %s\n", (uint32_t)legs.size() + 1u, egress_walk_m, arr);
     }
 }
-
 static void json_write_plan_leg(const RteGpuPack &pack, const RteGpuPlanLeg &leg) {
     if (leg.kind == RTEGPU_STATE_ORIGIN_WALK) {
         std::printf("{\"kind\":\"access_walk\",\"to_stop_index\":%u,\"to_stop\":", leg.alight);
@@ -1596,7 +1789,7 @@ static void cpu_scan(const RteGpuPack &pack, const std::vector<uint8_t> &active_
                     arrival[stop_index] = event_arr;
                     rides[stop_index] = board_rides;
                 }
-                if (base_arrival[stop_index] != RTEGPU_INF_TIME && base_arrival[stop_index] <= event_dep && base_rides[stop_index] < RTEGPU_MAX_ROUNDS) {
+                if (rtegpu_can_board(base_arrival[stop_index], event_dep) && base_rides[stop_index] < RTEGPU_MAX_ROUNDS) {
                     uint8_t candidate = (uint8_t)(base_rides[stop_index] + 1u);
                     if (candidate == round + 1u && (!have_board || event_dep < board_departure)) {
                         have_board = true;
@@ -1956,6 +2149,644 @@ static bool split_interactive_query_line(const std::string &line, std::string &f
     return !from.empty() && !to.empty();
 }
 
+struct RteGpuApiJsonValue {
+    enum Type { Null, Bool, Number, String, Array, Object } type = Null;
+    bool boolean = false;
+    double number = 0.0;
+    std::string text;
+    std::vector<RteGpuApiJsonValue> array;
+    std::map<std::string, RteGpuApiJsonValue> object;
+};
+
+static void api_append_utf8(std::string &out, uint32_t codepoint) {
+    if (codepoint <= 0x7fu) out.push_back((char)codepoint);
+    else if (codepoint <= 0x7ffu) {
+        out.push_back((char)(0xc0u | (codepoint >> 6u)));
+        out.push_back((char)(0x80u | (codepoint & 0x3fu)));
+    } else {
+        out.push_back((char)(0xe0u | (codepoint >> 12u)));
+        out.push_back((char)(0x80u | ((codepoint >> 6u) & 0x3fu)));
+        out.push_back((char)(0x80u | (codepoint & 0x3fu)));
+    }
+}
+
+struct RteGpuApiJsonParser {
+    const std::string &input;
+    size_t pos = 0;
+    std::string error;
+
+    explicit RteGpuApiJsonParser(const std::string &text) : input(text) {}
+
+    void skip_ws() {
+        while (pos < input.size() && std::isspace((unsigned char)input[pos])) pos += 1u;
+    }
+
+    bool parse_hex4(uint32_t &value) {
+        if (pos + 4u > input.size()) return false;
+        value = 0;
+        for (uint32_t i = 0; i < 4u; ++i) {
+            unsigned char ch = (unsigned char)input[pos++];
+            value <<= 4u;
+            if (ch >= '0' && ch <= '9') value |= (uint32_t)(ch - '0');
+            else if (ch >= 'a' && ch <= 'f') value |= (uint32_t)(ch - 'a' + 10);
+            else if (ch >= 'A' && ch <= 'F') value |= (uint32_t)(ch - 'A' + 10);
+            else return false;
+        }
+        return true;
+    }
+
+    bool parse_string(std::string &out) {
+        if (pos >= input.size() || input[pos] != '"') { error = "expected JSON string"; return false; }
+        pos += 1u;
+        out.clear();
+        while (pos < input.size()) {
+            unsigned char ch = (unsigned char)input[pos++];
+            if (ch == '"') return true;
+            if (ch == '\\') {
+                if (pos >= input.size()) { error = "truncated JSON escape"; return false; }
+                unsigned char esc = (unsigned char)input[pos++];
+                if (esc == '"' || esc == '\\' || esc == '/') out.push_back((char)esc);
+                else if (esc == 'b') out.push_back('\b');
+                else if (esc == 'f') out.push_back('\f');
+                else if (esc == 'n') out.push_back('\n');
+                else if (esc == 'r') out.push_back('\r');
+                else if (esc == 't') out.push_back('\t');
+                else if (esc == 'u') {
+                    uint32_t codepoint = 0;
+                    if (!parse_hex4(codepoint)) { error = "invalid JSON unicode escape"; return false; }
+                    api_append_utf8(out, codepoint);
+                } else {
+                    error = "invalid JSON escape";
+                    return false;
+                }
+            } else {
+                if (ch < 0x20u) { error = "control character in JSON string"; return false; }
+                out.push_back((char)ch);
+            }
+        }
+        error = "unterminated JSON string";
+        return false;
+    }
+
+    bool parse_value(RteGpuApiJsonValue &value) {
+        skip_ws();
+        if (pos >= input.size()) { error = "expected JSON value"; return false; }
+        char ch = input[pos];
+        if (ch == '"') {
+            value.type = RteGpuApiJsonValue::String;
+            return parse_string(value.text);
+        }
+        if (ch == '{') {
+            value.type = RteGpuApiJsonValue::Object;
+            pos += 1u;
+            skip_ws();
+            if (pos < input.size() && input[pos] == '}') { pos += 1u; return true; }
+            for (;;) {
+                std::string key;
+                if (!parse_string(key)) return false;
+                skip_ws();
+                if (pos >= input.size() || input[pos] != ':') { error = "expected ':' in JSON object"; return false; }
+                pos += 1u;
+                RteGpuApiJsonValue child;
+                if (!parse_value(child)) return false;
+                value.object[key] = child;
+                skip_ws();
+                if (pos < input.size() && input[pos] == ',') { pos += 1u; skip_ws(); continue; }
+                if (pos < input.size() && input[pos] == '}') { pos += 1u; return true; }
+                error = "expected ',' or '}' in JSON object";
+                return false;
+            }
+        }
+        if (ch == '[') {
+            value.type = RteGpuApiJsonValue::Array;
+            pos += 1u;
+            skip_ws();
+            if (pos < input.size() && input[pos] == ']') { pos += 1u; return true; }
+            for (;;) {
+                RteGpuApiJsonValue child;
+                if (!parse_value(child)) return false;
+                value.array.push_back(child);
+                skip_ws();
+                if (pos < input.size() && input[pos] == ',') { pos += 1u; continue; }
+                if (pos < input.size() && input[pos] == ']') { pos += 1u; return true; }
+                error = "expected ',' or ']' in JSON array";
+                return false;
+            }
+        }
+        if (input.compare(pos, 4u, "true") == 0) { value.type = RteGpuApiJsonValue::Bool; value.boolean = true; pos += 4u; return true; }
+        if (input.compare(pos, 5u, "false") == 0) { value.type = RteGpuApiJsonValue::Bool; value.boolean = false; pos += 5u; return true; }
+        if (input.compare(pos, 4u, "null") == 0) { value.type = RteGpuApiJsonValue::Null; pos += 4u; return true; }
+        if (ch == '-' || (ch >= '0' && ch <= '9')) {
+            const char *begin = input.c_str() + pos;
+            char *end = nullptr;
+            errno = 0;
+            double number = std::strtod(begin, &end);
+            if (end == begin || errno == ERANGE) { error = "invalid JSON number"; return false; }
+            pos = (size_t)(end - input.c_str());
+            value.type = RteGpuApiJsonValue::Number;
+            value.number = number;
+            return true;
+        }
+        error = "unexpected character in JSON value";
+        return false;
+    }
+
+    bool parse_root(RteGpuApiJsonValue &value) {
+        if (!parse_value(value)) return false;
+        skip_ws();
+        if (pos != input.size()) { error = "extra data after JSON value"; return false; }
+        return true;
+    }
+};
+
+static const RteGpuApiJsonValue *api_json_field(const RteGpuApiJsonValue &object, const char *name) {
+    if (object.type != RteGpuApiJsonValue::Object) return nullptr;
+    auto found = object.object.find(name);
+    return found == object.object.end() ? nullptr : &found->second;
+}
+
+static bool api_json_get_string(const RteGpuApiJsonValue &object, const char *name, std::string &out) {
+    const RteGpuApiJsonValue *value = api_json_field(object, name);
+    if (value == nullptr) return false;
+    if (value->type != RteGpuApiJsonValue::String) throw std::runtime_error(std::string("JSON field must be a string: ") + name);
+    out = value->text;
+    return true;
+}
+
+static bool api_json_get_bool(const RteGpuApiJsonValue &object, const char *name, bool &out) {
+    const RteGpuApiJsonValue *value = api_json_field(object, name);
+    if (value == nullptr) return false;
+    if (value->type != RteGpuApiJsonValue::Bool) throw std::runtime_error(std::string("JSON field must be a boolean: ") + name);
+    out = value->boolean;
+    return true;
+}
+
+static bool api_json_get_u32(const RteGpuApiJsonValue &object, const char *name, uint32_t &out) {
+    const RteGpuApiJsonValue *value = api_json_field(object, name);
+    if (value == nullptr) return false;
+    if (value->type != RteGpuApiJsonValue::Number || value->number < 0.0 || value->number > 4294967295.0 || std::floor(value->number) != value->number) throw std::runtime_error(std::string("JSON field must be an unsigned integer: ") + name);
+    out = (uint32_t)value->number;
+    return true;
+}
+
+static bool api_json_get_i32(const RteGpuApiJsonValue &object, const char *name, int32_t &out) {
+    const RteGpuApiJsonValue *value = api_json_field(object, name);
+    if (value == nullptr) return false;
+    if (value->type != RteGpuApiJsonValue::Number || value->number < -2147483648.0 || value->number > 2147483647.0 || std::floor(value->number) != value->number) throw std::runtime_error(std::string("JSON field must be a signed integer: ") + name);
+    out = (int32_t)value->number;
+    return true;
+}
+
+static bool api_json_get_double(const RteGpuApiJsonValue &object, const char *name, double &out) {
+    const RteGpuApiJsonValue *value = api_json_field(object, name);
+    if (value == nullptr) return false;
+    if (value->type != RteGpuApiJsonValue::Number) throw std::runtime_error(std::string("JSON field must be a number: ") + name);
+    out = value->number;
+    return true;
+}
+
+struct RteGpuApiParsedQuery {
+    QueryOptions options;
+    std::string from;
+    std::string to;
+};
+
+static int32_t api_coord_to_e7(double coord) {
+    double scaled = coord * 10000000.0;
+    if (scaled < -2147483648.0 || scaled > 2147483647.0) throw std::runtime_error("coordinate outside int32 e7 range");
+    return (int32_t)std::llround(scaled);
+}
+
+static void api_prepare_query(const QueryOptions &base, const RteGpuApiJsonValue &root, RteGpuApiParsedQuery &parsed) {
+    if (root.type != RteGpuApiJsonValue::Object) throw std::runtime_error("route request must be a JSON object");
+    parsed = RteGpuApiParsedQuery();
+    parsed.options = base;
+    parsed.options.interactive = true;
+    parsed.options.api = true;
+    parsed.options.tui = false;
+    parsed.options.build_address_index = false;
+    parsed.options.verify = false;
+    parsed.options.json = true;
+    parsed.options.show_plan = true;
+    parsed.options.use_color = false;
+    parsed.options.from_text = nullptr;
+    parsed.options.to_text = nullptr;
+    parsed.options.from_stop = RTEGPU_NO_INDEX;
+    parsed.options.to_stop = RTEGPU_NO_INDEX;
+    parsed.options.have_from_coord = false;
+    parsed.options.have_to_coord = false;
+    parsed.options.from_candidate_lat.clear();
+    parsed.options.from_candidate_lon.clear();
+    parsed.options.to_candidate_lat.clear();
+    parsed.options.to_candidate_lon.clear();
+    parsed.options.resolved_addresses = false;
+    parsed.options.from_match_count = 0;
+    parsed.options.to_match_count = 0;
+    parsed.options.address_index_used = false;
+    parsed.options.address_index_checked = false;
+    parsed.options.address_index_only = false;
+    parsed.options.address_index_status = "not_used";
+    if (!base.depart_explicit) set_depart_now(parsed.options);
+
+    std::string depart;
+    if (api_json_get_string(root, "depart", depart)) {
+        if (!rtegpu_parse_depart(depart.c_str(), &parsed.options.depart_date, &parsed.options.depart_seconds)) throw std::runtime_error("depart must look like YYYY-MM-DDTHH:MM[:SS]");
+        parsed.options.depart_explicit = true;
+    } else {
+        uint32_t depart_date = 0;
+        uint32_t depart_seconds = 0;
+        bool have_date = api_json_get_u32(root, "depart_date", depart_date);
+        bool have_seconds = api_json_get_u32(root, "depart_seconds", depart_seconds);
+        if (have_date != have_seconds) throw std::runtime_error("depart_date and depart_seconds must be supplied together");
+        if (have_date) {
+            parsed.options.depart_date = depart_date;
+            parsed.options.depart_seconds = depart_seconds;
+            parsed.options.depart_explicit = true;
+        }
+    }
+    if (parsed.options.depart_seconds >= 48u * 3600u) throw std::runtime_error("depart_seconds is out of range");
+
+    bool address_index_only = false;
+    if (api_json_get_bool(root, "address_index_only", address_index_only)) parsed.options.address_index_only = address_index_only;
+
+    bool have_from_text = api_json_get_string(root, "from", parsed.from);
+    bool have_to_text = api_json_get_string(root, "to", parsed.to);
+    if (have_from_text || have_to_text) {
+        if (!have_from_text || !have_to_text) throw std::runtime_error("from and to address strings must be supplied together");
+        if (parsed.from.empty() || parsed.to.empty()) throw std::runtime_error("from and to must not be empty");
+        parsed.options.from_text = parsed.from.c_str();
+        parsed.options.to_text = parsed.to.c_str();
+        return;
+    }
+
+    uint32_t stop = 0;
+    if (api_json_get_u32(root, "from_stop", stop) || api_json_get_u32(root, "from_stop_index", stop)) parsed.options.from_stop = stop;
+    if (api_json_get_u32(root, "to_stop", stop) || api_json_get_u32(root, "to_stop_index", stop)) parsed.options.to_stop = stop;
+
+    int32_t coord = 0;
+    if (api_json_get_i32(root, "from_lat_e7", coord)) { parsed.options.from_lat = coord; parsed.options.have_from_coord = true; }
+    if (api_json_get_i32(root, "from_lon_e7", coord)) { parsed.options.from_lon = coord; parsed.options.have_from_coord = true; }
+    if (api_json_get_i32(root, "to_lat_e7", coord)) { parsed.options.to_lat = coord; parsed.options.have_to_coord = true; }
+    if (api_json_get_i32(root, "to_lon_e7", coord)) { parsed.options.to_lon = coord; parsed.options.have_to_coord = true; }
+
+    double coord_double = 0.0;
+    if (api_json_get_double(root, "from_lat", coord_double)) { parsed.options.from_lat = api_coord_to_e7(coord_double); parsed.options.have_from_coord = true; }
+    if (api_json_get_double(root, "from_lon", coord_double)) { parsed.options.from_lon = api_coord_to_e7(coord_double); parsed.options.have_from_coord = true; }
+    if (api_json_get_double(root, "to_lat", coord_double)) { parsed.options.to_lat = api_coord_to_e7(coord_double); parsed.options.have_to_coord = true; }
+    if (api_json_get_double(root, "to_lon", coord_double)) { parsed.options.to_lon = api_coord_to_e7(coord_double); parsed.options.have_to_coord = true; }
+
+    bool have_from = parsed.options.from_stop != RTEGPU_NO_INDEX || parsed.options.have_from_coord;
+    bool have_to = parsed.options.to_stop != RTEGPU_NO_INDEX || parsed.options.have_to_coord;
+    if (!have_from || !have_to) throw std::runtime_error("request must supply either from/to address strings, stop indexes, or coordinates");
+    if (parsed.options.have_from_coord && (parsed.options.from_lat < -900000000 || parsed.options.from_lat > 900000000 || parsed.options.from_lon < -1800000000 || parsed.options.from_lon > 1800000000)) throw std::runtime_error("from coordinate out of WGS84 range");
+    if (parsed.options.have_to_coord && (parsed.options.to_lat < -900000000 || parsed.options.to_lat > 900000000 || parsed.options.to_lon < -1800000000 || parsed.options.to_lon > 1800000000)) throw std::runtime_error("to coordinate out of WGS84 range");
+}
+
+static void api_append_json_string(std::string &out, const char *data, size_t size) {
+    out.push_back('"');
+    for (size_t i = 0; i < size; ++i) {
+        unsigned char ch = (unsigned char)data[i];
+        if (ch == '"' || ch == '\\') { out.push_back('\\'); out.push_back((char)ch); }
+        else if (ch == '\n') out += "\\n";
+        else if (ch == '\r') out += "\\r";
+        else if (ch == '\t') out += "\\t";
+        else if (ch < 0x20u) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned)ch);
+            out += buf;
+        } else out.push_back((char)ch);
+    }
+    out.push_back('"');
+}
+
+static void api_append_json_string(std::string &out, const std::string &text) {
+    api_append_json_string(out, text.data(), text.size());
+}
+
+static void api_append_cstr(std::string &out, const char *text) {
+    api_append_json_string(out, text, std::strlen(text));
+}
+
+static void api_append_pack_string_or_null(std::string &out, const RteGpuPack &pack, uint32_t offset, uint32_t size) {
+    if (offset <= pack.strings.size() && size <= pack.strings.size() - offset && size != 0) api_append_json_string(out, pack.strings.data() + offset, size);
+    else out += "null";
+}
+
+static void api_append_stop_name_or_null(std::string &out, const RteGpuPack &pack, uint32_t stop) {
+    if (stop < pack.stop_name_offset.size() && stop < pack.stop_name_size.size()) api_append_pack_string_or_null(out, pack, pack.stop_name_offset[stop], pack.stop_name_size[stop]);
+    else out += "null";
+}
+
+static void api_append_route_short_or_null(std::string &out, const RteGpuPack &pack, uint32_t route) {
+    if (route < pack.route_short_offset.size() && route < pack.route_short_size.size()) api_append_pack_string_or_null(out, pack, pack.route_short_offset[route], pack.route_short_size[route]);
+    else out += "null";
+}
+
+static void api_append_route_long_or_null(std::string &out, const RteGpuPack &pack, uint32_t route) {
+    if (route < pack.route_long_offset.size() && route < pack.route_long_size.size()) api_append_pack_string_or_null(out, pack, pack.route_long_offset[route], pack.route_long_size[route]);
+    else out += "null";
+}
+
+static void api_append_double3(std::string &out, double value) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.3f", value);
+    out += buf;
+}
+
+static void api_append_plan_leg(std::string &out, const RteGpuPack &pack, const RteGpuPlanLeg &leg) {
+    if (leg.kind == RTEGPU_STATE_ORIGIN_WALK) {
+        out += "{\"kind\":\"access_walk\",\"to_stop_index\":" + std::to_string(leg.alight) + ",\"to_stop\":";
+        api_append_stop_name_or_null(out, pack, leg.alight);
+        out += ",\"walk_m\":" + std::to_string(leg.walk_m) + ",\"departure_sec\":" + std::to_string(leg.departure) + ",\"arrival_sec\":" + std::to_string(leg.arrival) + "}";
+    } else if (leg.kind == RTEGPU_STATE_TRANSFER_WALK) {
+        out += "{\"kind\":\"transfer_walk\",\"from_stop_index\":" + std::to_string(leg.board) + ",\"from_stop\":";
+        api_append_stop_name_or_null(out, pack, leg.board);
+        out += ",\"to_stop_index\":" + std::to_string(leg.alight) + ",\"to_stop\":";
+        api_append_stop_name_or_null(out, pack, leg.alight);
+        out += ",\"walk_m\":" + std::to_string(leg.walk_m) + ",\"departure_sec\":" + std::to_string(leg.departure) + ",\"arrival_sec\":" + std::to_string(leg.arrival) + "}";
+    } else if (leg.kind == RTEGPU_STATE_VEHICLE) {
+        out += "{\"kind\":\"ride\",\"mode\":";
+        api_append_cstr(out, mode_name(leg.mode));
+        out += ",\"route_index\":" + std::to_string(leg.route) + ",\"route_short_name\":";
+        api_append_route_short_or_null(out, pack, leg.route);
+        out += ",\"route_long_name\":";
+        api_append_route_long_or_null(out, pack, leg.route);
+        out += ",\"board_stop_index\":" + std::to_string(leg.board) + ",\"board_stop\":";
+        api_append_stop_name_or_null(out, pack, leg.board);
+        out += ",\"alight_stop_index\":" + std::to_string(leg.alight) + ",\"alight_stop\":";
+        api_append_stop_name_or_null(out, pack, leg.alight);
+        out += ",\"departure_sec\":" + std::to_string(leg.departure) + ",\"arrival_sec\":" + std::to_string(leg.arrival) + "}";
+    } else {
+        out += "{\"kind\":\"unknown\"}";
+    }
+}
+
+static std::string api_route_response_json(const RteGpuPack &pack, const QueryOptions &options, const RteGpuRouteResult &result) {
+    std::string out;
+    out.reserve(4096u + result.plan_legs.size() * 512u);
+    out += "{\"format\":\"RTEGPU01\",\"query_kind\":\"transit_trip_scan_with_walk_transfers\",\"resident_mode\":true,\"api_mode\":true";
+    out += ",\"query\":{\"depart_date\":" + std::to_string(options.depart_date) + ",\"depart_seconds\":" + std::to_string(options.depart_seconds);
+    if (options.from_text != nullptr) { out += ",\"from\":"; api_append_cstr(out, options.from_text); }
+    if (options.to_text != nullptr) { out += ",\"to\":"; api_append_cstr(out, options.to_text); }
+    if (options.from_stop != RTEGPU_NO_INDEX) out += ",\"from_stop_index\":" + std::to_string(options.from_stop);
+    if (options.to_stop != RTEGPU_NO_INDEX) out += ",\"to_stop_index\":" + std::to_string(options.to_stop);
+    if (options.have_from_coord) out += ",\"from_lat_e7\":" + std::to_string(options.from_lat) + ",\"from_lon_e7\":" + std::to_string(options.from_lon);
+    if (options.have_to_coord) out += ",\"to_lat_e7\":" + std::to_string(options.to_lat) + ",\"to_lon_e7\":" + std::to_string(options.to_lon);
+    out += "}";
+    out += ",\"address_mode\":";
+    out += options.resolved_addresses ? "true" : "false";
+    if (options.resolved_addresses) out += ",\"from_address_matches\":" + std::to_string(options.from_match_count) + ",\"to_address_matches\":" + std::to_string(options.to_match_count) + ",\"address_threads\":" + std::to_string(options.address_threads);
+    out += ",\"address_index\":{\"status\":";
+    api_append_json_string(out, options.address_index_status);
+    out += ",\"used\":";
+    out += options.address_index_used ? "true" : "false";
+    out += ",\"entries\":" + std::to_string(options.address_index_entries) + "}";
+    out += ",\"counts\":{\"stops\":" + std::to_string(pack.header.stop_count) + ",\"trips\":" + std::to_string(pack.header.trip_count) + ",\"events\":" + std::to_string(pack.header.event_count) + ",\"transfer_edges\":" + std::to_string(pack.header.transfer_edge_count) + "}";
+    out += ",\"result\":{\"status\":";
+    api_append_cstr(out, result.gpu_best_arrival == RTEGPU_INF_TIME ? "unreachable" : "found");
+    out += ",\"candidate_origin_stops\":" + std::to_string(result.candidate_origin_stops) + ",\"candidate_destination_stops\":" + std::to_string(result.candidate_destination_stops) + ",\"best_stop_index\":" + std::to_string(result.gpu_best_stop) + ",\"best_arrival_sec\":" + std::to_string(result.gpu_best_arrival) + ",\"walk_from_stop_m\":" + std::to_string(result.gpu_walk_m) + "}";
+    out += ",\"verification\":{\"enabled\":false}";
+    out += ",\"plan\":{\"status\":";
+    api_append_cstr(out, result.plan_found ? "found" : "unavailable");
+    out += ",\"legs\":[";
+    if (result.plan_found) {
+        bool need_comma = false;
+        for (uint32_t i = 0; i < result.plan_legs.size(); ++i) {
+            if (need_comma) out.push_back(',');
+            api_append_plan_leg(out, pack, result.plan_legs[i]);
+            need_comma = true;
+        }
+        if (result.gpu_walk_m != 0 || options.to_stop == RTEGPU_NO_INDEX) {
+            if (need_comma) out.push_back(',');
+            out += "{\"kind\":\"egress_walk\",\"from_stop_index\":" + std::to_string(result.gpu_best_stop) + ",\"from_stop\":";
+            api_append_stop_name_or_null(out, pack, result.gpu_best_stop);
+            out += ",\"walk_m\":" + std::to_string(result.gpu_walk_m) + ",\"arrival_sec\":" + std::to_string(result.gpu_best_arrival) + "}";
+        }
+    }
+    out += "]}";
+    out += ",\"timing_ms\":{\"address_resolve\":";
+    api_append_double3(out, result.timing.address_ms);
+    out += ",\"load\":";
+    api_append_double3(out, result.timing.load_ms);
+    out += ",\"host_to_device\":";
+    api_append_double3(out, result.timing.copy_ms);
+    out += ",\"gpu_kernel_avg\":";
+    api_append_double3(out, result.timing.gpu_ms);
+    out += ",\"cpu_scan\":";
+    api_append_double3(out, result.timing.cpu_ms);
+    out += "}}\n";
+    return out;
+}
+
+static std::string api_error_json(const std::string &message) {
+    std::string out = "{\"error\":{\"message\":";
+    api_append_json_string(out, message);
+    out += "}}\n";
+    return out;
+}
+
+struct RteGpuHttpRequest {
+    std::string method;
+    std::string path;
+    std::string body;
+    std::map<std::string, std::string> headers;
+};
+
+static std::string api_lower_ascii(std::string text) {
+    for (char &ch : text) ch = (char)std::tolower((unsigned char)ch);
+    return text;
+}
+
+static std::string api_trim_ascii(const std::string &text) {
+    size_t begin = 0;
+    while (begin < text.size() && std::isspace((unsigned char)text[begin])) begin += 1u;
+    size_t end = text.size();
+    while (end > begin && std::isspace((unsigned char)text[end - 1u])) end -= 1u;
+    return text.substr(begin, end - begin);
+}
+
+static bool api_read_http_request(int fd, RteGpuHttpRequest &request, std::string &error) {
+    timeval timeout;
+    timeout.tv_sec = 30;
+    timeout.tv_usec = 0;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    std::string data;
+    char buffer[4096];
+    size_t header_end = std::string::npos;
+    while ((header_end = data.find("\r\n\r\n")) == std::string::npos) {
+        if (data.size() > 65536u) { error = "HTTP header too large"; return false; }
+        ssize_t got = recv(fd, buffer, sizeof(buffer), 0);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            error = std::string("recv failed: ") + std::strerror(errno);
+            return false;
+        }
+        if (got == 0) { error = "connection closed before HTTP header"; return false; }
+        data.append(buffer, (size_t)got);
+    }
+    std::string header = data.substr(0, header_end);
+    std::istringstream stream(header);
+    std::string line;
+    if (!std::getline(stream, line)) { error = "empty HTTP request"; return false; }
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    std::istringstream first(line);
+    std::string version;
+    if (!(first >> request.method >> request.path >> version)) { error = "invalid HTTP request line"; return false; }
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = api_lower_ascii(api_trim_ascii(line.substr(0, colon)));
+        std::string value = api_trim_ascii(line.substr(colon + 1u));
+        request.headers[key] = value;
+    }
+    uint64_t content_length = 0;
+    auto length_header = request.headers.find("content-length");
+    if (length_header != request.headers.end()) {
+        char *end = nullptr;
+        errno = 0;
+        unsigned long long parsed = std::strtoull(length_header->second.c_str(), &end, 10);
+        if (errno != 0 || end == length_header->second.c_str() || *end != '\0') { error = "invalid Content-Length"; return false; }
+        content_length = (uint64_t)parsed;
+    }
+    if (content_length > 1024u * 1024u) { error = "HTTP body too large"; return false; }
+    size_t body_begin = header_end + 4u;
+    if (body_begin < data.size()) request.body.assign(data.data() + body_begin, data.size() - body_begin);
+    while (request.body.size() < content_length) {
+        ssize_t got = recv(fd, buffer, sizeof(buffer), 0);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            error = std::string("recv body failed: ") + std::strerror(errno);
+            return false;
+        }
+        if (got == 0) { error = "connection closed before HTTP body"; return false; }
+        request.body.append(buffer, (size_t)got);
+    }
+    if (request.body.size() > content_length) request.body.resize((size_t)content_length);
+    return true;
+}
+
+static void api_send_all(int fd, const std::string &data) {
+    size_t sent = 0;
+    while (sent < data.size()) {
+        ssize_t n = send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        if (n == 0) return;
+        sent += (size_t)n;
+    }
+}
+
+static void api_send_response(int fd, int status, const char *reason, const char *content_type, const std::string &body) {
+    std::string header = "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n";
+    header += "Content-Type: ";
+    header += content_type;
+    header += "\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\n\r\n";
+    api_send_all(fd, header);
+    api_send_all(fd, body);
+}
+
+static std::string api_index_html() {
+    return std::string(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>rte-gpu-route API</title><style>body{font-family:system-ui,sans-serif;margin:24px;max-width:960px;background:#f7f7f4;color:#202124}label{display:block;margin:12px 0 4px;font-weight:600}input,textarea,button{font:inherit}input{width:100%;box-sizing:border-box;padding:8px;border:1px solid #aaa;border-radius:6px}button{margin-top:12px;padding:8px 14px;border:1px solid #555;border-radius:6px;background:#fff;cursor:pointer}pre{white-space:pre-wrap;background:#111;color:#eee;padding:12px;border-radius:6px;overflow:auto;min-height:220px}</style></head>"
+        "<body><h1>rte-gpu-route API</h1><form id=\"route\"><label>From</label><input id=\"from\" name=\"from\" autocomplete=\"street-address\"><label>To</label><input id=\"to\" name=\"to\" autocomplete=\"street-address\"><label>Depart</label><input id=\"depart\" name=\"depart\" placeholder=\"YYYY-MM-DDTHH:MM[:SS]\"><button>Route</button></form><pre id=\"out\"></pre>"
+        "<script>const f=document.getElementById('route'),o=document.getElementById('out');f.addEventListener('submit',async e=>{e.preventDefault();const q={from:f.from.value,to:f.to.value};if(f.depart.value)q.depart=f.depart.value;o.textContent='Routing...';try{const r=await fetch('/route',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(q)});const t=await r.text();try{o.textContent=JSON.stringify(JSON.parse(t),null,2)}catch(_){o.textContent=t}}catch(err){o.textContent=String(err)}});</script></body></html>");
+}
+
+static int api_open_listener(const char *host, uint32_t port) {
+    addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    std::string port_text = std::to_string(port);
+    const char *node = (host == nullptr || host[0] == '\0' || std::strcmp(host, "*") == 0) ? nullptr : host;
+    addrinfo *infos = nullptr;
+    int gai = getaddrinfo(node, port_text.c_str(), &hints, &infos);
+    if (gai != 0) throw std::runtime_error(std::string("getaddrinfo failed: ") + gai_strerror(gai));
+    int listener = -1;
+    for (addrinfo *info = infos; info != nullptr; info = info->ai_next) {
+        int fd = socket(info->ai_family, info->ai_socktype | SOCK_CLOEXEC, info->ai_protocol);
+        if (fd < 0) continue;
+        int reuse = 1;
+        (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        if (bind(fd, info->ai_addr, info->ai_addrlen) == 0 && listen(fd, 16) == 0) {
+            listener = fd;
+            break;
+        }
+        close(fd);
+    }
+    freeaddrinfo(infos);
+    if (listener < 0) throw std::runtime_error("failed to bind API listener");
+    return listener;
+}
+
+static void api_handle_route_request(int fd, const RteGpuPack &pack, RteGpuDeviceContext &device, const QueryOptions &base_options, const std::string &body) {
+    try {
+        RteGpuApiJsonValue root;
+        RteGpuApiJsonParser parser(body);
+        if (!parser.parse_root(root)) throw std::runtime_error(parser.error.empty() ? "invalid JSON" : parser.error);
+        RteGpuApiParsedQuery parsed;
+        api_prepare_query(base_options, root, parsed);
+        RteGpuQueryTiming timing;
+        auto address_start = std::chrono::steady_clock::now();
+        if (parsed.options.from_text != nullptr || parsed.options.to_text != nullptr) resolve_address_queries(parsed.options);
+        auto address_end = std::chrono::steady_clock::now();
+        timing.address_ms = std::chrono::duration<double, std::milli>(address_end - address_start).count();
+        timing.load_ms = 0.0;
+        timing.copy_ms = 0.0;
+        RteGpuRouteResult result;
+        compute_route_query_silent(pack, device, parsed.options, timing, result);
+        api_send_response(fd, 200, "OK", "application/json; charset=utf-8", api_route_response_json(pack, parsed.options, result));
+    } catch (const std::exception &e) {
+        api_send_response(fd, 400, "Bad Request", "application/json; charset=utf-8", api_error_json(e.what()));
+    }
+}
+
+static void api_handle_http_request(int fd, const RteGpuPack &pack, RteGpuDeviceContext &device, const QueryOptions &base_options) {
+    RteGpuHttpRequest request;
+    std::string error;
+    if (!api_read_http_request(fd, request, error)) {
+        api_send_response(fd, 400, "Bad Request", "application/json; charset=utf-8", api_error_json(error));
+        return;
+    }
+    std::string path = request.path;
+    size_t question = path.find('?');
+    if (question != std::string::npos) path.resize(question);
+    if (request.method == "OPTIONS") {
+        api_send_response(fd, 204, "No Content", "text/plain; charset=utf-8", "");
+    } else if (request.method == "GET" && (path == "/" || path == "/index.html")) {
+        api_send_response(fd, 200, "OK", "text/html; charset=utf-8", api_index_html());
+    } else if (request.method == "GET" && path == "/health") {
+        std::string body = "{\"status\":\"ok\",\"format\":\"RTEGPU01\",\"stops\":" + std::to_string(pack.header.stop_count) + ",\"trips\":" + std::to_string(pack.header.trip_count) + "}\n";
+        api_send_response(fd, 200, "OK", "application/json; charset=utf-8", body);
+    } else if (request.method == "POST" && (path == "/route" || path == "/api/route")) {
+        api_handle_route_request(fd, pack, device, base_options, request.body);
+    } else {
+        api_send_response(fd, 404, "Not Found", "application/json; charset=utf-8", api_error_json("unknown endpoint"));
+    }
+}
+
+static int run_api_mode(const RteGpuPack &pack, RteGpuDeviceContext &device, QueryOptions &options, const RteGpuQueryTiming &setup_timing) {
+    int listener = api_open_listener(options.api_host, options.api_port);
+    std::fprintf(stderr, "rte-gpu-route: api ready http://%s:%u/ load_ms=%.3f host_to_device_ms=%.3f endpoint=POST /route\n", options.api_host, options.api_port, setup_timing.load_ms, setup_timing.copy_ms);
+    for (;;) {
+        int client = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
+        if (client < 0) {
+            if (errno == EINTR) continue;
+            std::fprintf(stderr, "rte-gpu-route: accept failed: %s\n", std::strerror(errno));
+            break;
+        }
+        api_handle_http_request(client, pack, device, options);
+        close(client);
+    }
+    close(listener);
+    return 0;
+}
+
 struct RteGpuTuiTerminal {
     termios saved;
     bool raw = false;
@@ -1975,6 +2806,10 @@ struct RteGpuTuiAddressCache {
     int32_t from_lon = 0;
     int32_t to_lat = 0;
     int32_t to_lon = 0;
+    std::vector<int32_t> from_candidate_lat;
+    std::vector<int32_t> from_candidate_lon;
+    std::vector<int32_t> to_candidate_lat;
+    std::vector<int32_t> to_candidate_lon;
     uint32_t from_match_count = 0;
     uint32_t to_match_count = 0;
     uint32_t address_threads = 0;
@@ -2035,6 +2870,10 @@ static void tui_store_address_cache(RteGpuTuiState &state, const QueryOptions &q
     state.address_cache.from_lon = query.from_lon;
     state.address_cache.to_lat = query.to_lat;
     state.address_cache.to_lon = query.to_lon;
+    state.address_cache.from_candidate_lat = query.from_candidate_lat;
+    state.address_cache.from_candidate_lon = query.from_candidate_lon;
+    state.address_cache.to_candidate_lat = query.to_candidate_lat;
+    state.address_cache.to_candidate_lon = query.to_candidate_lon;
     state.address_cache.from_match_count = query.from_match_count;
     state.address_cache.to_match_count = query.to_match_count;
     state.address_cache.address_threads = query.address_threads;
@@ -2050,6 +2889,10 @@ static void tui_apply_address_cache(const RteGpuTuiState &state, QueryOptions &q
     query.from_lon = state.address_cache.from_lon;
     query.to_lat = state.address_cache.to_lat;
     query.to_lon = state.address_cache.to_lon;
+    query.from_candidate_lat = state.address_cache.from_candidate_lat;
+    query.from_candidate_lon = state.address_cache.from_candidate_lon;
+    query.to_candidate_lat = state.address_cache.to_candidate_lat;
+    query.to_candidate_lon = state.address_cache.to_candidate_lon;
     query.have_from_coord = true;
     query.have_to_coord = true;
     query.resolved_addresses = true;
@@ -2230,7 +3073,9 @@ static std::vector<std::string> tui_plan_lines_colored(const RteGpuPack &pack, c
         lines.push_back("Plan reconstruction unavailable.");
         return lines;
     }
-    for (size_t i = 0; i < result.plan_legs.size(); ++i) {
+    bool combine_final_walk = result.gpu_walk_m != 0 && !result.plan_legs.empty() && result.plan_legs.back().kind == RTEGPU_STATE_TRANSFER_WALK;
+    size_t visible_legs = result.plan_legs.size() - (combine_final_walk ? 1U : 0U);
+    for (size_t i = 0; i < visible_legs; ++i) {
         const RteGpuPlanLeg &leg = result.plan_legs[i];
         std::string prefix = std::to_string(i + 1U) + ". ";
         if (leg.kind == RTEGPU_STATE_ORIGIN_WALK) {
@@ -2240,6 +3085,11 @@ static std::vector<std::string> tui_plan_lines_colored(const RteGpuPack &pack, c
         } else if (leg.kind == RTEGPU_STATE_VEHICLE) {
             lines.push_back(prefix + "take " + tui_route_label_colored(pack, use_color, leg.mode, leg.route) + " from " + tui_stop_name_colored(pack, use_color, leg.board) + " at " + tui_time(leg.departure) + " to " + tui_stop_name_colored(pack, use_color, leg.alight) + " arrive " + tui_time(leg.arrival));
         }
+    }
+    if (combine_final_walk) {
+        const RteGpuPlanLeg &leg = result.plan_legs.back();
+        lines.push_back(std::to_string(visible_legs + 1U) + ". walk " + std::to_string(leg.walk_m + result.gpu_walk_m) + " m from " + tui_stop_name_colored(pack, use_color, leg.board) + " at " + tui_time(leg.departure) + " to destination arrive " + tui_time(result.gpu_best_arrival));
+        return lines;
     }
     if (result.gpu_walk_m != 0) lines.push_back(std::to_string(lines.size()) + ". walk " + std::to_string(result.gpu_walk_m) + " m to destination arrive " + tui_time(result.gpu_best_arrival));
     return lines;
@@ -2371,6 +3221,10 @@ static void tui_try_route(const RteGpuPack &pack, RteGpuDeviceContext &device, c
     query.address_index_only = !allow_relaxed_scan;
     query.have_from_coord = false;
     query.have_to_coord = false;
+    query.from_candidate_lat.clear();
+    query.from_candidate_lon.clear();
+    query.to_candidate_lat.clear();
+    query.to_candidate_lon.clear();
     query.resolved_addresses = false;
     query.address_index_used = false;
     query.address_index_checked = false;
@@ -2572,6 +3426,11 @@ int main(int argc, char **argv) {
         if (pack.header.stop_count > UINT32_MAX || pack.header.trip_count > UINT32_MAX || pack.header.service_count > UINT32_MAX || pack.header.event_count > UINT32_MAX) throw std::runtime_error("pack too large for prototype");
         RteGpuDeviceContext device;
         setup_timing.copy_ms = rtegpu_device_init(pack, options.show_plan, device);
+        if (options.api) {
+            int status = run_api_mode(pack, device, options, setup_timing);
+            rtegpu_device_free(device);
+            return status;
+        }
         if (options.tui) {
             int status = run_tui_mode(pack, device, options, setup_timing);
             rtegpu_device_free(device);
@@ -2595,6 +3454,10 @@ int main(int argc, char **argv) {
                 query.to_text = to.c_str();
                 query.have_from_coord = false;
                 query.have_to_coord = false;
+                query.from_candidate_lat.clear();
+                query.from_candidate_lon.clear();
+                query.to_candidate_lat.clear();
+                query.to_candidate_lon.clear();
                 query.from_stop = RTEGPU_NO_INDEX;
                 query.to_stop = RTEGPU_NO_INDEX;
                 query.resolved_addresses = false;
