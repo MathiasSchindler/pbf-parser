@@ -259,10 +259,12 @@ Plan legs can have these `kind` values:
 
 | Kind | Meaning |
 | --- | --- |
-| `access_walk` | Walk from the request origin to the first transit stop. |
-| `ride` | Vehicle ride on a GTFS route. Includes mode, route index/name, board stop, alight stop, and times. |
-| `transfer_walk` | Walk between transit stops during the route. |
-| `egress_walk` | Walk from the final transit stop to the requested destination. |
+| `access_walk` | Walk from the request origin to the first transit stop. Includes request origin coordinates when known and first-stop coordinates. |
+| `ride` | Vehicle ride on a GTFS route. Includes mode, route index/name, board stop, alight stop, stop coordinates, and times. |
+| `transfer_walk` | Walk between transit stops during the route. Includes both stop coordinates. |
+| `egress_walk` | Walk from the final transit stop to the requested destination. Includes final-stop coordinates and destination coordinates when known. |
+
+Coordinate fields are emitted in both integer e7 form and decimal degree form. For example, a ride leg contains `board_stop_lat_e7`, `board_stop_lon_e7`, `board_stop_lat`, `board_stop_lon`, `alight_stop_lat_e7`, `alight_stop_lon_e7`, `alight_stop_lat`, and `alight_stop_lon`. Walk legs use analogous prefixes such as `from`, `to`, `from_stop`, and `to_stop`.
 
 Example response excerpt:
 
@@ -274,9 +276,9 @@ Example response excerpt:
   "plan": {
     "status": "found",
     "legs": [
-      {"kind":"access_walk","to_stop":"Potsdam, Brandenburger Str."},
-      {"kind":"ride","mode":"rail","route_short_name":"RE1"},
-      {"kind":"egress_walk","walk_m":282}
+      {"kind":"access_walk","to_stop":"Nauener Tor","to_stop_lat":52.4028200,"to_stop_lon":13.0578430},
+      {"kind":"ride","mode":"rail","route_short_name":"RE1","board_stop_lat":52.4007950,"board_stop_lon":13.0673250,"alight_stop_lat":52.5255890,"alight_stop_lon":13.3695480},
+      {"kind":"egress_walk","walk_m":282,"from_stop_lat":48.2004680,"from_stop_lon":8.5919500,"to_lat":48.1985000,"to_lon":8.5900000}
     ]
   },
   "timing_ms": {
@@ -289,7 +291,7 @@ Example response excerpt:
 }
 ```
 
-The excerpt omits many fields for readability. Real responses include stop indexes, full stop names when available, route long names when available, departure seconds, and arrival seconds.
+The excerpt omits many fields for readability. Real responses include stop indexes, full stop names when available, route long names when available, e7 coordinates, departure seconds, and arrival seconds.
 
 ## Errors
 

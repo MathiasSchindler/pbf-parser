@@ -1579,6 +1579,14 @@ static void json_write_route_long_or_null(const RteGpuPack &pack, uint32_t route
     else std::printf("null");
 }
 
+static void json_write_coord_fields(const char *prefix, int32_t lat_e7, int32_t lon_e7) {
+    std::printf(",\"%s_lat_e7\":%d,\"%s_lon_e7\":%d,\"%s_lat\":%.7f,\"%s_lon\":%.7f", prefix, lat_e7, prefix, lon_e7, prefix, (double)lat_e7 / 10000000.0, prefix, (double)lon_e7 / 10000000.0);
+}
+
+static void json_write_stop_coord_fields(const RteGpuPack &pack, const char *prefix, uint32_t stop) {
+    if (stop < pack.stop_lat.size() && stop < pack.stop_lon.size()) json_write_coord_fields(prefix, pack.stop_lat[stop], pack.stop_lon[stop]);
+}
+
 static bool build_plan_legs(const RteGpuPack &pack, const RteGpuPredHost &pred, uint32_t best_stop, std::vector<RteGpuPlanLeg> &legs) {
     std::vector<RteGpuPlanLeg> reverse;
     uint32_t current = best_stop;
@@ -1674,16 +1682,20 @@ static void print_plan_text(const RteGpuPack &pack, const QueryOptions &options,
         std::printf("plan_%u: walk %u m to destination arrive %s\n", (uint32_t)legs.size() + 1u, egress_walk_m, arr);
     }
 }
-static void json_write_plan_leg(const RteGpuPack &pack, const RteGpuPlanLeg &leg) {
+static void json_write_plan_leg(const RteGpuPack &pack, const QueryOptions &options, const RteGpuPlanLeg &leg) {
     if (leg.kind == RTEGPU_STATE_ORIGIN_WALK) {
         std::printf("{\"kind\":\"access_walk\",\"to_stop_index\":%u,\"to_stop\":", leg.alight);
         json_write_stop_name_or_null(pack, leg.alight);
+        if (options.have_from_coord) json_write_coord_fields("from", options.from_lat, options.from_lon);
+        json_write_stop_coord_fields(pack, "to_stop", leg.alight);
         std::printf(",\"walk_m\":%u,\"departure_sec\":%u,\"arrival_sec\":%u}", leg.walk_m, leg.departure, leg.arrival);
     } else if (leg.kind == RTEGPU_STATE_TRANSFER_WALK) {
         std::printf("{\"kind\":\"transfer_walk\",\"from_stop_index\":%u,\"from_stop\":", leg.board);
         json_write_stop_name_or_null(pack, leg.board);
         std::printf(",\"to_stop_index\":%u,\"to_stop\":", leg.alight);
         json_write_stop_name_or_null(pack, leg.alight);
+        json_write_stop_coord_fields(pack, "from_stop", leg.board);
+        json_write_stop_coord_fields(pack, "to_stop", leg.alight);
         std::printf(",\"walk_m\":%u,\"departure_sec\":%u,\"arrival_sec\":%u}", leg.walk_m, leg.departure, leg.arrival);
     } else if (leg.kind == RTEGPU_STATE_VEHICLE) {
         std::printf("{\"kind\":\"ride\",\"mode\":");
@@ -1696,6 +1708,8 @@ static void json_write_plan_leg(const RteGpuPack &pack, const RteGpuPlanLeg &leg
         json_write_stop_name_or_null(pack, leg.board);
         std::printf(",\"alight_stop_index\":%u,\"alight_stop\":", leg.alight);
         json_write_stop_name_or_null(pack, leg.alight);
+        json_write_stop_coord_fields(pack, "board_stop", leg.board);
+        json_write_stop_coord_fields(pack, "alight_stop", leg.alight);
         std::printf(",\"departure_sec\":%u,\"arrival_sec\":%u}", leg.departure, leg.arrival);
     } else {
         std::printf("{\"kind\":\"unknown\"}");
@@ -1750,12 +1764,14 @@ static void print_json_report(
     if (plan_found) {
         for (uint32_t i = 0; i < legs.size(); ++i) {
             if (i != 0) std::putchar(',');
-            json_write_plan_leg(pack, legs[i]);
+            json_write_plan_leg(pack, options, legs[i]);
         }
         if (gpu_walk_m != 0 || options.to_stop == RTEGPU_NO_INDEX) {
             if (!legs.empty()) std::putchar(',');
             std::printf("{\"kind\":\"egress_walk\",\"from_stop_index\":%u,\"from_stop\":", gpu_best_stop);
             json_write_stop_name_or_null(pack, gpu_best_stop);
+            json_write_stop_coord_fields(pack, "from_stop", gpu_best_stop);
+            if (options.have_to_coord) json_write_coord_fields("to", options.to_lat, options.to_lon);
             std::printf(",\"walk_m\":%u,\"arrival_sec\":%u}", gpu_walk_m, gpu_best_arrival);
         }
     }
@@ -2487,22 +2503,44 @@ static void api_append_route_long_or_null(std::string &out, const RteGpuPack &pa
     else out += "null";
 }
 
+static void api_append_coord_fields(std::string &out, const char *prefix, int32_t lat_e7, int32_t lon_e7) {
+    char buf[128];
+    out += ",\"";
+    out += prefix;
+    out += "_lat_e7\":";
+    out += std::to_string(lat_e7);
+    out += ",\"";
+    out += prefix;
+    out += "_lon_e7\":";
+    out += std::to_string(lon_e7);
+    std::snprintf(buf, sizeof(buf), ",\"%s_lat\":%.7f,\"%s_lon\":%.7f", prefix, (double)lat_e7 / 10000000.0, prefix, (double)lon_e7 / 10000000.0);
+    out += buf;
+}
+
+static void api_append_stop_coord_fields(std::string &out, const RteGpuPack &pack, const char *prefix, uint32_t stop) {
+    if (stop < pack.stop_lat.size() && stop < pack.stop_lon.size()) api_append_coord_fields(out, prefix, pack.stop_lat[stop], pack.stop_lon[stop]);
+}
+
 static void api_append_double3(std::string &out, double value) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%.3f", value);
     out += buf;
 }
 
-static void api_append_plan_leg(std::string &out, const RteGpuPack &pack, const RteGpuPlanLeg &leg) {
+static void api_append_plan_leg(std::string &out, const RteGpuPack &pack, const QueryOptions &options, const RteGpuPlanLeg &leg) {
     if (leg.kind == RTEGPU_STATE_ORIGIN_WALK) {
         out += "{\"kind\":\"access_walk\",\"to_stop_index\":" + std::to_string(leg.alight) + ",\"to_stop\":";
         api_append_stop_name_or_null(out, pack, leg.alight);
+        if (options.have_from_coord) api_append_coord_fields(out, "from", options.from_lat, options.from_lon);
+        api_append_stop_coord_fields(out, pack, "to_stop", leg.alight);
         out += ",\"walk_m\":" + std::to_string(leg.walk_m) + ",\"departure_sec\":" + std::to_string(leg.departure) + ",\"arrival_sec\":" + std::to_string(leg.arrival) + "}";
     } else if (leg.kind == RTEGPU_STATE_TRANSFER_WALK) {
         out += "{\"kind\":\"transfer_walk\",\"from_stop_index\":" + std::to_string(leg.board) + ",\"from_stop\":";
         api_append_stop_name_or_null(out, pack, leg.board);
         out += ",\"to_stop_index\":" + std::to_string(leg.alight) + ",\"to_stop\":";
         api_append_stop_name_or_null(out, pack, leg.alight);
+        api_append_stop_coord_fields(out, pack, "from_stop", leg.board);
+        api_append_stop_coord_fields(out, pack, "to_stop", leg.alight);
         out += ",\"walk_m\":" + std::to_string(leg.walk_m) + ",\"departure_sec\":" + std::to_string(leg.departure) + ",\"arrival_sec\":" + std::to_string(leg.arrival) + "}";
     } else if (leg.kind == RTEGPU_STATE_VEHICLE) {
         out += "{\"kind\":\"ride\",\"mode\":";
@@ -2515,6 +2553,8 @@ static void api_append_plan_leg(std::string &out, const RteGpuPack &pack, const 
         api_append_stop_name_or_null(out, pack, leg.board);
         out += ",\"alight_stop_index\":" + std::to_string(leg.alight) + ",\"alight_stop\":";
         api_append_stop_name_or_null(out, pack, leg.alight);
+        api_append_stop_coord_fields(out, pack, "board_stop", leg.board);
+        api_append_stop_coord_fields(out, pack, "alight_stop", leg.alight);
         out += ",\"departure_sec\":" + std::to_string(leg.departure) + ",\"arrival_sec\":" + std::to_string(leg.arrival) + "}";
     } else {
         out += "{\"kind\":\"unknown\"}";
@@ -2553,13 +2593,15 @@ static std::string api_route_response_json(const RteGpuPack &pack, const QueryOp
         bool need_comma = false;
         for (uint32_t i = 0; i < result.plan_legs.size(); ++i) {
             if (need_comma) out.push_back(',');
-            api_append_plan_leg(out, pack, result.plan_legs[i]);
+            api_append_plan_leg(out, pack, options, result.plan_legs[i]);
             need_comma = true;
         }
         if (result.gpu_walk_m != 0 || options.to_stop == RTEGPU_NO_INDEX) {
             if (need_comma) out.push_back(',');
             out += "{\"kind\":\"egress_walk\",\"from_stop_index\":" + std::to_string(result.gpu_best_stop) + ",\"from_stop\":";
             api_append_stop_name_or_null(out, pack, result.gpu_best_stop);
+            api_append_stop_coord_fields(out, pack, "from_stop", result.gpu_best_stop);
+            if (options.have_to_coord) api_append_coord_fields(out, "to", options.to_lat, options.to_lon);
             out += ",\"walk_m\":" + std::to_string(result.gpu_walk_m) + ",\"arrival_sec\":" + std::to_string(result.gpu_best_arrival) + "}";
         }
     }

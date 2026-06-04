@@ -262,7 +262,7 @@ rte-gpu-route data/germany-gtfs.rtegpu --rte data/germany-gtfs.rte --build-addre
 
 `--plan` enables GPU predecessor capture and prints reconstructed route legs. Text plan output uses color by default, matching the CPU tool's opt-out style: route modes/numbers are highlighted in yellow, stop/station names in cyan, and the plan header in magenta. The text and TUI views compact adjacent same-trip ride fragments and chained walking transfers so the displayed itinerary is closer to what a rider expects. Use `--no-color` to suppress ANSI escapes, or `--color` to force them back on.
 
-`--json` emits one structured JSON object instead of text. JSON mode implies `--plan`, disables color, and includes query metadata, counts, best arrival, optional verification details, route legs, and timing fields. `--verify` runs the CPU mirror and should be used for validation, but normal route queries skip it to avoid the extra CPU scan.
+`--json` emits one structured JSON object instead of text. JSON mode implies `--plan`, disables color, and includes query metadata, counts, best arrival, optional verification details, route legs, stop/request coordinates for each leg, and timing fields. Coordinates are emitted as both integer e7 values and decimal degrees. `--verify` runs the CPU mirror and should be used for validation, but normal route queries skip it to avoid the extra CPU scan.
 
 Verified Germany-wide prototype results on `data/germany-gtfs.rte`:
 
@@ -398,7 +398,7 @@ Interactive JSON output is newline-delimited JSON: each input line produces one 
 
 `--tui` is a terminal form mode for live routing. It enters the alternate screen, provides editable `From`, `To`, and `Depart` fields, and renders the fastest route in the lower pane as soon as the current inputs resolve exactly through the address sidecar. The TUI deliberately uses sidecar-only address lookup while editing, so incomplete or misspelled addresses return quickly instead of falling back to the full 18M-record `.rte` scan. If the sidecar misses, press Enter to run one deliberate relaxed full-scan lookup; this can resolve cases such as `Thomasburg 18, Oldenburg` even before the sidecar has been rebuilt with the new alias keys. Use Tab, Up, or Down to move between fields; Ctrl-Q or Esc exits. When `Depart` is selected, Left and Right move the time backward or forward in 5-minute steps. Optional `--from`, `--to`, and `--depart` arguments prefill the form.
 
-`--api` starts a small local HTTP server after loading the `.rtegpu` pack and copying the hot arrays to the GPU. It binds to `127.0.0.1:8765` by default; override this with `--api-host HOST` and `--api-port PORT`. The root path serves a minimal browser form, `/health` returns pack counts, and `POST /route` or `POST /api/route` accepts a JSON route request and replies with the same structured JSON route shape as `--json`.
+`--api` starts a small local HTTP server after loading the `.rtegpu` pack and copying the hot arrays to the GPU. It binds to `127.0.0.1:8765` by default; override this with `--api-host HOST` and `--api-port PORT`. The root path serves a minimal browser form, `/health` returns pack counts, and `POST /route` or `POST /api/route` accepts a JSON route request and replies with the same structured JSON route shape as `--json`, including stop/request coordinates for each plan leg.
 
 Address request example:
 
